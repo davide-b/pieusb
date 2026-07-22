@@ -8,8 +8,9 @@ from pieusb.types import (
     OptionalDevices,
     DeviceInfo
 )
-from pieusb.usb_utils import find_device
+from pieusb.usb_utils import find_device, get_device
 from pieusb.uas import UASDevice, SCSI_INQUIRY
+from pieusb.scanning import ScannerDevice
 
 import struct
 
@@ -170,10 +171,15 @@ def get_devices() -> list[DeviceInfo]:
             with UASDevice(dev) as d:
                 r = _get_inquiry(d)
                 devices.append(DeviceInfo(
-                    id=r.product,
+                    id='pieusb:' + str(dev.bus) + ':' + str(dev.address),
                     vendor=r.vendor,
                     model=r.model_str,
                     inquiry=r
                 ))
 
     return devices
+
+def open(id: str) -> ScannerDevice:
+    _, bus, address = id.split(':')
+    dev = get_device(int(bus), int(address))
+    return ScannerDevice(dev)

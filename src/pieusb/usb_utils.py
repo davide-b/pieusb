@@ -33,3 +33,7 @@ def find_device(vid: int, pid: int) -> usb.core.Device | None:
     log.debug("[find_device] found device")
 
     return dev
+
+def get_device(bus: int, address: int) -> usb.core.Device:
+    backend = get_backend()
+    return usb.core.find(custom_match=lambda d: d.bus == bus and d.address == address, backend=backend)
