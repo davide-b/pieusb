@@ -232,7 +232,7 @@ class UASDevice:
 
         return status, result
 
-    def command(self, opcode, out_data=b"", in_size=0, cdb_length=None):
+    def command(self, opcode, out_data=b"", in_size=0, cdb_length=None) -> bytes:
         """
         Full command with retry/busy/check-condition handling, per
         sanei_pieusb_command() in pieusb_usb.c.
