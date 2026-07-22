@@ -1,0 +1,11 @@
+[project]
+name = "pieusb"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "libusb-package>=1.0.30.0",
+    "numpy>=2.5.1",
+    "pyusb>=1.3.1",
+]
