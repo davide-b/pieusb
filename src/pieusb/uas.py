@@ -28,6 +28,27 @@ PORT_SCSI_CMD = 0x0085
 PORT_PAR_CTRL = 0x0087
 PORT_PAR_DATA = 0x0088
 
+SCSI_TEST_UNIT_READY = 0x00
+SCSI_REQUEST_SENSE = 0x03
+SCSI_READ = 0x08
+SCSI_WRITE = 0x0A
+SCSI_PARAM = 0x0F
+SCSI_INQUIRY = 0x12
+SCSI_MODE_SELECT = 0x15
+SCSI_COPY = 0x18
+SCSI_MODE_SENSE = 0x1A
+SCSI_SCAN = 0x1B
+SCSI_READ_GAIN_OFFSET = 0xD7
+SCSI_WRITE_GAIN_OFFSET = 0xDC
+SCSI_READ_STATE = 0xDD
+
+# "Virtual" sub-commands written via SCSI_WRITE (little-endian 16-bit code
+# in the first 2 bytes of the payload)
+SCSI_SCAN_FRAME = 0x12
+SCSI_EXPOSURE = 0x13
+SCSI_HIGHLIGHT_SHADOW = 0x14
+SCSI_CALIBRATION_INFO = 0x95
+
 SCSI_COMMAND_LEN = 6  # standard 6-byte CDB
 SCSI_REQUEST_SENSE = 0x03
 
@@ -80,7 +101,7 @@ class UASDevice:
         self.open()
         return self
 
-    def __exit__(self) -> None:
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
     def _ensure_open(self) -> tuple[int, usb.core.Endpoint]:
@@ -157,11 +178,12 @@ class UASDevice:
     
         log.debug("[open] get_active_configuration()...")
         cfg = self.dev.get_active_configuration()
-        self.intf_number = cfg[(0, 0)].bInterfaceNumber
+        intf = cfg[(0, 0)]
+        self.intf_number = intf.bInterfaceNumber
         log.debug(f"[open] interface number = {self.intf_number}")
     
         self.ep_in = usb.util.find_descriptor(
-            self.intf_number,
+            intf,
             custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
             == usb.util.ENDPOINT_IN,
         )
