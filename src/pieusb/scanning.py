@@ -51,16 +51,16 @@ class ScannerDevice:
         raise TimeoutError("scanner did not become ready in time")
 
     def start_scan(self) -> None:
-        self.command(SCSI_SCAN, cdb_length=1)
+        self.uas.command(SCSI_SCAN, cdb_length=1)
     
     def stop_scan(self) -> None:
-        self.command(SCSI_SCAN, cdb_length=0)
+        self.uas.command(SCSI_SCAN, cdb_length=0)
 
     def get_ccd_mask(self, mask_size) -> bytes:
-        return self.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
+        return self.uas.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
 
     def get_scanned_lines(self, lines, size) -> bytes:
         # NOTE: cdb_length is the *line count*, in_size is the byte count --
         # this divergence is real, taken directly from
         # sanei_pieusb_cmd_get_scanned_lines() in pieusb_scancmd.c.
-        return self.command(SCSI_READ, in_size=size, cdb_length=lines)
+        return self.uas.command(SCSI_READ, in_size=size, cdb_length=lines)
