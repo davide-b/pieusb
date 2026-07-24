@@ -3,8 +3,8 @@ import time
 
 import usb.core
 
-from pieusb.uas import UASDevice, CheckCondition
-from pieusb.uas import (
+from pieusb.transport import UASDevice, CheckCondition
+from pieusb.transport import (
     SCSI_TEST_UNIT_READY,
     SCSI_REQUEST_SENSE,
     SCSI_READ,

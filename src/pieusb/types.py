@@ -66,6 +66,7 @@ class InquiryResponse:
     production: str
     timestamp: str
     signature: str
+    slide_transport: bool
 
 # @dataclass(frozen=True)
 # class Capabilities:
