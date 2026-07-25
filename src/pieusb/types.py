@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+import usb.core
 
 class Filter(StrEnum):
     INFRARED = 'Infrared'
@@ -68,21 +69,9 @@ class InquiryResponse:
     signature: str
     slide_transport: bool
 
-# @dataclass(frozen=True)
-# class Capabilities:
-#     ir_channel: bool
-#     supported_dpi: tuple[int, ...]
-#     supported_depths: tuple[int, ...]
-#     multi_sample: bool
-#     adapter_frame_capacity: int | None
-#     adapter_frame_control: bool
-#     auto_exposure: bool
-#     registered_geometry: bool
-#     can_eject: bool
-
 @dataclass(frozen=True)
 class DeviceInfo:
-    id: str
+    dev: usb.core.Device
     vendor: str
     model: str
     inquiry: InquiryResponse
