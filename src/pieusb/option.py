@@ -13,7 +13,9 @@ from pieusb.transport import (
     UASDevice,
     SCSI_WRITE,
     SCSI_HIGHLIGHT_SHADOW,
-    SCSI_EXPOSURE
+    SCSI_EXPOSURE,
+    SCSI_SCAN_FRAME,
+    SCSI_WRITE_GAIN_OFFSET
 )
 
 class Unit(Enum):
@@ -277,3 +279,50 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
     for filt, value in ((0x02, r), (0x04, g), (0x08, b)):
         payload = struct.pack("<HHHH", SCSI_EXPOSURE, 4, filt, value)
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
+
+    index = 128 # Trust me bro
+    x0 = options["tl_x"]
+    y0 = options["tl_y"]
+    x1 = options["br_x"]
+    y1 = options["br_y"]
+    payload = struct.pack("<HHHHHHH", SCSI_SCAN_FRAME, 10, index, x0, y0, x1, y1)
+    dev.command(SCSI_WRITE, out_data=payload, cdb_length=14)
+
+    # Set exposure, gain and offset
+    payload = struct.pack('<HHHBBBBBBBBBBBBHBBBBBBBBB',
+        options['exp_r'].value,
+        options['exp_g'].value,
+        options['exp_b'].value,
+        options['offset_r'].value,
+        options['offset_g'].value,
+        options['offset_b'].value,
+        0,
+        0,
+        0,
+        options['gain_r'].value,
+        options['gain_g'].value,
+        options['gain_b'].value,
+        0, # Light, maybe in SANE is 5?
+        0, # Extra entried
+        0, # Double times
+        options['exp_i'].value,
+        options['offset_i'].value,
+        0,
+        options['gain_i'].value,
+        0, 0, 0, 0, 0, 0
+    )
+    dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload, cdb_length=29)
+
+    # Set mode
+    quality = 0
+    if options['sharpen'].value:
+        quality |= 0x02
+    if not options['calibrate'].value:
+        quality |= 0x08
+    struct.pack('<BBHBBBBBBBB',
+        0,
+        15, # Mode size, for some reason
+        options['resolution'].value,
+        0, # TODO: passes
+        options['color_depth'].value,
+    )
