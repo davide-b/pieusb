@@ -27,25 +27,29 @@ class Unit(Enum):
 
 T = TypeVar("T")
 
-# FIXME: Option is frozen but assigned to
-# maybe wrap frozen option into a modifiable param class
 @dataclass(frozen=True)
 class Option(Generic[T]):
     name: str
     type: type[T]
     unit: Unit
     validate: Callable[[T], bool]
-    value: T
+    default: T
+
+class Parameter:
+    def __init__(self, opt: Option):
+        self.opt = opt
+        assert opt.validate(opt.default)
+        self.value = opt.default
 
 class OptionsTable:
-    def __init__(self, options: list[Option]) -> None:
-        self.table = options
+    def __init__(self, params: list[Parameter]) -> None:
+        self.table = params
 
-    def __getitem__(self, key) -> Option:
-        return next(filter(lambda o: o.name == key, self.table))
+    def __getitem__(self, key) -> Parameter:
+        return next(filter(lambda o: o.opt.name == key, self.table))
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
-    out = []
+    out: list[Parameter] = []
 
     modes = []
     if Filter.GREEN in inq.filters:
@@ -54,217 +58,217 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         modes.append('rgb')
     if set({Filter.RED, Filter.GREEN, Filter.BLUE, Filter.INFRARED}) <= set(inq.filters):
         modes.append('rgbi')
-    out.append(Option(
+    out.append(Parameter(Option(
         name='mode',
         type=str,
         unit=Unit.NONE,
         validate=lambda v: v in modes,
-        value='rgb'
-    ))
+        default='rgb'
+    )))
 
     # Bit depth of the scan
-    out.append(Option(
+    out.append(Parameter(Option(
         name='color_depth',
         type=int,
         unit=Unit.BITS,
         validate=lambda v: v in inq.color_depths,
-        value=16
-    ))
+        default=16
+    )))
 
     # Scan resolution
-    out.append(Option(
+    out.append(Parameter(Option(
         name='resolution',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v < min(inq.max_resolution_x, inq.max_resolution_y),
-        value=300
-    ))
+        default=300
+    )))
 
     # Halftone
 
     # Increase sharpness by giving more time to the CCD to discharge between each line
-    out.append(Option(
+    out.append(Parameter(Option(
         name='sharpen',
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
-        value=False
-    ))
+        default=False
+    )))
 
     # Force calibration of the CCD sensor
-    out.append(Option(
+    out.append(Parameter(Option(
         name='calibrate',
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
-        value=False
-    ))
+        default=False
+    )))
 
     # Perform a preview pass to determine best exposure parameters
-    out.append(Option(
+    out.append(Parameter(Option(
         name='auto_exp',
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
-        value=False
-    ))
+        default=False
+    )))
 
     # Advance slide after scan
-    out.append(Option(
+    out.append(Parameter(Option(
         name='advance',
         type=bool,
         unit=Unit.NONE,
-        validate=lambda v: inq.slide_transport,
-        value=False
-    ))
+        validate=lambda v: not v or inq.slide_transport,
+        default=False
+    )))
 
     # X coordinate of the top-left corner
-    out.append(Option(
+    out.append(Parameter(Option(
         name='tl_x',
         type=int,
         unit=Unit.PIXEL,
         validate=lambda v: v >= 0,
-        value=0
-    ))
+        default=0
+    )))
 
     # Y coordinate of the top-left corner
-    out.append(Option(
+    out.append(Parameter(Option(
         name='tl_y',
         type=int,
         unit=Unit.PIXEL,
         validate=lambda v: v >= 0,
-        value=0
-    ))
+        default=0
+    )))
 
     # X coordinate of the bottom-right corner
-    out.append(Option(
+    out.append(Parameter(Option(
         name='br_x',
         type=int,
         unit=Unit.PIXEL,
         validate=lambda v: v <= inq.max_scan_w,
-        value=inq.max_scan_w
-    ))
+        default=inq.max_scan_w
+    )))
 
     # Y coordinate of the bottom-right corner
-    out.append(Option(
+    out.append(Parameter(Option(
         name='br_y',
         type=int,
         unit=Unit.PIXEL,
         validate=lambda v: v <= inq.max_scan_h,
-        value=inq.max_scan_h
-    ))
+        default=inq.max_scan_h
+    )))
 
     # SANE exposure default 2937
     # Though setting the option does nothing as the value is hardcoded to 100 per channel
     # Exposure for red channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='exp_r',
         type=int,
         unit=Unit.MICROSECONDS,
         validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        value=100
-    ))
+        default=100
+    )))
     
     # Exposure for green channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='exp_g',
         type=int,
         unit=Unit.MICROSECONDS,
         validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        value=100
-    ))
+        default=100
+    )))
     
     # Exposure for blue channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='exp_b',
         type=int,
         unit=Unit.MICROSECONDS,
         validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        value=100
-    ))
+        default=100
+    )))
     
     # Exposure for infrared channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='exp_i',
         type=int,
         unit=Unit.MICROSECONDS,
         validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        value=100
-    ))
+        default=100
+    )))
 
     # SANE gain default 19
     # Gain for red channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='gain_r',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        value=19
-    ))
+        default=19
+    )))
     
     # Gain for green channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='gain_g',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        value=19
-    ))
+        default=19
+    )))
     
     # Gain for blue channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='gain_b',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        value=19
-    ))
+        default=19
+    )))
     
     # Gain for infrared channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='gain_i',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        value=19
-    ))
+        default=19
+    )))
 
     # SANE offset default 0
     # Offset for the red channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='offset_r',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        value=0
-    ))
+        default=0
+    )))
 
     # Offset for the green channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='offset_g',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        value=0
-    ))
+        default=0
+    )))
     
     # Offset for the blue channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='offset_b',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        value=0
-    ))
+        default=0
+    )))
     
     # Offset for the infrared channel
-    out.append(Option(
+    out.append(Parameter(Option(
         name='offset_i',
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        value=0
-    ))
+        default=0
+    )))
 
     return OptionsTable(out)
 

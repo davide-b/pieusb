@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
-        self.options = generate_options(info.inquiry)
+        self.params = generate_options(info.inquiry)
         self.dev.open()
 
     def __enter__(self) -> "Scanner":
@@ -29,12 +29,12 @@ class Scanner:
         self.dev.close()
 
     def __setitem__(self, key, value) -> None:
-        opt = self.options[key]
-        if type(value) is not opt.type:
-            raise TypeError(f"Invalid type provided to option '{opt.name}' (got {type(value)}, expected {opt.type})")
-        if not opt.validate(value):
-            raise ValueError(f"Invalid value provided to option '{opt.name}'")
-        opt.value = value
+        par = self.params[key]
+        if type(value) is not par.opt.type:
+            raise TypeError(f"Invalid type provided to option '{par.opt.name}' (got {type(value)}, expected {par.opt.type})")
+        if not par.opt.validate(value):
+            raise ValueError(f"Invalid value provided to option '{par.opt.name}'")
+        par.value = value
 
     def _ready(self) -> bool:
         try:
@@ -82,7 +82,7 @@ class Scanner:
     def scan(self) -> numpy.ndarray:
         self.wait_ready()
 
-        set_options(self.dev, self.options)
+        set_options(self.dev, self.params)
 
         self.wait_ready()
 

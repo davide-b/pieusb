@@ -1,10 +1,9 @@
-from pieusb.usb_utils import find_device, get_device
+from pieusb.usb_utils import find_device
 from pieusb.transport import UASDevice, SCSI_INQUIRY
 from pieusb.scanner import Scanner
 
 from pieusb.inquiry import KNWON_PIDS, PIE_VENDOR_ID, parse_inquiry
 from pieusb.types import DeviceInfo
-from pieusb.scanner import Scanner
 
 def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
     header = dev.command(SCSI_INQUIRY, in_size=5, cdb_length=5)
