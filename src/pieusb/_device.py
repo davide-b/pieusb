@@ -31,5 +31,8 @@ def get_devices() -> list[DeviceInfo]:
 
     return devices
 
+# Probably unnecessary.
+# The user can just s = Scanner(devices[0]) or with Scanner(devices[0]) as s
+# Device gets "opened" in the Scanner constructor
 def open(dev: DeviceInfo) -> Scanner:
     return Scanner(dev)
