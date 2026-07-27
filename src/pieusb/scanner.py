@@ -3,8 +3,12 @@ import usb.core
 
 from pieusb.option import generate_options, set_options
 from pieusb.types import DeviceInfo
-from pieusb.transport import (
+from pieusb.exceptions import (
     CheckCondition,
+    DeviceNotReady,
+    WarmingUp
+)
+from pieusb.transport import (
     SCSI_READ,
     SCSI_SCAN,
     SCSI_TEST_UNIT_READY
@@ -36,24 +40,49 @@ class Scanner:
             raise ValueError(f"Invalid value provided to option '{par.opt.name}'")
         par.value = value
 
-    def ready(self) -> bool:
+    def _why_not_ready(self) -> CheckCondition | None:
+        """None if the device is ready, else the NOT READY sense explaining why.
+
+        Anything other than a NOT READY sense is a real error and propagates --
+        swallowing it here would hide bugs behind a bland 'not ready'.
+        """
         try:
             self.dev.command(SCSI_TEST_UNIT_READY, cdb_length=0)
-            return True
+            return None
         except CheckCondition as e:
-            if e.warming_up:
-                return False
+            if e.not_ready:
+                return e
             raise
 
-    def wait_ready(self, timeout_s=180):
+    def ready(self) -> bool:
+        """Whether the device can start a scan right now.
+
+        Every NOT READY sense maps to False, warming up included; use
+        wait_ready() if you need to know which.
+        """
+        return self._why_not_ready() is None
+
+    def wait_ready(self, timeout_s: float = 180) -> None:
+        """Poll until the device is ready, or raise once timeout_s has passed.
+
+        Raises WarmingUp if the lamp was still warming up when time ran out, and
+        DeviceNotReady for any other reason. WarmingUp is a subclass of the
+        latter, so `except DeviceNotReady` catches both.
+        """
         log.debug("  [wait_ready] polling TEST UNIT READY...")
         deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if self.ready():
+        while True:
+            reason = self._why_not_ready()
+            if reason is None:
                 log.debug("  [wait_ready] ready")
                 return
+            if time.time() >= deadline:
+                break
             time.sleep(1.0)
-        raise TimeoutError("scanner did not become ready in time")
+
+        if reason.warming_up:
+            raise WarmingUp(f"scanner still warming up after {timeout_s}s")
+        raise DeviceNotReady(f"scanner did not become ready within {timeout_s}s ({reason})")
 
     def _start_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=1)

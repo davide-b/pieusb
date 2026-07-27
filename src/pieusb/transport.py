@@ -9,6 +9,8 @@ import logging
 import time
 import struct
 
+from pieusb.exceptions import CheckCondition, TransportError, Timeout
+
 log = logging.getLogger(__name__)
 
 REQUEST_TYPE_OUT = 0x40  # vendor, host-to-device
@@ -67,30 +69,6 @@ BULK_TIMEOUT_MS = 30_000
 BULK_CHUNK = 0x4000
 COMMAND_TIMEOUT_S = 60
 
-class CheckCondition(Exception):
-    def __init__(self, sense_key, sense_code, sense_qualifier):
-        self.sense_key = sense_key
-        self.sense_code = sense_code
-        self.sense_qualifier = sense_qualifier
-        super().__init__(
-            f"CHECK CONDITION key=0x{sense_key:02x} code=0x{sense_code:02x} "
-            f"qualifier=0x{sense_qualifier:02x}"
-        )
-
-    @property
-    def warming_up(self) -> bool:
-        return self.sense_key == 0x02 and self.sense_code == 4 and self.sense_qualifier == 1
-
-    @property
-    def must_calibrate(self) -> bool:
-        # "Calibration disable not granted" -- returned by START SCAN when
-        # skipShadingAnalysis was requested but the scanner insists on
-        # calibrating. In the SANE backend (sanei_pieusb_decode_sense) this maps
-        # to PIEUSB_STATUS_MUST_CALIBRATE, which is NOT an error: it is the
-        # signal to enter the calibration phase and read shading reference data
-        # (pieusb.c:1091-1121). We treat it the same way.
-        return self.sense_key == 0x06 and self.sense_code == 0x82 and self.sense_qualifier == 0
-
 class UASDevice:
     def __init__(self, dev: usb.core.Device) -> None:
         self.dev = dev
@@ -130,7 +108,7 @@ class UASDevice:
             if len(data) >= 1:
                 return data[0]
             time.sleep(0.05 * (attempt + 1))
-        raise IOError(f"ctrl_in_byte(port=0x{port:04x}) returned zero-length response after retries")
+        raise TransportError(f"ctrl_in_byte(port=0x{port:04x}) returned zero-length response after retries")
 
 
     def _bulk_size(self, size):
@@ -259,12 +237,12 @@ class UASDevice:
                         data_phase_retries += 1
                         status = STATUS_AGAIN
                         continue
-                    raise IOError(
+                    raise TransportError(
                         f"cmd 0x{opcode:02x}: OK but got {len(result)} bytes, expected {in_size}"
                     )
                 return result
             if status == STATUS_READ:
-                raise IOError("unexpected second READ status (protocol violation)")
+                raise TransportError("unexpected second READ status (protocol violation)")
             if status == STATUS_CHECK:
                 sense = self.get_sense()
                 raise CheckCondition(sense["sense_key"], sense["sense_code"], sense["sense_qualifier"])
@@ -275,10 +253,10 @@ class UASDevice:
                 continue
             if status in (STATUS_FAIL, STATUS_ERROR):
                 self.reset()
-                raise IOError(f"USB status 0x{status:02x}")
-            raise IOError(f"unhandled USB status 0x{status:02x}")
+                raise TransportError(f"USB status 0x{status:02x}")
+            raise TransportError(f"unhandled USB status 0x{status:02x}")
 
-        raise TimeoutError(f"command 0x{opcode:02x} timed out after {COMMAND_TIMEOUT_S}s")
+        raise Timeout(f"command 0x{opcode:02x} timed out after {COMMAND_TIMEOUT_S}s")
 
     def get_sense(self):
         raw = self.command(SCSI_REQUEST_SENSE, in_size=14)

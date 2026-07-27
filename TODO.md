@@ -133,20 +133,22 @@ surface it used to specify is gone, so several old items here went with it.
   both read before the pixel data, so correction can be applied to each chunk as it arrives —
   required for `progress`'s `chunk` to be presentable. `apply_shading_correction` (#11) is
   currently written to take the whole assembled array; it needs a per-chunk entry point.
-- [ ] 19c. **Exception hierarchy** (`exceptions.py`, per `DESIGN.md` "Exceptions"):
-  `PieusbError` base, with `DeviceNotReady` → `WarmingUp`, plus `CheckCondition`, `Timeout` and
-  `ScanInProgress`. `WarmingUp` subclasses `DeviceNotReady` because both are SCSI sense key
-  `NOT_READY` and warm-up is just the 0x04/0x01 sub-case (`pieusb_usb.c:387-397`).
-  `CheckCondition` moves out of `transport.py`, and `transport.py` should stop raising bare
-  `IOError`/`TimeoutError`.
-- [ ] 19d. **`ready()` / `wait_ready()` semantics** (`scanner.py:38-55`). Both are public now, so
-  their contracts need tightening:
-  - `ready()` currently re-raises any `CheckCondition` that is not warming-up; it should map
-    *every* `NOT_READY` sense to `False` and only let transport failures escape.
-  - `wait_ready()` raises a bare builtin `TimeoutError`; it should raise `WarmingUp` if the
-    device was still warming up when the timeout expired, `DeviceNotReady` otherwise.
-  - Both talk to the device, so both must raise `ScanInProgress` while a worker is running —
-    pyusb is not thread-safe and the worker owns the device.
+- [x] 19c. **Exception hierarchy** — `exceptions.py` created with `PieusbError` base,
+  `DeviceNotReady` → `WarmingUp`, `CheckCondition`, `Timeout`, `TransportError` and
+  `ScanInProgress`. `CheckCondition` moved out of `transport.py` (which now imports it), gained a
+  `not_ready` predicate, and all six bare `IOError`/`TimeoutError` raises in `transport.py`
+  became `TransportError`/`Timeout`.
+
+  `TransportError` was added beyond the set listed in `DESIGN.md` — the bare `IOError`s needed a
+  home, and folding them into `PieusbError` directly would have made the base class both a
+  category and a concrete error.
+- [x] 19d. **`ready()` / `wait_ready()` semantics** — `ready()` now maps every `NOT_READY` sense
+  to `False` (non-NOT_READY senses still propagate, since those are real errors), and
+  `wait_ready()` raises `WarmingUp` or `DeviceNotReady` instead of a builtin `TimeoutError`. A
+  shared `_why_not_ready()` returns the sense so `wait_ready()` can tell the two apart.
+- [ ] 19d-i. **Still open from 19d:** `ready()`/`wait_ready()` must raise `ScanInProgress` while a
+  worker is running — pyusb is not thread-safe and the worker owns the device. Deferred until the
+  worker exists (#17); there is no `_scanning` flag to guard on yet.
 - [ ] 19e. **`scan()` pre-flight readiness check.** Before spawning the worker, check the device
   and raise `WarmingUp` / `DeviceNotReady` on the calling thread so the caller can decide. The
   worker keeps its own bounded warm-up retry at START SCAN (matching `pieusb.c:1088-1093`), since

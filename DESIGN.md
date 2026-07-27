@@ -136,12 +136,21 @@ running — see the threading contract below.
 
 ```
 PieusbError
+├── TransportError        USB/SCSI transaction failed below the command layer
+├── Timeout               a command, or a wait for the device, did not complete in time
+├── CheckCondition        raw SCSI CHECK CONDITION with decoded sense data
 ├── DeviceNotReady        device is reachable but cannot start a scan
 │   └── WarmingUp         ... specifically because the lamp is warming up (retryable)
-├── CheckCondition        raw SCSI CHECK CONDITION with decoded sense data
-├── Timeout               a command did not complete in time
 └── ScanInProgress        host-side: this Scanner already has a worker running
 ```
+
+`CheckCondition` is what the *transport* layer raises: it reports what the device said and
+nothing more, exposing `not_ready` / `warming_up` / `must_calibrate` predicates over the sense
+triple. Translating a sense into `WarmingUp` or `DeviceNotReady` is the `Scanner`'s job, since
+that is an interpretation rather than a property of the transaction — and because
+`DeviceNotReady` also covers non-sense sources such as `Pieusb_Scanner_State.scanning`. The C
+backend splits it the same way: `sanei_pieusb_command()` returns a status, `sane_start()` decides
+what it means.
 
 `WarmingUp` subclasses `DeviceNotReady` so that `except DeviceNotReady` catches "cannot scan"
 generally, while a caller who wants to retry can catch `WarmingUp` specifically. That hierarchy
@@ -274,7 +283,7 @@ Split along the C backend's module boundaries.
 | `inquiry.py` | `InquiryResponse` parsing + model/VID-PID tables | `pieusb_specific.c` | done |
 | `postprocess.py` | Deinterleave by line tag, shading correction, (later) IR dust removal | `pieusb_buffer.c`, `sanei_pieusb_post` | missing |
 | `types.py` | Enums + dataclasses, incl. `ScanResult`/`ScanPhase` | — | partial |
-| `exceptions.py` | `PieusbError` base; `DeviceNotReady`, `WarmingUp`, `CheckCondition`, `Timeout`, `ScanInProgress` | — | `CheckCondition` in `transport.py` |
+| `exceptions.py` | `PieusbError` base; `DeviceNotReady`, `WarmingUp`, `CheckCondition`, `TransportError`, `Timeout`, `ScanInProgress` | — | done |
 
 `_device.py` folds into `__init__.py` + `inquiry.py`.
 
