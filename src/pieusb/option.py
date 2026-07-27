@@ -27,6 +27,8 @@ class Unit(Enum):
 
 T = TypeVar("T")
 
+# FIXME: Option is frozen but assigned to
+# maybe wrap frozen option into a modifiable param class
 @dataclass(frozen=True)
 class Option(Generic[T]):
     name: str
@@ -48,10 +50,10 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     modes = []
     if Filter.GREEN in inq.filters:
         modes.append('gray')
-    if set(Filter.RED, Filter.GREEN, Filter.BLUE) <= set(inq.filters):
-        modes.append('rbg')
-    if set(Filter.RED, Filter.GREEN, Filter.BLUE, Filter.INFRARED) <= set(inq.filters):
-        modes.append('rbgi')
+    if set({Filter.RED, Filter.GREEN, Filter.BLUE}) <= set(inq.filters):
+        modes.append('rgb')
+    if set({Filter.RED, Filter.GREEN, Filter.BLUE, Filter.INFRARED}) <= set(inq.filters):
+        modes.append('rgbi')
     out.append(Option(
         name='mode',
         type=str,
@@ -281,10 +283,10 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
 
     index = 128 # Trust me bro
-    x0 = options["tl_x"]
-    y0 = options["tl_y"]
-    x1 = options["br_x"]
-    y1 = options["br_y"]
+    x0 = options["tl_x"].value
+    y0 = options["tl_y"].value
+    x1 = options["br_x"].value
+    y1 = options["br_y"].value
     payload = struct.pack("<HHHHHHH", SCSI_SCAN_FRAME, 10, index, x0, y0, x1, y1)
     dev.command(SCSI_WRITE, out_data=payload, cdb_length=14)
 

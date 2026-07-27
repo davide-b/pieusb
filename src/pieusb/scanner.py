@@ -25,10 +25,10 @@ class Scanner:
     def __enter__(self) -> "Scanner":
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.dev.close()
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, value) -> None:
         opt = self.options[key]
         if type(value) is not opt.type:
             raise TypeError(f"Invalid type provided to option '{opt.name}' (got {type(value)}, expected {opt.type})")
@@ -82,7 +82,7 @@ class Scanner:
     def scan(self) -> numpy.ndarray:
         self.wait_ready()
 
-        set_options(self.options)
+        set_options(self.dev, self.options)
 
         self.wait_ready()
 

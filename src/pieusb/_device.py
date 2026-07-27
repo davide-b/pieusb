@@ -3,6 +3,8 @@ from pieusb.transport import UASDevice, SCSI_INQUIRY
 from pieusb.scanning import ScannerDevice
 
 from pieusb.inquiry import KNWON_PIDS, PIE_VENDOR_ID, parse_inquiry
+from pieusb.types import DeviceInfo
+from pieusb.scanner import Scanner
 
 def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
     header = dev.command(SCSI_INQUIRY, in_size=5, cdb_length=5)
@@ -11,8 +13,8 @@ def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
     raw = dev.command(SCSI_INQUIRY, in_size=total_size, cdb_length=total_size)
     return parse_inquiry(raw)
 
-def get_devices():# -> list[DeviceInfo]:
-    # devices: list[DeviceInfo] = []
+def get_devices() -> list[DeviceInfo]:
+    devices: list[DeviceInfo] = []
 
     for pid in KNWON_PIDS:
         dev = find_device(PIE_VENDOR_ID, pid)
@@ -20,10 +22,8 @@ def get_devices():# -> list[DeviceInfo]:
         if dev is not None:
             with UASDevice(dev) as d:
                 r = _get_inquiry(d)
-                print(r)
-                quit()
                 devices.append(DeviceInfo(
-                    id='pieusb:' + str(dev.bus) + ':' + str(dev.address),
+                    dev=dev,
                     vendor=r.vendor,
                     model=r.model_str,
                     inquiry=r
@@ -31,7 +31,5 @@ def get_devices():# -> list[DeviceInfo]:
 
     return devices
 
-def open(id: str) -> ScannerDevice:
-    _, bus, address = id.split(':')
-    dev = get_device(int(bus), int(address))
-    return ScannerDevice(dev)
+def open(dev: DeviceInfo) -> Scanner:
+    return Scanner(dev)

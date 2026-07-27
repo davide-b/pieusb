@@ -116,6 +116,10 @@ def parse_inquiry(raw: bytes) -> InquiryResponse:
         return b.rstrip(b"\x00").decode("ascii", errors="replace").strip()
 
     model_nr = struct.unpack_from("<H", raw, 116)[0]
+    if model_nr in MODEL_NAMES:
+        model_str = MODEL_NAMES[model_nr]
+    else:
+        model_str = 'Unknown'
     return InquiryResponse(
         vendor=txt(raw[8:16]),
         product=txt(raw[16:32]),
@@ -146,7 +150,7 @@ def parse_inquiry(raw: bytes) -> InquiryResponse:
         y0=struct.unpack_from("<H", raw, 112)[0],
         y1=struct.unpack_from("<H", raw, 114)[0],
         model=model_nr,
-        model_str=MODEL_NAMES[model_nr],
+        model_str=model_str,
         production=txt(raw[120:124]),
         timestamp=txt(raw[124:144]),
         signature=txt(raw[144:184]),
