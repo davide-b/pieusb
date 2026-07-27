@@ -10,19 +10,31 @@ from pieusb.exceptions import (
 )
 from pieusb.transport import (
     SCSI_READ,
+    SCSI_WRITE,
     SCSI_SCAN,
-    SCSI_TEST_UNIT_READY
+    SCSI_TEST_UNIT_READY,
+    SCSI_CALIBRATION_INFO,
+    SCSI_READ_GAIN_OFFSET,
+    SCSI_PARAM,
+    SCSI_COPY
 )
 
 import logging
 import numpy
 import time
+import threading
+import struct
+
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
+        self.scan_thread: threading.Thread | None = None
+        self.on_update: Callable[[int, int], None] | None = None
+        self.on_complete: Callable[[numpy.ndarray], None] | None = None
         self.params = generate_options(info.inquiry)
         self.dev.open()
 
@@ -105,12 +117,56 @@ class Scanner:
             log.debug(f"[scan]   {label}: {done}/{total_lines} lines read (remaining {remaining})")
         return bytes(collected)
 
+    def _get_shading_parms(self):
+        prep = bytes([SCSI_CALIBRATION_INFO | 0x80]) + bytes(5)
+        self.dev.command(SCSI_WRITE, out_data=prep, cdb_length=6)
+        raw = self.dev.command(SCSI_READ, in_size=32, cdb_length=32)
+        n_entries = raw[4]
+        entry_size = raw[5]
+        entries = []
+        for k in range(n_entries):
+            off = 8 + entry_size * k
+            entries.append({
+                "type": raw[off],
+                "n_lines": raw[off + 3],
+                "pixels_per_line": struct.unpack_from("<H", raw, off + 4)[0],
+            })
+        return entries
+
+    def _get_scan_parameters(self):
+        raw = self.dev.command(SCSI_PARAM, in_size=18, cdb_length=18)
+        return {
+            "width": struct.unpack_from("<H", raw, 0)[0],
+            "lines": struct.unpack_from("<H", raw, 2)[0],
+            "bytes_per_line": struct.unpack_from("<H", raw, 4)[0],
+            "available_lines": struct.unpack_from("<H", raw, 14)[0],
+        }
+
+    def _get_ccd_mask(self, mask_size):
+        return self.dev.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
+
+    def _get_gain_offset(self):
+        raw = self.dev.command(SCSI_READ_GAIN_OFFSET, in_size=103, cdb_length=103)
+        exposure_rgb = struct.unpack_from("<3H", raw, 60)
+        offset_rgb = tuple(raw[66:69])
+        gain_rgb = tuple(raw[72:75])
+        light = raw[75]
+        exposure_i = struct.unpack_from("<H", raw, 98)[0]
+        offset_i = raw[100]
+        gain_i = raw[102]
+        return {
+            "exposure_time": exposure_rgb + (exposure_i,),
+            "offset": offset_rgb + (offset_i,),
+            "gain": gain_rgb + (gain_i,),
+            "light": light,
+        }
+
     def stop_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=0)
 
-    def scan(self) -> numpy.ndarray:
+    def _scan_worker(self) -> None:
         self.wait_ready()
-
+        
         set_options(self.dev, self.params)
 
         self.wait_ready()
@@ -138,4 +194,8 @@ class Scanner:
                 raise
         self.wait_ready()
 
-        
+    def scan(self, on_update: Callable[[int, int], None], on_complete: Callable[[numpy.ndarray], None]) -> None:
+        self.on_update = on_update
+        self.on_complete = on_complete
+        self.scan_thread = threading.Thread(target=self._scan_worker)
+        self.scan_thread.start()
