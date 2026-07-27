@@ -66,6 +66,17 @@ to False, wiring quality bit `0x80`.
   exposure; both references do exposure first (`poc:672-679`). Probably harmless, but
   `get_shading_parms` (#10) has to land *between* exposure and SET SCAN FRAME, so the ordering
   is worth settling at the same time.
+- [ ] 12c. **Slide-transport models are not supported.** `sane_start()` issues two extra
+  commands on scanners with `FLAG_SLIDE_TRANSPORT`, neither of which exists here:
+  - `sanei_pieusb_cmd_17(device, 1)` after SET SCAN FRAME (`pieusb.c:1008-1023`), skipped on
+    models carrying `FLAG_CMD_17_NOSUPPORT` — so a per-model quirk flag is needed too.
+  - `sanei_pieusb_cmd_slide(device, SLIDE_INIT)` after SET MODE (`pieusb.c:1061-1073`), plus a
+    further `cmd_slide` after the read to advance the slide (`pieusb.c:1226`), which is what the
+    existing `advance` option is meant to drive.
+
+  `inquiry.slide_transport` already identifies these models (DigitDia 6000, DigitDia 4000) and
+  the `advance` option validates against it, but nothing sends the commands. The PoC is
+  ProScan 10T only, so it is no help here — this is C-backend-only territory.
 
 ## C. Safety — before the next hardware run
 
@@ -81,7 +92,7 @@ to False, wiring quality bit `0x80`.
   unit accordingly.
 - [ ] 15. `resolution` validator uses `v < min(max_x, max_y)` (`option.py:119`) — should be `<=`,
   otherwise the scanner's own maximum resolution is rejected.
-- [x] 16. **`calibrate` default flipped to True.** It defaulted to False, which sets quality bit
+- [x] 15a. **`calibrate` default flipped to True.** It defaulted to False, which sets quality bit
   `0x08` (`skipShadingAnalysis`) and takes the path the PoC never validated: skipping the
   shading pass makes the device reject the following CCD MASK and GET PARAMETERS as "invalid
   command", and it is the only route to the `must_calibrate` branch in `scanner.py:99-108`.
@@ -89,17 +100,59 @@ to False, wiring quality bit `0x80`.
 
 ## D. API surface still missing vs `DESIGN.md`
 
-- [ ] 16. `Scanner` has `__setitem__` but no `__getitem__`, and none of the
-  options-as-attributes `__getattr__`/`__setattr__` magic that is the point of the python-sane shape.
-- [ ] 17. Missing methods: `start()`, `snap()`, `arr_snap()`, `arr_scan()`, `get_parameters()`,
-  `cancel()`, `close()`, `get_options()`, plus the virtual attrs `optlist` / `area` /
-  `scanner_model`. `__exit__` closes but there is no standalone `close()`.
-- [ ] 18. `__init__.py` exports only `get_devices` — needs `init()`, `open()`, `exit()`,
-  `Scanner`, and the exceptions.
-- [ ] 19. Resolve the two documented divergences (`DESIGN.md:107-117`): what `snap()` does for
-  4-plane rgbi, and `get_parameters()` before vs. after `start()`.
+`DESIGN.md` was reduced to `available_devices()` / `Scanner` / `scan()`; the python-sane-shaped
+surface it used to specify is gone, so several old items here went with it.
 
-## E. Module split (`DESIGN.md:44-56`), partially done
+- [ ] 16. **Options-as-attributes.** `Scanner` has `__setitem__` but no `__getitem__`, and no
+  `__getattr__`/`__setattr__`, which is how `scanner.resolution = 5000` has to work. Note
+  `__setattr__` needs care: `Scanner.__init__` assigns real attributes (`dev`, `params`), so it
+  must fall through for anything not in the option table.
+- [ ] 17. **`scan()` is non-blocking now.** `scan(progress=None, scan_complete=None) -> None`
+  spawns a worker thread; plus `cancel()`, `wait(timeout=None)`, `close()`, a readable
+  `scanner.phase` / `scanner.scanning`, and a busy guard like the C backend's
+  `scanner->scanning` (`pieusb.c:897-901`). `start()`/`snap()`/`arr_snap()`/`get_parameters()`
+  are not planned. Implementation constraints, all in `DESIGN.md` "Threading contract":
+  - whole-table validation runs on the *calling* thread before the worker starts, so bad options
+    raise instead of arriving in a callback;
+  - `cancel()` must not touch the device — pyusb is not thread-safe, so it sets a flag the
+    worker checks between chunk reads and the worker issues STOP SCAN;
+  - `__exit__` must cancel and join, or a `with` block can release the interface while the
+    worker is mid-read.
+- [ ] 18. **Rename `get_devices()` → `available_devices()`** and export it, `Scanner`, the types
+  and the exceptions from `__init__.py`, which currently exports only `get_devices`.
+- [ ] 19. **Callbacks.** `progress(scanned_lines, total_lines, chunk, plane)` fired once per
+  plane-run per chunked read, and `scan_complete(result: ScanResult)` fired exactly once on
+  success, cancellation *and* failure. `ScanResult` + `ScanPhase` go in `types.py`. Note the
+  chunk shape is `(n_lines, pixels_per_line)` single-plane, not an image strip — see #19a.
+- [ ] 19a. **Split each raw read by channel tag before reporting it.** Planes arrive as
+  sequential blocks and the 255-line cap does not align to plane boundaries (`poc:794-818`), so
+  one device read can straddle a channel transition and must produce two `progress` calls. This
+  is also what makes a live preview possible at all: the other channels for a given row do not
+  exist until much later in the scan.
+- [ ] 19b. **Shading-correct per chunk, not at the end.** The shading reference and CCD mask are
+  both read before the pixel data, so correction can be applied to each chunk as it arrives —
+  required for `progress`'s `chunk` to be presentable. `apply_shading_correction` (#11) is
+  currently written to take the whole assembled array; it needs a per-chunk entry point.
+- [ ] 19c. **Exception hierarchy** (`exceptions.py`, per `DESIGN.md` "Exceptions"):
+  `PieusbError` base, with `DeviceNotReady` → `WarmingUp`, plus `CheckCondition`, `Timeout` and
+  `ScanInProgress`. `WarmingUp` subclasses `DeviceNotReady` because both are SCSI sense key
+  `NOT_READY` and warm-up is just the 0x04/0x01 sub-case (`pieusb_usb.c:387-397`).
+  `CheckCondition` moves out of `transport.py`, and `transport.py` should stop raising bare
+  `IOError`/`TimeoutError`.
+- [ ] 19d. **`ready()` / `wait_ready()` semantics** (`scanner.py:38-55`). Both are public now, so
+  their contracts need tightening:
+  - `ready()` currently re-raises any `CheckCondition` that is not warming-up; it should map
+    *every* `NOT_READY` sense to `False` and only let transport failures escape.
+  - `wait_ready()` raises a bare builtin `TimeoutError`; it should raise `WarmingUp` if the
+    device was still warming up when the timeout expired, `DeviceNotReady` otherwise.
+  - Both talk to the device, so both must raise `ScanInProgress` while a worker is running —
+    pyusb is not thread-safe and the worker owns the device.
+- [ ] 19e. **`scan()` pre-flight readiness check.** Before spawning the worker, check the device
+  and raise `WarmingUp` / `DeviceNotReady` on the calling thread so the caller can decide. The
+  worker keeps its own bounded warm-up retry at START SCAN (matching `pieusb.c:1088-1093`), since
+  by then there is no caller left to ask; exhausting it surfaces as `result.error = WarmingUp`.
+
+## E. Module split (`DESIGN.md` "Module structure"), partially done
 
 - [x] 20. **Delete `scanning.py`** — done.
 - [ ] 21. Rename `option.py` → `options.py`, `usb_utils.py` → `usb.py`; fold `_device.py` into
@@ -118,10 +171,10 @@ to False, wiring quality bit `0x80`.
 
 ## E2. Enumeration / open, decisions left over from A
 
-- [ ] 24. **`open(DeviceInfo)` diverges from `DESIGN.md:20,45,121`**, which specifies
-  `pieusb.open("pieusb:1:5")` and a `(name, vendor, model, type)` tuple from `get_devices()`.
-  The comment at `_device.py:34-36` argues the string round-trip is pointless, which is a fair
-  call — but then `DESIGN.md` should record the decision, and #23's `get_device()` goes away.
+- [x] 24. **`open()` vs device-name strings — settled.** `DESIGN.md` now drops `open()` and the
+  `pieusb:bus:addr` string entirely: `available_devices()` returns `DeviceInfo` objects carrying
+  the live `usb.core.Device`, and `Scanner(info)` is constructed from one directly. Delete the
+  `open()` wrapper in `_device.py:37-38` along with `usb_utils.get_device()` (#23).
 - [ ] 25. **`find_device()` returns only the first match per PID** (`usb_utils.py:30`, no
   `find_all=True`), so two identical scanners enumerate as one.
 - [ ] 26. **Verify the re-open path on hardware.** `get_devices()` opens each device and closes
@@ -140,5 +193,5 @@ to False, wiring quality bit `0x80`.
   MODE SELECT payload equals `00 0f e8 03 80 04 04 00 01 02 00 00 00 80 10 00` for res 1000 /
   RGB / 8-bit / sharpen — that is the C backend's own documented capture and it caught the
   `colorFormat` assumption in the PoC.
-- [ ] 29. `pyproject.toml:8` still says `"Add your description here"`; add Pillow if `snap()` is
-  to return a `PIL.Image` as designed.
+- [ ] 29. `pyproject.toml:8` still says `"Add your description here"`. No Pillow dependency is
+  needed — `DESIGN.md` now returns numpy only.

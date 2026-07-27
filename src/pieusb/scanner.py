@@ -36,7 +36,7 @@ class Scanner:
             raise ValueError(f"Invalid value provided to option '{par.opt.name}'")
         par.value = value
 
-    def _ready(self) -> bool:
+    def ready(self) -> bool:
         try:
             self.dev.command(SCSI_TEST_UNIT_READY, cdb_length=0)
             return True
@@ -49,7 +49,7 @@ class Scanner:
         log.debug("  [wait_ready] polling TEST UNIT READY...")
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if self._ready():
+            if self.ready():
                 log.debug("  [wait_ready] ready")
                 return
             time.sleep(1.0)
