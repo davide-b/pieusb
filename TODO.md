@@ -1,43 +1,40 @@
 # pieusb — next steps
 
-Status audit of the mid-refactor tree (see `DESIGN.md` for the target shape). Everything
-compiles, but nothing runs end-to-end: enumeration raises, `Scanner` cannot be constructed,
-and `scan()` stops right after START SCAN.
+Status audit of the mid-refactor tree (see `DESIGN.md` for the target shape). The package
+imports and `set_options()` now runs to completion, but `Scanner.scan()` still stops right
+after START SCAN, so there is no working acquisition path yet.
 
 Cross-checked against the reference PoC (`~/sw/pieusb_ref/pieusb_proscan10t_poc.py`, cited
 below as `poc:LINE`) and the SANE C backend (`~/backends/backend/pieusb*.c`).
 
-**Suggested first slice:** section A (1–8) + D-20 + F-24 — restores `pieusb.get_devices()`
-and drops the dead code, no hardware needed. Then C-13 before any scan attempt, then B.
+**Next up:** C-13 (frame bounds check) before any hardware run, then B.
 
-## A. Blocking bugs — cannot enumerate or scan
+## A. Blocking bugs — DONE
 
-- [ ] 1. **`get_devices()` is broken** (`src/pieusb/_device.py:14-32`): `devices` never
-  initialized (declaration commented out at :15), `print(r)` + `quit()` debug leftovers at
-  :23-24, `DeviceInfo` not imported, and the constructor is called with `id=` which is not a
-  field of `types.DeviceInfo` (`dev, vendor, model, inquiry`). This is the one thing
-  `tests/exercise.py` calls.
-- [ ] 2. **`open()` returns the dead class** (`_device.py:34-37`): builds `ScannerDevice(dev)`,
-  not `Scanner(info)`. Unresolved design point: `Scanner.__init__` needs a `DeviceInfo` (hence
-  an INQUIRY), so `open(name)` must re-enumerate + inquire, and `DeviceInfo` needs to carry
-  both the `usb.core.Device` and the `pieusb:bus:addr` name string that `get_devices()` hands out.
-- [ ] 3. **`set(...)` misuse** (`option.py:51,53`): `set(Filter.RED, Filter.GREEN, Filter.BLUE)`
-  raises `TypeError` — needs `{...}`. `generate_options()` therefore fails on first call, so
-  `Scanner()` can never construct.
-- [ ] 4. **Mode name typos + unsatisfiable default** (`option.py:51-61`): `'rbg'`/`'rbgi'` should
-  be `'rgb'`/`'rgbi'`; the default `value='rgb'` does not validate against the list as written.
-- [ ] 5. **`Option` is frozen but assigned to** (`option.py:30` vs `scanner.py:37`):
-  `opt.value = value` raises `FrozenInstanceError`. Decide: make `Option` mutable, or keep it
-  frozen and hold values in a separate dict / use `dataclasses.replace`.
-- [ ] 6. **`Option` objects passed to `struct.pack`** (`option.py:284-288`):
-  `x0 = options["tl_x"]` is missing `.value` for all four frame coordinates.
-- [ ] 7. **`set_mode` is unfinished** (`option.py:316-327`): 11 format chars vs 5 args, result
-  unassigned, and no `dev.command(SCSI_MODE_SELECT, ...)` — the file simply ends. Port the
-  PoC version (`poc:465-483`): 16-byte payload, `data[1]=15`, dpi at 2, `MODE_PASSES[mode]`
-  (0x80 color / 0x90 rgbi) at 4, `0x04`/`0x20` depth at 5, `colorFormat=0x04` at 6,
-  `byteOrder=0x01` at 8, quality at 9, threshold at 13, `0x10` at 14.
-- [ ] 8. **`KNWON_PIDS` → `KNOWN_PIDS`**, and **`MODEL_NAMES[model_nr]` KeyErrors on unknown
-  models** (`inquiry.py:15,149`) — both already flagged in `DESIGN.md:125-126`, still open.
+All eight closed:
+
+- [x] 1. `get_devices()` builds a real `list[DeviceInfo]`; debug `print`/`quit()` gone.
+- [x] 2. `open()` returns a `Scanner`; the dead `ScannerDevice` is gone with `scanning.py`.
+- [x] 3. `set(...)` misuse fixed — `generate_options()` runs.
+- [x] 4. Mode names are `'gray'`/`'rgb'`/`'rgbi'` and the default validates.
+- [x] 5. Frozen-`Option` solved by the `Option` (immutable descriptor) / `Parameter` (mutable
+  value) split, with `Parameter.__init__` asserting the default passes its own validator.
+- [x] 6. `.value` added on the four frame coordinates.
+- [x] 7. `set_mode` implemented — see the note below.
+- [x] 8. `KNOWN_PIDS` renamed; `MODEL_NAMES` KeyError guarded (`inquiry.py:118-122`).
+
+**Note on `set_mode`** (`option.py`, end of `set_options`): built from
+`sanei_pieusb_cmd_set_mode()` (`pieusb_scancmd.c:731-800`) rather than the PoC, because the
+PoC hardcodes `colorFormat = 0x04` — true only for colour/rgbi. `sanei_pieusb_set_mode_from_options()`
+(`pieusb_specific.c:1808-1838`) shows `passes` and `colorFormat` are picked together per mode,
+which the `'gray'` mode needs. Byte-verified against the capture documented at
+`pieusb_scancmd.c:759-772`; the only difference is byte 13 (line threshold), where we send
+`0x80` per the cyberview capture and the PoC rather than that dump's `0x7f`. It only affects
+lineart/halftone, which are unimplemented.
+
+Two defaults settled while doing this: `calibrate` now defaults to **True** (the PoC's
+proven-working configuration — see C-16), and a `fast_infrared` option was added, defaulting
+to False, wiring quality bit `0x80`.
 
 ## B. Finish the scan path
 
@@ -54,12 +51,21 @@ and drops the dead code, no hardware needed. Then C-13 before any scan attempt, 
     `# maybe in SANE is 5?` comment. The 29-byte payload offsets in `option.py:292-314` were
     verified to match the PoC byte-for-byte — only the `light` value and the missing round trip
     are open questions.
-  - `get_ccd_mask` exists only on the dead `ScannerDevice` (`scanning.py:59`).
+  - `get_ccd_mask` — was on the deleted `ScannerDevice`, now exists nowhere.
 - [ ] 11. **Port the postprocessing** (`poc:561-660` → `postprocess.py`): `calculate_shading`,
   `build_width_to_loc`, `apply_shading_correction`. Pure numpy, and the most testable code in
   the project.
-- [ ] 12. **Infrared exposure never sent** (`option.py:279-281`): the loop covers filters
+- [ ] 12. **Infrared exposure never sent** (`option.py`, the SET EXPOSURE loop): covers filters
   0x02/0x04/0x08 only; `exp_i` is packed into gain/offset but no SET EXPOSURE for filter 0x10.
+- [ ] 12a. **`'gray'` mode returns untagged data.** Now that `set_mode` maps gray to
+  `SCAN_COLOR_FORMAT_PIXEL`, gray scans come back as interleaved pixels with *no* per-line
+  `RR`/`GG`/`BB`/`II` tag — so the tag-based deinterleave #9 needs must not be applied to them.
+  Per `pieusb_scancmd.h:165-173`, in a single-filter scan only the first pixel of each triple
+  holds valid data. Either handle both layouts in #9 or reject `'gray'` until it is handled.
+- [ ] 12b. **Command order differs from the PoC/C.** `set_options` sends highlight/shadow before
+  exposure; both references do exposure first (`poc:672-679`). Probably harmless, but
+  `get_shading_parms` (#10) has to land *between* exposure and SET SCAN FRAME, so the ordering
+  is worth settling at the same time.
 
 ## C. Safety — before the next hardware run
 
@@ -73,8 +79,13 @@ and drops the dead code, no hardware needed. Then C-13 before any scan attempt, 
   (10000 dpi on the ProScan 10T), independent of the requested dpi — while `DESIGN.md:76` wants
   the public API in mm. Pick one, do the mm↔native conversion in a single place, and rename the
   unit accordingly.
-- [ ] 15. `resolution` validator uses `v < min(max_x, max_y)` (`option.py:77`) — should be `<=`.
-  `advance`'s validator ignores its argument (`option.py:115`).
+- [ ] 15. `resolution` validator uses `v < min(max_x, max_y)` (`option.py:119`) — should be `<=`,
+  otherwise the scanner's own maximum resolution is rejected.
+- [x] 16. **`calibrate` default flipped to True.** It defaulted to False, which sets quality bit
+  `0x08` (`skipShadingAnalysis`) and takes the path the PoC never validated: skipping the
+  shading pass makes the device reject the following CCD MASK and GET PARAMETERS as "invalid
+  command", and it is the only route to the `must_calibrate` branch in `scanner.py:99-108`.
+  True matches the PoC's `skip_shading_analysis=False` default.
 
 ## D. API surface still missing vs `DESIGN.md`
 
@@ -90,23 +101,44 @@ and drops the dead code, no hardware needed. Then C-13 before any scan attempt, 
 
 ## E. Module split (`DESIGN.md:44-56`), partially done
 
-- [ ] 20. **Delete `scanning.py`** — `ScannerDevice` is dead and duplicates `Scanner`'s
-  `ready`/`wait_ready`/`start_scan`/`stop_scan`; only `_device.py`'s broken `open()` still
-  references it.
+- [x] 20. **Delete `scanning.py`** — done.
 - [ ] 21. Rename `option.py` → `options.py`, `usb_utils.py` → `usb.py`; fold `_device.py` into
   `__init__.py` + `inquiry.py`.
 - [ ] 22. Not yet created: `commands.py`, `protocol.py`, `postprocess.py`, `exceptions.py`.
   Extracting `protocol.py` also fixes that `SCSI_SCAN_FRAME = 0x12` (virtual subcommand)
   currently collides with `SCSI_INQUIRY = 0x12` (opcode) in one namespace, and that
-  `SCSI_REQUEST_SENSE` is defined twice (`transport.py:32,53`).
-- [ ] 23. Minor: unused `DeviceInfo` import in `inquiry.py:9`, unused `usb.core` in `scanner.py:2`.
+  `SCSI_REQUEST_SENSE` is defined twice (`transport.py:32,53`). The MODE SELECT constants
+  added for `set_mode` (`SCAN_*`, `MODE_SETTINGS`, `COLOR_DEPTHS`) belong there too.
+- [ ] 23. Dead/unused code:
+  - `usb_utils.get_device(bus, address)` is now referenced nowhere — `open()` takes a
+    `DeviceInfo`, so the `pieusb:bus:addr` string never needs resolving back to a device.
+    Delete it, or keep it and settle #24 first.
+  - unused `DeviceInfo` import in `inquiry.py:9` (and `ColorFormat` is imported twice there);
+    unused `usb.core` in `scanner.py:2`.
+
+## E2. Enumeration / open, decisions left over from A
+
+- [ ] 24. **`open(DeviceInfo)` diverges from `DESIGN.md:20,45,121`**, which specifies
+  `pieusb.open("pieusb:1:5")` and a `(name, vendor, model, type)` tuple from `get_devices()`.
+  The comment at `_device.py:34-36` argues the string round-trip is pointless, which is a fair
+  call — but then `DESIGN.md` should record the decision, and #23's `get_device()` goes away.
+- [ ] 25. **`find_device()` returns only the first match per PID** (`usb_utils.py:30`, no
+  `find_all=True`), so two identical scanners enumerate as one.
+- [ ] 26. **Verify the re-open path on hardware.** `get_devices()` opens each device and closes
+  it through `__exit__` → `dispose_resources()`, then `Scanner.__init__` calls
+  `set_configuration()` + `claim_interface()` on that same `usb.core.Device`. Probably fine, but
+  the PoC never exercised open → close → reopen.
 
 ## F. Tooling
 
-- [ ] 24. **The package is not installed in `.venv`** — `import pieusb` fails without
+- [ ] 27. **The package is not installed in `.venv`** — `import pieusb` fails without
   `PYTHONPATH=src`, so `tests/exercise.py` cannot run as-is. `uv pip install -e .`.
-- [ ] 25. **No tests.** `tests/exercise.py` is two lines and needs hardware. `parse_inquiry` /
+- [ ] 28. **No tests.** `tests/exercise.py` is two lines and needs hardware. `parse_inquiry` /
   `parse_*` and the whole shading pipeline are pure functions — worth a pytest suite against a
   captured INQUIRY blob and synthetic shading lines. Add pytest as a dev dependency.
-- [ ] 26. `pyproject.toml:8` still says `"Add your description here"`; add Pillow if `snap()` is
+  First case to write: feed `set_options` a fake device that records commands and assert the
+  MODE SELECT payload equals `00 0f e8 03 80 04 04 00 01 02 00 00 00 80 10 00` for res 1000 /
+  RGB / 8-bit / sharpen — that is the C backend's own documented capture and it caught the
+  `colorFormat` assumption in the PoC.
+- [ ] 29. `pyproject.toml:8` still says `"Add your description here"`; add Pillow if `snap()` is
   to return a `PIL.Image` as designed.

@@ -12,11 +12,43 @@ from pieusb.inquiry import (
 from pieusb.transport import (
     UASDevice,
     SCSI_WRITE,
+    SCSI_MODE_SELECT,
     SCSI_HIGHLIGHT_SHADOW,
     SCSI_EXPOSURE,
     SCSI_SCAN_FRAME,
     SCSI_WRITE_GAIN_OFFSET
 )
+
+# MODE SELECT payload constants, from pieusb_specific.h:55-75.
+
+# 'passes' -- which filters the scanner acquires in a single pass
+SCAN_ONE_PASS_RGBI = 0x90
+SCAN_ONE_PASS_COLOR = 0x80
+SCAN_FILTER_GREEN = 0x04
+
+# 'colorFormat' -- how the scanner lays the returned data out. INDEX means every
+# line is prefixed by a two-byte 'RR'/'GG'/'BB'/'II' channel tag; PIXEL means
+# interleaved RGB pixels, of which only the first is valid in a single-filter scan.
+SCAN_COLOR_FORMAT_INDEX = 0x04
+SCAN_COLOR_FORMAT_PIXEL = 0x01
+
+# mode name -> (passes, colorFormat), per sanei_pieusb_set_mode_from_options()
+# (pieusb_specific.c:1808-1838). Gray is the green filter alone: the C backend
+# notes it was "unable to get R & B & I to work" as single-filter scans.
+MODE_SETTINGS = {
+    'gray': (SCAN_FILTER_GREEN, SCAN_COLOR_FORMAT_PIXEL),
+    'rgb': (SCAN_ONE_PASS_COLOR, SCAN_COLOR_FORMAT_INDEX),
+    'rgbi': (SCAN_ONE_PASS_RGBI, SCAN_COLOR_FORMAT_INDEX),
+}
+
+# 'colorDepth' bitmask, pieusb_specific.h:64-70
+COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
+
+# 'lineThreshold', where 0xFF is 100%. Only meaningful for the lineart/halftone
+# modes, which aren't supported yet. The C backend derives it from OPT_THRESHOLD
+# (pieusb_specific.c:1864); 128 is what the cyberview capture quoted in
+# pieusb_scancmd.c:757 sends, and what the PoC uses.
+LINE_THRESHOLD = 128
 
 class Unit(Enum):
     MM = 0
@@ -90,7 +122,9 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
 
     # Halftone
 
-    # Increase sharpness by giving more time to the CCD to discharge between each line
+    # Increase sharpness by giving more time to the CCD to discharge between each line.
+    # Only effective with 'fast_infrared' off and a one-pass colour mode
+    # (pieusb_scancmd.h:180).
     out.append(Parameter(Option(
         name='sharpen',
         type=bool,
@@ -99,12 +133,25 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Force calibration of the CCD sensor
+    # Collect shading (flat-field) information as part of the scan. Turning this
+    # off sets the 'skip calibration' quality bit, which makes the scanner reject
+    # the subsequent CCD MASK and GET PARAMETERS commands as invalid -- the whole
+    # read sequence in Scanner.scan() depends on the shading pass having run.
     out.append(Parameter(Option(
         name='calibrate',
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
+        default=True
+    )))
+
+    # Acquire the infrared plane in a faster, lower-quality pass. Requires a
+    # scanner with an infrared filter, and disables 'sharpen' when on.
+    out.append(Parameter(Option(
+        name='fast_infrared',
+        type=bool,
+        unit=Unit.NONE,
+        validate=lambda v: not v or Filter.INFRARED in inq.filters,
         default=False
     )))
 
@@ -323,16 +370,33 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
     )
     dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload, cdb_length=29)
 
-    # Set mode
+    # Set mode -- MODE SELECT, a fixed 16-byte payload built byte by byte, per
+    # sanei_pieusb_cmd_set_mode() (pieusb_scancmd.c:731-800). Bytes 0, 7, 10, 11
+    # and 15 are unused and stay zero.
+    passes, color_format = MODE_SETTINGS[options['mode'].value]
+
+    # Quality bitmask, byte 9 (pieusb_scancmd.c:790-794)
     quality = 0
     if options['sharpen'].value:
         quality |= 0x02
     if not options['calibrate'].value:
+        # skipShadingAnalysis. The C backend sets this bit when shading analysis
+        # is *not* wanted: skipShadingAnalysis = !OPT_SHADING_ANALYSIS
+        # (pieusb_specific.c:1857), so 'calibrate' inverts into it.
         quality |= 0x08
-    struct.pack('<BBHBBBBBBBB',
-        0,
-        15, # Mode size, for some reason
-        options['resolution'].value,
-        0, # TODO: passes
-        options['color_depth'].value,
-    )
+    if options['fast_infrared'].value:
+        quality |= 0x80
+
+    payload = bytearray(16)
+    payload[1] = 15 # Size of the data that follows
+    struct.pack_into('<H', payload, 2, options['resolution'].value)
+    payload[4] = passes
+    payload[5] = COLOR_DEPTHS[options['color_depth'].value]
+    payload[6] = color_format
+    payload[8] = 0x01 # byteOrder: Intel, only bit 0 is used
+    payload[9] = quality
+    payload[12] = 0x00 # halftonePattern; the C backend only ever sends 0
+    payload[13] = LINE_THRESHOLD
+    payload[14] = 0x10 # Unexplained, but sent unconditionally by the C backend
+                       # (pieusb_scancmd.c:797) and present in the cyberview capture
+    dev.command(SCSI_MODE_SELECT, out_data=bytes(payload), cdb_length=16)
