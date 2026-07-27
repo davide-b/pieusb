@@ -46,7 +46,11 @@ class OptionsTable:
         self.table = params
 
     def __getitem__(self, key) -> Parameter:
-        return next(filter(lambda o: o.opt.name == key, self.table))
+        try:
+            out = next(filter(lambda o: o.opt.name == key, self.table))
+            return out
+        except StopIteration:
+            raise KeyError(f"No parameter named {key} exists")
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
     out: list[Parameter] = []

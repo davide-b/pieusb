@@ -12,7 +12,7 @@ from pieusb.types import (
 import struct
 
 PIE_VENDOR_ID = 0x05E3
-KNWON_PIDS = [0x0142, 0x0144, 0x0145]
+KNOWN_PIDS = [0x0142, 0x0144, 0x0145]
 MODEL_NAMES = {
     0x003a: 'DigitDia 6000 Multiple Slide Scanner',
     0x0030: 'CrystalScan 7200',

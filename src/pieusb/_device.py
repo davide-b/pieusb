@@ -2,7 +2,7 @@ from pieusb.usb_utils import find_device
 from pieusb.transport import UASDevice, SCSI_INQUIRY
 from pieusb.scanner import Scanner
 
-from pieusb.inquiry import KNWON_PIDS, PIE_VENDOR_ID, parse_inquiry
+from pieusb.inquiry import NKOWN_PIDS, PIE_VENDOR_ID, parse_inquiry
 from pieusb.types import DeviceInfo
 
 def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
@@ -15,7 +15,7 @@ def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
 def get_devices() -> list[DeviceInfo]:
     devices: list[DeviceInfo] = []
 
-    for pid in KNWON_PIDS:
+    for pid in NKOWN_PIDS:
         dev = find_device(PIE_VENDOR_ID, pid)
 
         if dev is not None:
