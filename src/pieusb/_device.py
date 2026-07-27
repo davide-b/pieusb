@@ -1,6 +1,6 @@
 from pieusb.usb_utils import find_device, get_device
 from pieusb.transport import UASDevice, SCSI_INQUIRY
-from pieusb.scanning import ScannerDevice
+from pieusb.scanner import Scanner
 
 from pieusb.inquiry import KNWON_PIDS, PIE_VENDOR_ID, parse_inquiry
 from pieusb.types import DeviceInfo
