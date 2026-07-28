@@ -256,9 +256,12 @@ surface it used to specify is gone, so several old items here went with it.
 
 - [ ] 27. **The package is not installed in `.venv`** — `import pieusb` fails without
   `PYTHONPATH=src`, so `tests/exercise.py` cannot run as-is. `uv pip install -e .`.
-- [ ] 28. **No tests.** `tests/exercise.py` is two lines and needs hardware. `parse_inquiry` /
-  `parse_*` and the whole shading pipeline are pure functions — worth a pytest suite against a
-  captured INQUIRY blob and synthetic shading lines. Add pytest as a dev dependency.
+- [ ] 28. **No automated tests.** `tests/exercise.py` is now a full hardware driver — enumerate,
+  configure (`--mode`/`--resolution`/`--depth`/`--frame-mm`/`-o NAME=VALUE`), `--dry-run`,
+  progress bar, Ctrl-C cancel, `.npy` output and per-channel statistics — but it still needs a
+  scanner. `parse_inquiry` / `parse_*` and the whole shading pipeline are pure functions — worth
+  a pytest suite against a captured INQUIRY blob and synthetic shading lines. Add pytest as a dev
+  dependency.
   First case to write: feed `set_options` a fake device that records commands and assert the
   MODE SELECT payload equals `00 0f e8 03 80 04 04 00 01 02 00 00 00 80 10 00` for res 1000 /
   RGB / 8-bit / sharpen — that is the C backend's own documented capture and it caught the
