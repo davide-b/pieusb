@@ -141,8 +141,14 @@ PieusbError
 ├── CheckCondition        raw SCSI CHECK CONDITION with decoded sense data
 ├── DeviceNotReady        device is reachable but cannot start a scan
 │   └── WarmingUp         ... specifically because the lamp is warming up (retryable)
+├── ParamError            option values that are individually valid but conflict
 └── ScanInProgress        host-side: this Scanner already has a worker running
 ```
+
+`ParamError` is what whole-table validation raises — the cross-option checks that per-option
+validators structurally cannot express, such as `tl_x < br_x`. It is distinct from the
+`TypeError`/`ValueError` a single bad assignment raises, because it can only be detected once the
+whole table is known.
 
 `CheckCondition` is what the *transport* layer raises: it reports what the device said and
 nothing more, exposing `not_ready` / `warming_up` / `must_calibrate` predicates over the sense
@@ -283,7 +289,7 @@ Split along the C backend's module boundaries.
 | `inquiry.py` | `InquiryResponse` parsing + model/VID-PID tables | `pieusb_specific.c` | done |
 | `postprocess.py` | Deinterleave by line tag, shading correction, (later) IR dust removal | `pieusb_buffer.c`, `sanei_pieusb_post` | missing |
 | `types.py` | Enums + dataclasses, incl. `ScanResult`/`ScanPhase` | — | partial |
-| `exceptions.py` | `PieusbError` base; `DeviceNotReady`, `WarmingUp`, `CheckCondition`, `TransportError`, `Timeout`, `ScanInProgress` | — | done |
+| `exceptions.py` | `PieusbError` base; `DeviceNotReady`, `WarmingUp`, `CheckCondition`, `TransportError`, `Timeout`, `ScanInProgress`, `ParamError` | — | done |
 
 `_device.py` folds into `__init__.py` + `inquiry.py`.
 

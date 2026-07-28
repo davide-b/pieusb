@@ -85,3 +85,7 @@ class CheckCondition(PieusbError):
         return (self.sense_key == SENSE_KEY_UNIT_ATTENTION
                 and self.sense_code == 0x82
                 and self.sense_qualifier == 0x00)
+
+class ParamError(PieusbError):
+    '''Some parameter values are incompatible with each other
+    '''

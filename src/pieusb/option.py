@@ -18,6 +18,7 @@ from pieusb.transport import (
     SCSI_SCAN_FRAME,
     SCSI_WRITE_GAIN_OFFSET
 )
+from pieusb.exceptions import ParamError
 
 # MODE SELECT payload constants, from pieusb_specific.h:55-75.
 
@@ -83,6 +84,17 @@ class OptionsTable:
             return out
         except StopIteration:
             raise KeyError(f"No parameter named {key} exists")
+
+    def validate(self) -> None:
+        '''
+        Cross check parameter values
+        Raise if any of them are incompatible with eachother
+        '''
+        if self['tl_x'].value >= self['br_x'].value:
+            raise ParamError(f"Parameter 'tl_x' ({self['tl_x'].value}px) must be smaller than parameter 'br_x' ({self['br_x'].value}px)")
+
+        if self['tl_y'].value >= self['br_y'].value:
+            raise ParamError(f"Parameter 'tl_y' ({self['tl_y'].value}px) must be smaller than parameter 'br_y' ({self['br_y'].value}px)")
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
     out: list[Parameter] = []

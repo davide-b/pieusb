@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 import usb.core
+import numpy
 
 class Filter(StrEnum):
     INFRARED = 'Infrared'
@@ -75,3 +76,21 @@ class DeviceInfo:
     vendor: str
     model: str
     inquiry: InquiryResponse
+
+class ScanPhase(StrEnum):
+    CONFIGURING = 'Configuring'
+    WARMING_UP = 'Warming up'
+    CALIBRATING = 'Calibrating'
+    SCANNING = 'Scanning'
+    PROCESSING = 'Post process'
+
+@dataclass(frozen=True)
+class UpdateData:
+    phase: ScanPhase
+    scanned_lines: int | None = None
+    total_lines: int | None = None
+
+@dataclass(frozen=True)
+class ScanResult:
+    rgb: numpy.ndarray
+    ir: numpy.ndarray | None

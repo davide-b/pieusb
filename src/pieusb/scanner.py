@@ -1,8 +1,12 @@
 from pieusb.transport import UASDevice
-import usb.core
 
 from pieusb.option import generate_options, set_options
-from pieusb.types import DeviceInfo
+from pieusb.types import (
+    DeviceInfo,
+    UpdateData,
+    ScanResult,
+    ScanPhase
+)
 from pieusb.exceptions import (
     CheckCondition,
     DeviceNotReady,
@@ -18,9 +22,14 @@ from pieusb.transport import (
     SCSI_PARAM,
     SCSI_COPY
 )
+from pieusb.exceptions import (
+    PieusbError,
+    WarmingUp,
+    DeviceNotReady,
+    ScanInProgress
+)
 
 import logging
-import numpy
 import time
 import threading
 import struct
@@ -33,8 +42,10 @@ class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
         self.scan_thread: threading.Thread | None = None
-        self.on_update: Callable[[int, int], None] | None = None
-        self.on_complete: Callable[[numpy.ndarray], None] | None = None
+        self.on_update: Callable[[UpdateData], None] | None = None
+        self.on_complete: Callable[[ScanResult], None] | None = None
+        self.scan_in_progress: bool = False
+        self.shading_params: list[dict] | None = None
         self.params = generate_options(info.inquiry)
         self.dev.open()
 
@@ -117,7 +128,7 @@ class Scanner:
             log.debug(f"[scan]   {label}: {done}/{total_lines} lines read (remaining {remaining})")
         return bytes(collected)
 
-    def _get_shading_parms(self):
+    def _get_shading_parms(self) -> list[dict]:
         prep = bytes([SCSI_CALIBRATION_INFO | 0x80]) + bytes(5)
         self.dev.command(SCSI_WRITE, out_data=prep, cdb_length=6)
         raw = self.dev.command(SCSI_READ, in_size=32, cdb_length=32)
@@ -165,11 +176,15 @@ class Scanner:
         self.dev.command(SCSI_SCAN, cdb_length=0)
 
     def _scan_worker(self) -> None:
+        self.on_update(UpdateData(phase=ScanPhase.CONFIGURING))
+
         self.wait_ready()
         
         set_options(self.dev, self.params)
 
         self.wait_ready()
+
+        self.shading_params = self._get_shading_parms()
 
         log.debug("[scan] starting scan...")
         for attempt in range(30):
@@ -194,8 +209,28 @@ class Scanner:
                 raise
         self.wait_ready()
 
-    def scan(self, on_update: Callable[[int, int], None], on_complete: Callable[[numpy.ndarray], None]) -> None:
+        # TODO self.on_complete(...)
+        self.scan_in_progress = False
+
+    def scan(self, on_update: Callable[[UpdateData], None], on_complete: Callable[[ScanResult], None]) -> None:
+        self.params.validate()
+
+        # TODO this could probably be checked with a hardware call
+        if self.scan_in_progress:
+            raise ScanInProgress
+
+        reason = self._why_not_ready()
+        if reason is not None:
+            if reason.warming_up:
+                raise WarmingUp
+            if reason.not_ready:
+                raise DeviceNotReady
+
+        if on_update is None or on_complete is None:
+            raise PieusbError('Must set on_update and on_complete callbacks to start a scan')
+            
         self.on_update = on_update
         self.on_complete = on_complete
         self.scan_thread = threading.Thread(target=self._scan_worker)
+        self.scan_in_progress = True
         self.scan_thread.start()
