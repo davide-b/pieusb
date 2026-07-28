@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pieusb"
 version = "0.1.0"
-description = "Add your description here"
+description = "Interface and acquire images from the Reflecta (a.k.a PacificImage) line of film scanners."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,6 +13,16 @@ dependencies = [
     "numpy>=2.5.1",
     "pyusb>=1.3.1",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pieusb"]
+
+[project.urls]
+Homepage = "https://github.com/davide-b/pieusb"
+Issues = "https://github.com/davide-b/pieusb/issues"
