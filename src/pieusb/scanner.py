@@ -1,18 +1,17 @@
-from pieusb.transport import UASDevice
-
-from pieusb.option import generate_options, set_options
+from pieusb.option import generate_options, set_options, MODE_PLANES
+from pieusb.postprocess import (
+    apply_shading_correction,
+    build_width_to_loc,
+    calculate_shading
+)
 from pieusb.types import (
     DeviceInfo,
     UpdateData,
     ScanResult,
     ScanPhase
 )
-from pieusb.exceptions import (
-    CheckCondition,
-    DeviceNotReady,
-    WarmingUp
-)
 from pieusb.transport import (
+    UASDevice,
     SCSI_READ,
     SCSI_WRITE,
     SCSI_SCAN,
@@ -23,6 +22,7 @@ from pieusb.transport import (
     SCSI_COPY
 )
 from pieusb.exceptions import (
+    CheckCondition,
     PieusbError,
     WarmingUp,
     DeviceNotReady,
@@ -34,9 +34,26 @@ import time
 import threading
 import struct
 
-from collections.abc import Callable
+import numpy
+
+from collections.abc import Callable, Iterator
 
 log = logging.getLogger(__name__)
+
+# Hard cap per READ, mirroring sanei_pieusb_get_scan_data() (pieusb_specific.c:2248).
+# It is a maximum, not a fixed size; requesting more than 255 lines in one call
+# produced corrupted/banded images on real hardware (poc:519-525).
+MAX_LINES_PER_READ = 255
+
+# Every line the scanner returns in INDEX colour format is prefixed by a two-byte
+# channel tag (poc:820).
+TAG_TO_CHANNEL = {b'RR': 0, b'GG': 1, b'BB': 2, b'II': 3}
+CHANNEL_NAMES = ('R', 'G', 'B', 'I')
+
+# START SCAN is retried while the device reports warming up, as in
+# pieusb.c:1088-1093. 30 attempts at 5s is the PoC's proven budget (poc:719).
+START_SCAN_ATTEMPTS = 30
+START_SCAN_RETRY_S = 5
 
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
@@ -45,6 +62,10 @@ class Scanner:
         self.on_update: Callable[[UpdateData], None] | None = None
         self.on_complete: Callable[[ScanResult], None] | None = None
         self.scan_in_progress: bool = False
+        # Set by cancel(), polled by the worker between chunk reads. An Event
+        # rather than a bool because it is the one piece of state written from
+        # the caller's thread and read from the worker's.
+        self.cancel_requested = threading.Event()
         self.shading_params: list[dict] | None = None
         self.params = generate_options(info.inquiry)
         self.dev.open()
@@ -113,19 +134,29 @@ class Scanner:
     def _get_scanned_lines_cmd(self, lines, size) -> bytes:
         return self.dev.command(SCSI_READ, in_size=size, cdb_length=lines)
 
-    def _get_scanned_lines(self, total_lines, bytes_per_line, label="lines") -> bytes:
-        MAX_LINES_PER_READ = 255
-        collected = bytearray()
+    def _iter_scanned_lines(self, total_lines, bytes_per_line, label="lines") -> Iterator[tuple[bytes, int]]:
+        """Read total_lines in <=MAX_LINES_PER_READ chunks, yielding (bytes, n_lines).
+
+        A generator rather than one buffer so the pixel read can decode, report
+        and discard each chunk as it arrives -- a full-resolution 16-bit RGBI
+        scan is gigabytes, and holding the raw bytes alongside the decoded image
+        would double that.
+        """
         remaining = total_lines
         done = 0
         while remaining > 0:
             lines_this_read = min(MAX_LINES_PER_READ, remaining)
             n_bytes = lines_this_read * bytes_per_line
             chunk = self._get_scanned_lines_cmd(lines=lines_this_read, size=n_bytes)
-            collected.extend(chunk)
             done += lines_this_read
             remaining -= lines_this_read
             log.debug(f"[scan]   {label}: {done}/{total_lines} lines read (remaining {remaining})")
+            yield chunk, lines_this_read
+
+    def _get_scanned_lines(self, total_lines, bytes_per_line, label="lines") -> bytes:
+        collected = bytearray()
+        for chunk, _ in self._iter_scanned_lines(total_lines, bytes_per_line, label):
+            collected.extend(chunk)
         return bytes(collected)
 
     def _get_shading_parms(self) -> list[dict]:
@@ -175,26 +206,106 @@ class Scanner:
     def stop_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=0)
 
+    def cancel(self) -> None:
+        """Ask a running scan to stop; returns immediately, no-op if idle.
+
+        Does not touch the device -- pyusb is not thread-safe and the worker owns
+        it -- so cancellation takes effect at the next chunk boundary (<=255
+        lines), where the worker issues STOP SCAN itself and fires on_complete
+        with result.cancelled set.
+        """
+        if self.scan_in_progress:
+            self.cancel_requested.set()
+
+    def _emit(self, update: UpdateData) -> None:
+        """Fire on_update, never letting a caller's callback abort the scan."""
+        try:
+            self.on_update(update)
+        except Exception:
+            log.exception("[scan] on_update callback raised; continuing the scan")
+
+    def _result(self, rgb=None, ir=None, *, started: float, width: int = 0, height: int = 0,
+                shading_corrected: bool = False, cancelled: bool = False,
+                error: Exception | None = None) -> ScanResult:
+        """Build a ScanResult, filling in the settings the scan actually ran with."""
+        return ScanResult(
+            rgb=rgb,
+            ir=ir,
+            width=width,
+            height=height,
+            mode=self.params['mode'].value,
+            color_depth=self.params['color_depth'].value,
+            resolution=self.params['resolution'].value,
+            shading_corrected=shading_corrected,
+            cancelled=cancelled,
+            error=error,
+            duration_s=time.monotonic() - started,
+        )
+
     def _scan_worker(self) -> None:
-        self.on_update(UpdateData(phase=ScanPhase.CONFIGURING))
+        """Thread entry point: run the scan and deliver exactly one ScanResult.
 
-        self.wait_ready()
-        
-        set_options(self.dev, self.params)
+        Nothing may escape this method. Once the worker has started there is no
+        caller left on the stack, so every failure is caught here, STOP SCAN is
+        attempted, and it reaches the caller as result.error -- the threading
+        contract in DESIGN.md.
+        """
+        started = time.monotonic()
+        try:
+            try:
+                result = self._run_scan(started)
+            except Exception as e:
+                log.exception("[scan] scan failed")
+                try:
+                    self.stop_scan()
+                except Exception:
+                    log.exception("[scan] STOP SCAN after the failure also failed")
+                result = self._result(started=started, error=e)
+        finally:
+            # Cleared before on_complete so a callback may start the next scan.
+            self.scan_in_progress = False
 
-        self.wait_ready()
+        try:
+            self.on_complete(result)
+        except Exception:
+            log.exception("[scan] on_complete callback raised")
+
+    def _run_scan(self, started: float) -> ScanResult:
+        """The scan sequence proper. Raises; _scan_worker turns that into result.error.
+
+        Follows sane_start() (pieusb.c:865-1140) and the PoC (poc:645-893), which
+        is the sequence actually verified against hardware. The reads in the
+        calibration phase are not optional extras: skipping the shading reference
+        read makes the device reject the following CCD MASK and GET PARAMETERS as
+        "invalid command" (poc:741-747).
+        """
+        self._emit(UpdateData(phase=ScanPhase.CONFIGURING))
 
         self.shading_params = self._get_shading_parms()
+        if not self.shading_params:
+            raise PieusbError(
+                "GET SHADING PARMS returned no entries; cannot size the shading read or the CCD mask"
+            )
+        log.debug(f"[scan] shading params: {self.shading_params}")
+        # The shading reference is wider than the image: it still holds the CCD's
+        # unused pixels, which is what the CCD mask later maps away.
+        shading_ppl = self.shading_params[0]["pixels_per_line"]
 
+        self.wait_ready()
+        set_options(self.dev, self.params)
+        self.wait_ready()
+
+        self._emit(UpdateData(phase=ScanPhase.WARMING_UP))
         log.debug("[scan] starting scan...")
-        for attempt in range(30):
+        for attempt in range(START_SCAN_ATTEMPTS):
             try:
                 self._start_scan()
                 break
             except CheckCondition as e:
                 if e.warming_up:
-                    log.debug("[scan]   still warming up, waiting 5s...")
-                    time.sleep(5)
+                    log.debug(f"[scan]   still warming up, waiting {START_SCAN_RETRY_S}s "
+                              f"(attempt {attempt + 1}/{START_SCAN_ATTEMPTS})...")
+                    time.sleep(START_SCAN_RETRY_S)
                     continue
                 if e.must_calibrate:
                     # NOT an error: the scanner is telling us it will calibrate and
@@ -207,10 +318,151 @@ class Scanner:
                             "read shading reference data...")
                     break
                 raise
+        else:
+            raise WarmingUp(
+                f"scanner still warming up after {START_SCAN_ATTEMPTS} START SCAN attempts "
+                f"({START_SCAN_ATTEMPTS * START_SCAN_RETRY_S}s)"
+            )
         self.wait_ready()
 
-        # TODO self.on_complete(...)
-        self.scan_in_progress = False
+        # --- Calibration: shading reference, CCD mask, GET PARAMETERS ---------
+        self._emit(UpdateData(phase=ScanPhase.CALIBRATING))
+
+        # The last cancellation point before the pixel read; the calibration
+        # reads below are short enough not to be worth interrupting mid-way.
+        if self.cancel_requested.is_set():
+            log.debug("[scan] cancelled before the calibration read; stopping")
+            self.stop_scan()
+            return self._result(started=started, cancelled=True)
+
+        # Shading data is always 16-bit, with the same two-byte channel tag per
+        # line as the image data. The C backend reads 4 * entry[0].nLines
+        # (pieusb_specific.c:2078); summing nLines over all entries agrees with
+        # that as long as the entries share a line count, and does not assume
+        # four of them.
+        total_shading_lines = sum(e["n_lines"] for e in self.shading_params)
+        shading_bytes_per_line = 2 + shading_ppl * 2
+        log.debug(f"[scan] reading shading reference ({total_shading_lines} lines, "
+                  f"{total_shading_lines * shading_bytes_per_line} bytes)...")
+        shading_raw = self._get_scanned_lines(
+            total_shading_lines, shading_bytes_per_line, label="shading"
+        )
+        self.wait_ready()
+
+        log.debug("[scan] reading CCD mask...")
+        ccd_mask = self._get_ccd_mask(shading_ppl)
+
+        # The device's own authoritative geometry, rather than one computed from
+        # the frame coordinates and hoped for.
+        scan_params = self._get_scan_parameters()
+        width = scan_params["width"]
+        height = scan_params["lines"]
+        log.debug(f"[scan] scan parameters: {scan_params}")
+        if width <= 0 or height <= 0:
+            raise PieusbError(f"GET PARAMETERS reported an empty image ({width}x{height})")
+        self.wait_ready()
+
+        # --- Pixel data -------------------------------------------------------
+        mode = self.params['mode'].value
+        n_planes = MODE_PLANES[mode]
+        # '<u1'/'<u2' rather than uint8/uint16: byteOrder is set to Intel in
+        # SET MODE, so the samples are little-endian regardless of this host.
+        sample_dtype = numpy.dtype('<u1' if self.params['color_depth'].value <= 8 else '<u2')
+        raw_bytes_per_line = 2 + width * sample_dtype.itemsize
+        total_lines = n_planes * height
+
+        log.debug(f"[scan] reading {n_planes} planes x {height} lines "
+                  f"({raw_bytes_per_line} bytes/line incl. 2-byte tag)...")
+        self._emit(UpdateData(phase=ScanPhase.SCANNING, scanned_lines=0, total_lines=total_lines))
+
+        # Planes arrive as sequential blocks -- all R lines, then all G, and so
+        # on -- but the 255-line read cap does not align to those boundaries, so
+        # a single read can straddle a channel transition. Rows are therefore
+        # placed by their own tag, not by arrival order or position.
+        planes = numpy.zeros((n_planes, height, width), dtype=sample_dtype)
+        rows_seen = [0, 0, 0, 0]
+        unknown_tags: dict[bytes, int] = {}
+        overflow = 0
+        done = 0
+
+        for chunk, n_lines in self._iter_scanned_lines(
+            total_lines, raw_bytes_per_line, label="scan data"
+        ):
+            for k in range(n_lines):
+                off = k * raw_bytes_per_line
+                tag = bytes(chunk[off:off + 2])
+                channel = TAG_TO_CHANNEL.get(tag)
+                if channel is None:
+                    unknown_tags[tag] = unknown_tags.get(tag, 0) + 1
+                    continue
+                row = rows_seen[channel]
+                rows_seen[channel] += 1
+                if channel >= n_planes or row >= height:
+                    overflow += 1
+                    continue
+                planes[channel, row] = numpy.frombuffer(
+                    chunk, dtype=sample_dtype, count=width, offset=off + 2
+                )
+            done += n_lines
+            self._emit(UpdateData(
+                phase=ScanPhase.SCANNING, scanned_lines=done, total_lines=total_lines
+            ))
+
+            if self.cancel_requested.is_set():
+                log.debug(f"[scan] cancelled after {done}/{total_lines} lines; stopping")
+                self.stop_scan()
+                return self._result(started=started, width=width, height=height, cancelled=True)
+
+        if unknown_tags:
+            log.warning(f"[scan] unrecognized line tags, rows dropped: {unknown_tags} "
+                        f"(expected only {list(TAG_TO_CHANNEL)})")
+        if overflow:
+            log.warning(f"[scan] {overflow} lines arrived beyond the {n_planes}x{height} "
+                        f"the device reported; dropped")
+        for c in range(n_planes):
+            if rows_seen[c] != height:
+                log.warning(f"[scan] channel {CHANNEL_NAMES[c]}: {rows_seen[c]} rows, "
+                            f"expected {height}")
+
+        # Build from what actually arrived, using the smallest common row count,
+        # rather than guessing padding for a channel that came up short.
+        usable_height = min(rows_seen[:n_planes])
+        if usable_height == 0:
+            raise PieusbError(
+                f"no complete channel data recovered from {done} lines read "
+                f"(rows per channel: {rows_seen[:n_planes]})"
+            )
+        if usable_height < height:
+            log.warning(f"[scan] image truncated to {usable_height} of {height} lines")
+            planes = planes[:, :usable_height, :]
+
+        # --- Post-processing ---------------------------------------------------
+        self._emit(UpdateData(phase=ScanPhase.PROCESSING))
+
+        shading_corrected = False
+        shading_ref, shading_mean = calculate_shading(shading_raw, shading_ppl)
+        if shading_ref is None:
+            log.warning("[scan] no usable shading reference lines; returning raw pixel data")
+        else:
+            log.debug(f"[scan] shading mean per channel = "
+                      f"{[round(shading_mean[c], 1) for c in range(n_planes)]}")
+            apply_shading_correction(
+                planes, shading_ref, shading_mean, build_width_to_loc(ccd_mask, width)
+            )
+            shading_corrected = True
+
+        # (planes, h, w) -> (h, w, planes) for the colour channels; infrared is a
+        # single plane and stays two-dimensional.
+        rgb = numpy.ascontiguousarray(numpy.moveaxis(planes[:3], 0, -1))
+        ir = numpy.ascontiguousarray(planes[3]) if n_planes > 3 else None
+
+        return self._result(
+            rgb, ir,
+            started=started,
+            width=width,
+            height=usable_height,
+            shading_corrected=shading_corrected,
+        )
 
     def scan(self, on_update: Callable[[UpdateData], None], on_complete: Callable[[ScanResult], None]) -> None:
         self.params.validate()
@@ -231,6 +483,7 @@ class Scanner:
             
         self.on_update = on_update
         self.on_complete = on_complete
+        self.cancel_requested.clear()
         self.scan_thread = threading.Thread(target=self._scan_worker)
         self.scan_in_progress = True
         self.scan_thread.start()

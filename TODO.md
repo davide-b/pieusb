@@ -1,13 +1,15 @@
 # pieusb — next steps
 
-Status audit of the mid-refactor tree (see `DESIGN.md` for the target shape). The package
-imports and `set_options()` now runs to completion, but `Scanner.scan()` still stops right
-after START SCAN, so there is no working acquisition path yet.
+Status audit of the mid-refactor tree (see `DESIGN.md` for the target shape). The whole
+acquisition path is now written end to end — configure, calibrate, read, deinterleave,
+shading-correct, assemble — but **none of it has run against hardware yet**. It has only been
+exercised against a simulated device.
 
 Cross-checked against the reference PoC (`~/sw/pieusb_ref/pieusb_proscan10t_poc.py`, cited
 below as `poc:LINE`) and the SANE C backend (`~/backends/backend/pieusb*.c`).
 
-**Next up:** C-13 (frame bounds check) before any hardware run, then B.
+**Next up:** a hardware run. Then #12b (GET SHADING PARMS ordering) and D-17's remaining
+lifecycle methods.
 
 ## A. Blocking bugs — DONE
 
@@ -49,14 +51,16 @@ to False, wiring quality bit `0x80`.
   fails to start — the flag stays `True` and every later `scan()` raises `ScanInProgress` forever.
   Verified. Set the flag last, immediately before `.start()`, and clear it in the worker's
   `finally`.
-- [ ] 32. **`on_complete` never fires and the flag never clears.** `_scan_worker` returns after
-  its final `wait_ready()` (`scanner.py:210`) without calling `self.on_complete` or resetting
-  `scan_in_progress`. Per `DESIGN.md` the completion callback must fire exactly once on *every*
-  outcome — it is the only channel through which a caller learns the scan finished.
-- [ ] 33. **The worker has no exception handling.** Anything raised inside `_scan_worker` kills
-  the thread, prints to stderr, leaves `scan_in_progress` `True` and never notifies the caller.
-  Per `DESIGN.md` "Threading contract": catch everything, attempt STOP SCAN, and deliver it as
-  `result.error`. Needs #35 first, since `ScanResult` currently has nowhere to put it.
+- [x] 30. Fixed: the guard checks the parameters, before any state is mutated.
+- [x] 31. Fixed: `scan_in_progress` is set immediately before `.start()`, and the worker clears
+  it in a `finally`.
+- [x] 32. **`on_complete` now fires exactly once on every outcome.** `_scan_worker` is a thin
+  wrapper around `_run_scan()`: it clears `scan_in_progress` in a `finally` and then delivers a
+  `ScanResult` for success, cancellation and failure alike. A callback that itself raises is
+  logged, not propagated — there is no thread left to propagate to.
+- [x] 33. **The worker catches everything.** Any exception out of `_run_scan()` is logged, STOP
+  SCAN is attempted, and it reaches the caller as `result.error` (`ScanResult` gained the field,
+  see #19).
 - [ ] 34. **Unreachable branch in `scan()`** (`scanner.py:225-227`). `_why_not_ready()` only
   returns a sense when `not_ready` is true (key 0x02); `must_calibrate` requires key 0x06. No
   sense satisfies both — verified exhaustively — so `reason.not_ready` above it always wins and
@@ -64,32 +68,42 @@ to False, wiring quality bit `0x80`.
   and the worker already handles it there.
 - [ ] 34a. Minor: `raise WarmingUp` / `raise DeviceNotReady` raise the bare classes, discarding
   the sense `_why_not_ready()` just obtained. `wait_ready()` passes a message; these should too.
-- [ ] 34b. Minor: `scanner.py` imports from `pieusb.transport` twice (:1, :15) and from
-  `pieusb.exceptions` twice (:10, :25), with `WarmingUp`/`DeviceNotReady` in both blocks.
+- [x] 34b. Duplicate `pieusb.transport` / `pieusb.exceptions` import blocks in `scanner.py`
+  merged.
 
 ## B. Finish the scan path
 
-- [ ] 9. **`_scan_worker` stops right after START SCAN** (`scanner.py:178-210`). Still missing
-  everything downstream: the shading-reference read, CCD mask, GET PARAMETERS, the N-plane read,
-  per-line tag deinterleave and image assembly. The PoC has all of it working (`poc:672-880`).
-  `_get_shading_parms()` is now called and stashed in `self.shading_params`, but nothing consumes
-  it yet.
+- [x] 9. **The full scan path is written.** `_run_scan()` does the shading-reference read, CCD
+  mask, GET PARAMETERS, the N-plane read, the per-line tag deinterleave and the image assembly,
+  following `poc:672-893`. Two deliberate differences from the PoC:
+  - Chunks are decoded as they arrive rather than concatenated into one raw buffer, and rows go
+    straight into a preallocated `(planes, height, width)` array. A full-resolution 16-bit RGBI
+    scan is gigabytes; holding the raw bytes alongside the decoded image would double that.
+  - Samples are read as `<u1`/`<u2` rather than `uint8`/`uint16`, since SET MODE fixes the wire
+    format to Intel byte order regardless of host endianness.
+
+  Row placement is by channel tag, never by arrival order, so a 255-line read straddling a plane
+  boundary is handled. Short or missing channels are warned about and the image is built from the
+  smallest common row count; zero recovered rows raises.
 - [x] 10. **The four missing commands are implemented** as private methods on `Scanner`:
   `_get_shading_parms` (:131), `_get_scan_parameters` (:147), `_get_ccd_mask` (:156) and
   `_get_gain_offset` (:159). Still open from the original item: `_get_gain_offset`'s result is
   never fed back into SET GAIN OFFSET, so the PoC's read-modify-write round trip
   (`poc:432-465`) does not happen yet — `set_options` writes table values with `light=0`. See
   also #22, these belong in `commands.py`.
-- [ ] 11. **Port the postprocessing** (`poc:561-660` → `postprocess.py`): `calculate_shading`,
-  `build_width_to_loc`, `apply_shading_correction`. Pure numpy, and the most testable code in
-  the project.
+- [x] 11. **Postprocessing ported** — `postprocess.py` has `calculate_shading`,
+  `build_width_to_loc` and `apply_shading_correction`, and the worker applies them. Pure numpy,
+  no device access, so it is the one part of the package testable without hardware (#28).
+  Rounding follows the C backend's `lround()` rather than the PoC's `.astype()` truncation,
+  which biased every corrected pixel down by up to one LSB.
 - [ ] 12. **Infrared exposure never sent** (`option.py`, the SET EXPOSURE loop): covers filters
   0x02/0x04/0x08 only; `exp_i` is packed into gain/offset but no SET EXPOSURE for filter 0x10.
-- [ ] 12a. **`'gray'` mode returns untagged data.** Now that `set_mode` maps gray to
-  `SCAN_COLOR_FORMAT_PIXEL`, gray scans come back as interleaved pixels with *no* per-line
-  `RR`/`GG`/`BB`/`II` tag — so the tag-based deinterleave #9 needs must not be applied to them.
-  Per `pieusb_scancmd.h:165-173`, in a single-filter scan only the first pixel of each triple
-  holds valid data. Either handle both layouts in #9 or reject `'gray'` until it is handled.
+- [x] 12a. **`'gray'` mode is rejected for now.** Gray maps to `SCAN_COLOR_FORMAT_PIXEL`, so its
+  lines carry no `RR`/`GG`/`BB`/`II` tag and the deinterleave does not apply; per
+  `pieusb_scancmd.h:165-173` only the first pixel of each triple holds valid data. Nothing has
+  ever exercised that layout on hardware, so `validate()` raises `ParamError` rather than the
+  worker guessing at the wire format. Still open as a *feature*: implement the PIXEL layout and
+  drop it from `option.UNSUPPORTED_MODES`.
 - [ ] 12b. **GET SHADING PARMS is in the wrong place.** `_scan_worker` calls it *after*
   `set_options()` (`scanner.py:187`), but both references read it in the *middle* of the
   configuration sequence — after SET EXPOSURE / SET HIGHLIGHT SHADOW and before SET SCAN FRAME
@@ -116,12 +130,15 @@ to False, wiring quality bit `0x80`.
   `tl_x < br_x` and `tl_y < br_y`, raising the new `ParamError`, and `scan()` calls it on the
   calling thread before starting the worker — the position `DESIGN.md` and
   `sanei_pieusb_analyse_options` both put it in.
-- [ ] 13a. **Still open from 13:** `validate()` does not re-check the frame against the device's
-  reported bed. Per-option validators cover `br_x <= inq.max_scan_w` at assignment time, but only
-  via `__setitem__` — and `__setattr__` (#16) does not exist yet, so `scanner.br_x = …` bypasses
-  validation entirely today. Given the carriage crash this check was born from, `validate()`
-  should assert the bounds itself rather than trusting that every write went through a validator.
-  `sharpen` vs `fast_infrared` (`pieusb_scancmd.h:180`) is the other cross-option case.
+- [x] 13a. **`validate()` completed.** `OptionsTable` now keeps the `InquiryResponse`, and
+  `validate()` (a) re-runs every per-option type check and validator, so a value that reached the
+  table without going through `__setitem__` cannot slip past, and (b) asserts the frame against
+  the device's own reported bed itself, with the axis-swap hint from the PoC's post-crash check
+  (`poc:690-703`). Cross-option checks: `tl < br` on both axes, frame within the bed, `sharpen`
+  vs `fast_infrared` (`pieusb_scancmd.h:180`, raises — the two are mutually exclusive), plus
+  unimplemented mode/depth rejections. Combinations that are merely *ineffective* (`sharpen` in a
+  non-one-pass-colour mode, `fast_infrared` without an IR plane, `auto_exp`, `advance`) log a
+  warning, which is what `sanei_pieusb_analyse_options` does (`pieusb_specific.c:1518-1620`).
 - [ ] 14. **Frame units are ambiguous.** `option.py` labels `tl_x`/`br_x` as `Unit.PIXEL` with
   defaults in `inq.max_scan_w`, but the PoC establishes these are **native-resolution units**
   (10000 dpi on the ProScan 10T), independent of the requested dpi — while `DESIGN.md:76` wants
@@ -147,9 +164,10 @@ surface it used to specify is gone, so several old items here went with it.
 - [ ] 17. **`scan()` is non-blocking — worker landed, lifecycle missing.** `scan()` validates,
   pre-flight-checks readiness and spawns `_scan_worker` on a `threading.Thread`, and
   `scan_in_progress` is the busy guard. Still missing:
-  - **`cancel()`** — no method, and no flag for the worker to poll. Must not touch the device
-    itself (pyusb is not thread-safe); it sets a flag the worker checks between chunk reads, and
-    the worker issues STOP SCAN.
+  - ~~**`cancel()`**~~ — done: sets `cancel_requested` (a `threading.Event`), which the worker
+    polls after each chunk read and once before the calibration read. The worker issues STOP SCAN
+    itself and returns a `ScanResult` with `cancelled=True` and no image; the caller's thread
+    never touches the device.
   - **`wait(timeout=None)`** — `scan_thread` is stored but never joined by anything.
   - **`close()`** — no standalone method; and `__exit__` (`scanner.py:55`) still just calls
     `self.dev.close()`, so a `with` block that exits mid-scan releases the USB interface out from
@@ -164,23 +182,22 @@ surface it used to specify is gone, so several old items here went with it.
     `plane`**, so there is nothing to drive a live preview with. Adding `phase` was a genuine
     improvement — it answers the "nothing reports progress before the pixel read" question the
     design left open — but the chunk needs to come back. See #19a.
-  - `ScanResult` is `rgb` + `ir` with **no `error` and no `cancelled`**. That split is a neat
-    answer to the RGBI-doesn't-fit-an-image-convention problem, but the threading contract has no
-    other channel for reporting a worker failure, so those two fields are load-bearing. The
-    design also listed `width`/`height`/`mode`/`color_depth`/`resolution`/`shading_corrected`/
-    `duration_s`; `width`/`height` in particular come from GET PARAMETERS and can differ from
-    what was requested.
+  - ~~`ScanResult` has no `error` and no `cancelled`~~ — added, along with the rest of the list
+    the design gave (`width`/`height` from GET PARAMETERS, `mode`, `color_depth`, `resolution`,
+    `shading_corrected`, `duration_s`). `rgb` is now `ndarray | None`, since a cancelled or
+    failed scan has no image. The `rgb` + `ir` split is kept over the design's single `image`
+    field; `DESIGN.md` still describes the latter and needs reconciling.
   - `DESIGN.md` still says `progress=None, scan_complete=None`; the implementation names them
     `on_update`/`on_complete` and makes them required. Reconcile one way or the other.
-- [ ] 19a. **Split each raw read by channel tag before reporting it.** Planes arrive as
-  sequential blocks and the 255-line cap does not align to plane boundaries (`poc:794-818`), so
-  one device read can straddle a channel transition and must produce two `progress` calls. This
-  is also what makes a live preview possible at all: the other channels for a given row do not
-  exist until much later in the scan.
+- [ ] 19a. **Partly done: rows are placed by channel tag**, so a read straddling a plane
+  boundary (`poc:794-818`) lands correctly in the image. What is still missing is *reporting* it:
+  the worker fires one `UpdateData` per device read carrying only a line count, not one per plane
+  run carrying the pixels. That needs `chunk`/`plane` on `UpdateData` (#19) and #19b.
 - [ ] 19b. **Shading-correct per chunk, not at the end.** The shading reference and CCD mask are
   both read before the pixel data, so correction can be applied to each chunk as it arrives —
-  required for `progress`'s `chunk` to be presentable. `apply_shading_correction` (#11) is
-  currently written to take the whole assembled array; it needs a per-chunk entry point.
+  required for `progress`'s `chunk` to be presentable. `apply_shading_correction` takes the whole
+  assembled `(planes, height, width)` array; it needs a per-chunk entry point. The worker
+  currently corrects once, in the `PROCESSING` phase.
 - [x] 19c. **Exception hierarchy** — `exceptions.py` created with `PieusbError` base,
   `DeviceNotReady` → `WarmingUp`, `CheckCondition`, `Timeout`, `TransportError` and
   `ScanInProgress`. `CheckCondition` moved out of `transport.py` (which now imports it), gained a
@@ -207,7 +224,7 @@ surface it used to specify is gone, so several old items here went with it.
 - [x] 20. **Delete `scanning.py`** — done.
 - [ ] 21. Rename `option.py` → `options.py`, `usb_utils.py` → `usb.py`; fold `_device.py` into
   `__init__.py` + `inquiry.py`.
-- [ ] 22. Not yet created: `commands.py`, `protocol.py`, `postprocess.py`. (`exceptions.py` done.)
+- [ ] 22. Not yet created: `commands.py`, `protocol.py`. (`exceptions.py`, `postprocess.py` done.)
   `commands.py` now has an obvious first tenant: the four SCSI wrappers that landed as private
   `Scanner` methods (`_get_shading_parms`, `_get_scan_parameters`, `_get_ccd_mask`,
   `_get_gain_offset`) plus the ones inside `set_options`.

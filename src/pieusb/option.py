@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 from enum import Enum
 
+import logging
 import struct
 
 from pieusb.inquiry import (
@@ -19,6 +20,8 @@ from pieusb.transport import (
     SCSI_WRITE_GAIN_OFFSET
 )
 from pieusb.exceptions import ParamError
+
+log = logging.getLogger(__name__)
 
 # MODE SELECT payload constants, from pieusb_specific.h:55-75.
 
@@ -41,6 +44,23 @@ MODE_SETTINGS = {
     'rgb': (SCAN_ONE_PASS_COLOR, SCAN_COLOR_FORMAT_INDEX),
     'rgbi': (SCAN_ONE_PASS_RGBI, SCAN_COLOR_FORMAT_INDEX),
 }
+
+# How many planes a mode produces, i.e. how many tagged line blocks the scanner
+# sends per image. Mirrors MODE_PLANES in the PoC (poc:462).
+MODE_PLANES = {'gray': 1, 'rgb': 3, 'rgbi': 4}
+
+# Modes this library can read back but not yet decode. 'gray' maps to
+# SCAN_COLOR_FORMAT_PIXEL, so its lines carry no 'RR'/'GG'/'BB'/'II' tag and the
+# tag-based deinterleave in Scanner does not apply -- per pieusb_scancmd.h:165-173
+# the data comes back as RGB pixel triples of which only the first is valid.
+# Nothing has ever exercised that layout on hardware, so rather than guess at it
+# in the worker, validate() refuses the mode outright. See TODO 12a.
+UNSUPPORTED_MODES = ('gray',)
+
+# Sample sizes the deinterleave in Scanner._run_scan understands. INQUIRY can
+# advertise 1/4/10/12 as well, but only 8 and 16 map cleanly onto a numpy dtype
+# and only those two have been seen on the wire.
+SUPPORTED_COLOR_DEPTHS = (8, 16)
 
 # 'colorDepth' bitmask, pieusb_specific.h:64-70
 COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
@@ -75,8 +95,11 @@ class Parameter:
         self.value = opt.default
 
 class OptionsTable:
-    def __init__(self, params: list[Parameter]) -> None:
+    def __init__(self, params: list[Parameter], inq: InquiryResponse) -> None:
         self.table = params
+        # Kept so validate() can re-check the frame against the device's own
+        # reported bed rather than trusting the per-option validators alone.
+        self.inq = inq
 
     def __getitem__(self, key) -> Parameter:
         try:
@@ -86,15 +109,93 @@ class OptionsTable:
             raise KeyError(f"No parameter named {key} exists")
 
     def validate(self) -> None:
-        '''
-        Cross check parameter values
-        Raise if any of them are incompatible with eachother
-        '''
-        if self['tl_x'].value >= self['br_x'].value:
-            raise ParamError(f"Parameter 'tl_x' ({self['tl_x'].value}px) must be smaller than parameter 'br_x' ({self['br_x'].value}px)")
+        '''Validate the table as a whole, before anything reaches the device.
 
-        if self['tl_y'].value >= self['br_y'].value:
-            raise ParamError(f"Parameter 'tl_y' ({self['tl_y'].value}px) must be smaller than parameter 'br_y' ({self['br_y'].value}px)")
+        Two jobs, in order:
+
+        1. Re-run every per-option validator. Values normally arrive through
+           Scanner.__setitem__, which validates -- but the attribute interface
+           DESIGN.md specifies does not exist yet, and any future write path that
+           misses the check would otherwise reach SET SCAN FRAME unvalidated.
+           Getting the frame wrong has already cost this project one carriage
+           crash, so this re-checks rather than trusts.
+        2. The cross-option checks a single-option validator structurally cannot
+           express -- the frame corners against each other and against the bed,
+           and the mode/quality-bit combinations.
+
+        Raises ParamError, naming the offending option(s). Combinations that are
+        merely ineffective rather than contradictory are logged as warnings, the
+        way sanei_pieusb_analyse_options does (pieusb_specific.c:1518-1620).
+        '''
+        for par in self.table:
+            if type(par.value) is not par.opt.type:
+                raise ParamError(
+                    f"Option '{par.opt.name}' holds a {type(par.value).__name__} "
+                    f"({par.value!r}), expected {par.opt.type.__name__}"
+                )
+            if not par.opt.validate(par.value):
+                raise ParamError(f"Option '{par.opt.name}' has an invalid value ({par.value!r})")
+
+        tl_x, tl_y = self['tl_x'].value, self['tl_y'].value
+        br_x, br_y = self['br_x'].value, self['br_y'].value
+
+        if tl_x >= br_x:
+            raise ParamError(f"Parameter 'tl_x' ({tl_x}) must be smaller than parameter 'br_x' ({br_x})")
+
+        if tl_y >= br_y:
+            raise ParamError(f"Parameter 'tl_y' ({tl_y}) must be smaller than parameter 'br_y' ({br_y})")
+
+        # The frame against the bed the device itself reports (INQUIRY offsets
+        # 40/42, native-resolution units). The PoC added the same check after a
+        # real carriage crash caused by an X/Y axis mix-up (poc:690-703): X is the
+        # long axis, Y the short one, and swapping them drives the head off its
+        # rail. Asserted here even though br_x/br_y have their own validators,
+        # because this is the last gate before SET SCAN FRAME.
+        if tl_x < 0 or br_x > self.inq.max_scan_w:
+            raise ParamError(
+                f"Requested X range [{tl_x}, {br_x}] exceeds the scanner's reported bed "
+                f"[0, {self.inq.max_scan_w}] -- check that the X/Y axes are not swapped"
+            )
+        if tl_y < 0 or br_y > self.inq.max_scan_h:
+            raise ParamError(
+                f"Requested Y range [{tl_y}, {br_y}] exceeds the scanner's reported bed "
+                f"[0, {self.inq.max_scan_h}] -- check that the X/Y axes are not swapped"
+            )
+
+        mode = self['mode'].value
+        if mode in UNSUPPORTED_MODES:
+            raise ParamError(
+                f"Mode '{mode}' is not implemented yet: it returns untagged pixel data "
+                f"which the deinterleave cannot decode. Use "
+                f"{' or '.join(repr(m) for m in MODE_SETTINGS if m not in UNSUPPORTED_MODES)}."
+            )
+
+        depth = self['color_depth'].value
+        if depth not in SUPPORTED_COLOR_DEPTHS:
+            raise ParamError(
+                f"Colour depth {depth} is advertised by the scanner but not implemented here; "
+                f"supported: {', '.join(str(d) for d in SUPPORTED_COLOR_DEPTHS)}"
+            )
+
+        # 'sharpen' is documented as "only effective with fastInfrared off"
+        # (pieusb_scancmd.h:180), so asking for both is a contradiction rather
+        # than a preference -- the scanner would silently drop one of them.
+        if self['sharpen'].value and self['fast_infrared'].value:
+            raise ParamError(
+                "Options 'sharpen' and 'fast_infrared' are mutually exclusive: sharpening is "
+                "only effective with fast infrared off (pieusb_scancmd.h:180)"
+            )
+
+        # Ineffective, not contradictory: warn and carry on.
+        if self['sharpen'].value and mode != 'rgb' and mode != 'rgbi':
+            log.warning(f"option 'sharpen' has no effect in '{mode}' mode (one-pass colour only)")
+        if self['fast_infrared'].value and mode != 'rgbi':
+            log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
+        if self['auto_exp'].value:
+            log.warning("option 'auto_exp' is not implemented yet and will be ignored")
+        if self['advance'].value:
+            log.warning("option 'advance' is not implemented yet and will be ignored: "
+                        "slide-transport commands are not sent (TODO 12c)")
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
     out: list[Parameter] = []
@@ -333,7 +434,7 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=0
     )))
 
-    return OptionsTable(out)
+    return OptionsTable(out, inq)
 
 def set_options(dev: UASDevice, options: OptionsTable) -> None:
     # Hard-coded in SANE. Experiment with setting different values

@@ -287,7 +287,7 @@ Split along the C backend's module boundaries.
 | `protocol.py` | Opcodes, ports, statuses, MODE SELECT constants | (headers) | inline in `transport.py`/`option.py` |
 | `usb.py` | libusb backend + enumeration | `pieusb_usb.c` | exists as `usb_utils.py` |
 | `inquiry.py` | `InquiryResponse` parsing + model/VID-PID tables | `pieusb_specific.c` | done |
-| `postprocess.py` | Deinterleave by line tag, shading correction, (later) IR dust removal | `pieusb_buffer.c`, `sanei_pieusb_post` | missing |
+| `postprocess.py` | Shading correction, (later) IR dust removal. Deinterleave by line tag stayed in the worker, which decodes each chunk as it arrives rather than buffering the whole raw read | `pieusb_buffer.c`, `sanei_pieusb_post` | partial |
 | `types.py` | Enums + dataclasses, incl. `ScanResult`/`ScanPhase` | — | partial |
 | `exceptions.py` | `PieusbError` base; `DeviceNotReady`, `WarmingUp`, `CheckCondition`, `TransportError`, `Timeout`, `ScanInProgress`, `ParamError` | — | done |
 

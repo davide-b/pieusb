@@ -92,5 +92,23 @@ class UpdateData:
 
 @dataclass(frozen=True)
 class ScanResult:
-    rgb: numpy.ndarray
-    ir: numpy.ndarray | None
+    '''What a finished scan reports, delivered exactly once per scan().
+
+    `rgb` is (height, width, 3) and `ir` is (height, width); both are None if the
+    scan was cancelled or failed, so `error` is the only channel through which a
+    worker-thread failure reaches the caller -- check it before using `rgb`.
+
+    `width`/`height` come from the device's own GET PARAMETERS mid-scan, not from
+    the requested frame, and can differ from what the options asked for.
+    '''
+    rgb: numpy.ndarray | None
+    ir: numpy.ndarray | None = None
+    width: int = 0
+    height: int = 0
+    mode: str = ''
+    color_depth: int = 0
+    resolution: int = 0
+    shading_corrected: bool = False
+    cancelled: bool = False
+    error: Exception | None = None
+    duration_s: float = 0.0
