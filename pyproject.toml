@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "pieusb"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Interface and acquire images from the Reflecta (a.k.a PacificImage) line of film scanners."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -19,6 +19,10 @@ classifiers = [
 ]
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
+
+# The git tag is the single source of truth for the version.
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pieusb"]

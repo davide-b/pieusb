@@ -6,7 +6,9 @@ try:
 
     __version__ = _pkg_version("pieusb")
 except Exception:  # pragma: no cover - only when the package isn't installed
-    __version__ = "0.1.0"
+    # The real version is derived from the git tag at build time; there is no
+    # meaningful number to fall back on when running from an uninstalled tree.
+    __version__ = "0.0.0+unknown"
 
 from pieusb._device import get_devices
 
