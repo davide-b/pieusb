@@ -24,13 +24,13 @@ If you only care about operating one scanner, you can skip the lines with irrele
 
 | Model | `ATTR{idProduct}` |
 |---|---|
-| DigitDia 6000 Multiple Slide Scanner | 0x0142 |
-| CrystalScan 7200 | 0x0145 |
-| ProScan 7200 | 0x0145 |
-| ProScan 10T | 0x0145 |
-| CrystalScan 3600 | 0x0145 |
-| DigitDia 4000 | 0x0142 |
-| RPS 10M (aka Pacific Image PrimeFilm XAs) | 0x0144 |
+| DigitDia 6000 Multiple Slide Scanner | 0142 |
+| CrystalScan 7200 | 0145 |
+| ProScan 7200 | 0145 |
+| ProScan 10T | 0145 |
+| CrystalScan 3600 | 0145 |
+| DigitDia 4000 | 0142 |
+| RPS 10M (aka Pacific Image PrimeFilm XAs) | 0144 |
 
 ### macOS
 
