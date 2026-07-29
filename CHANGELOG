@@ -1,0 +1,16 @@
+# 0.2.0
+
+- Added wait() API to block until the scan is finished
+- Added close(), which cancels a running scan and waits for the worker before
+  releasing the USB interface. `with Scanner(...)` now goes through it, so
+  leaving the block mid-scan no longer closes the device under the worker
+- Fixed Scanner construction: the option attribute accessors recursed on
+  `self.params` before the option table existed, so `Scanner(info)` always
+  raised RecursionError
+- Reading an option attribute returns its value rather than the internal
+  Parameter, and an unknown name raises AttributeError rather than KeyError
+- Setting an option while a scan is running raises ScanInProgress
+
+# 0.1.0
+
+Initial release

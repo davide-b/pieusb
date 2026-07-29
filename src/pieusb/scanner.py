@@ -1,4 +1,4 @@
-from pieusb.option import generate_options, set_options, MODE_PLANES
+from pieusb.option import generate_options, set_options, MODE_PLANES, Parameter
 from pieusb.postprocess import (
     apply_shading_correction,
     build_width_to_loc,
@@ -55,6 +55,11 @@ CHANNEL_NAMES = ('R', 'G', 'B', 'I')
 START_SCAN_ATTEMPTS = 30
 START_SCAN_RETRY_S = 5
 
+# How long close() waits for a cancelled worker to notice. Cancellation lands at
+# the next chunk boundary, so the bound is one outstanding command -- a little
+# over transport.COMMAND_TIMEOUT_S.
+CLOSE_WAIT_S = 90
+
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
@@ -67,6 +72,7 @@ class Scanner:
         # the caller's thread and read from the worker's.
         self.cancel_requested = threading.Event()
         self.shading_params: list[dict] | None = None
+        self.closed: bool = False
         self.params = generate_options(info.inquiry)
         self.dev.open()
 
@@ -74,15 +80,52 @@ class Scanner:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.dev.close()
+        self.close()
 
-    def __setitem__(self, key, value) -> None:
-        par = self.params[key]
+    def _option(self, name: str) -> Parameter | None:
+        """The option called `name`, or None if it is ordinary object state.
+
+        Reads `params` out of __dict__ directly: __setattr__ runs for every
+        assignment in __init__, including `self.params` itself, so going through
+        normal attribute lookup here would recurse into __getattr__ before the
+        table exists.
+        """
+        params = self.__dict__.get('params')
+        if params is None:
+            return None
+        try:
+            return params[name]
+        except KeyError:
+            return None
+
+    def __setattr__(self, key, value) -> None:
+        par = self._option(key)
+        if par is None:
+            # Not an option -- real attribute (self.dev, self.scan_thread, ...).
+            object.__setattr__(self, key, value)
+            return
+        if self.scan_in_progress:
+            raise ScanInProgress(f"cannot set option '{key}' while a scan is running")
         if type(value) is not par.opt.type:
             raise TypeError(f"Invalid type provided to option '{par.opt.name}' (got {type(value)}, expected {par.opt.type})")
         if not par.opt.validate(value):
             raise ValueError(f"Invalid value provided to option '{par.opt.name}'")
         par.value = value
+
+    def __getattr__(self, name):
+        """Read an option's value. Only called when normal lookup already failed.
+
+        Returns the value, not the Parameter, so `scanner.resolution` round-trips
+        through `scanner.resolution = ...`; `scanner.params` remains the table
+        for introspection. Unknown names must raise AttributeError, not KeyError,
+        or every hasattr()/getattr(default) probe against a Scanner breaks.
+        """
+        par = self._option(name)
+        if par is None:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute or option {name!r}"
+            )
+        return par.value
 
     def _why_not_ready(self) -> CheckCondition | None:
         """None if the device is ready, else the NOT READY sense explaining why.
@@ -212,10 +255,50 @@ class Scanner:
         Does not touch the device -- pyusb is not thread-safe and the worker owns
         it -- so cancellation takes effect at the next chunk boundary (<=255
         lines), where the worker issues STOP SCAN itself and fires on_complete
-        with result.cancelled set.
+        with result.cancelled set. Pair with wait() to block until that happens.
         """
         if self.scan_in_progress:
             self.cancel_requested.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until the running scan finishes, is cancelled or fails.
+
+        Returns True if the worker is done (or none was running), False if it is
+        still going when `timeout` expires. Never raises the scan's own failure:
+        that arrives as `result.error` through on_complete, so a caller who only
+        uses wait() learns nothing about the outcome by design.
+        """
+        thread = self.scan_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            # join() would deadlock. Reachable only from a callback, which by
+            # definition runs on the worker -- and is a bug worth naming.
+            raise PieusbError(
+                "wait() called from the scan worker thread; a callback cannot wait on its own scan"
+            )
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def close(self, timeout: float | None = CLOSE_WAIT_S) -> None:
+        """Cancel any running scan, wait for the worker, then release the interface.
+
+        Idempotent. The wait is the point: releasing the USB interface while the
+        worker still owns the device would pull it out from under a running scan.
+        If the worker does not stop within `timeout` the interface is released
+        anyway -- hanging forever on close() is the worse failure -- and that is
+        logged as an error rather than passed over.
+        """
+        if self.closed:
+            return
+        if self.scan_in_progress:
+            log.debug("[close] cancelling the running scan...")
+            self.cancel()
+            if not self.wait(timeout):
+                log.error(f"[close] worker still running after {timeout}s; releasing the "
+                          f"interface anyway -- the device may be left mid-scan")
+        self.closed = True
+        self.dev.close()
 
     def _emit(self, update: UpdateData) -> None:
         """Fire on_update, never letting a caller's callback abort the scan."""
@@ -465,6 +548,9 @@ class Scanner:
         )
 
     def scan(self, on_update: Callable[[UpdateData], None], on_complete: Callable[[ScanResult], None]) -> None:
+        if self.closed:
+            raise PieusbError('Scanner is closed')
+
         self.params.validate()
 
         # TODO this could probably be checked with a hardware call

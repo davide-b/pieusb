@@ -22,7 +22,6 @@ for rgbi scans, <prefix>_ir.npy with shape (height, width). --png also writes an
 import argparse
 import logging
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -118,7 +117,7 @@ def set_frame(scanner: Scanner, x0: int, y0: int, x1: int, y1: int) -> None:
     for name, value, limit in (('tl_x', x0, inq.max_scan_w), ('tl_y', y0, inq.max_scan_h),
                                ('br_x', x1, inq.max_scan_w), ('br_y', y1, inq.max_scan_h)):
         try:
-            scanner[name] = value
+            setattr(scanner, name, value)
         except ValueError:
             raise SystemExit(
                 f"{name} = {value} native units ({native_to_mm(value, inq):.2f} mm) is outside "
@@ -131,11 +130,11 @@ def apply_options(scanner: Scanner, args) -> None:
     inq = scanner.params.inq
 
     if args.mode is not None:
-        scanner['mode'] = args.mode
+        scanner.mode = args.mode
     if args.resolution is not None:
-        scanner['resolution'] = args.resolution
+        scanner.resolution = args.resolution
     if args.depth is not None:
-        scanner['color_depth'] = args.depth
+        scanner.color_depth = args.depth
 
     if args.frame_mm is not None:
         set_frame(scanner, *(mm_to_native(v, inq) for v in args.frame_mm))
@@ -153,7 +152,7 @@ def apply_options(scanner: Scanner, args) -> None:
         except KeyError:
             names = ', '.join(p.opt.name for p in scanner.params.table)
             raise SystemExit(f"no such option {name!r}. Available: {names}")
-        scanner[name] = coerce(name, raw, par.opt.type)
+        setattr(scanner, name, coerce(name, raw, par.opt.type))
 
 
 def report_frame(scanner: Scanner) -> None:
@@ -418,32 +417,27 @@ def main(argv=None) -> int:
             print(f"Not ready: {e}")
             return 1
 
-        finished = threading.Event()
         box: list[ScanResult] = []
-
-        def on_complete(result: ScanResult) -> None:
-            box.append(result)
-            finished.set()
 
         print("Scanning. Ctrl-C cancels.\n")
         try:
-            scanner.scan(Progress(), on_complete)
+            scanner.scan(Progress(), box.append)
         except PieusbError as e:
             print(f"Could not start the scan: {type(e).__name__}: {e}")
             return 1
 
-        # wait() does not exist yet (TODO 17), so poll the completion event --
-        # and keep the timeout so Ctrl-C stays responsive.
+        # Short waits in a loop rather than one open-ended wait(), so Ctrl-C
+        # stays responsive; join() itself does not deliver KeyboardInterrupt.
         try:
-            while not finished.wait(0.2):
+            while not scanner.wait(0.2):
                 pass
         except KeyboardInterrupt:
             print("\nCancelling -- the worker stops at the next chunk boundary...")
             scanner.cancel()
-            finished.wait()
+            scanner.wait()
 
-        # The `with` block closes the USB interface, so nothing may leave this
-        # scope while the worker still owns the device (DESIGN.md, __exit__).
+        # wait() returned True, so the worker thread is dead and on_complete has
+        # already run. Leaving this scope closes the device (Scanner.close()).
         return report_result(box[0], args)
 
 
