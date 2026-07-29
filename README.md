@@ -2,6 +2,40 @@
 
 Python package to enable interfacing with USB-connected Reflecta (a.k.a. PacificImage) film and dia scanners.
 
+## Prerequisites
+
+### Windows
+
+You need to swap whatever driver Windows auto-assigned to your scanner to WinUSB
+
+### Linux
+
+You need to add a udev rule
+
+```shell
+sudo tee /etc/udev/rules.d/60-pieusb.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0142", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0144", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0145", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+If you only care about operating one scanner, you can skip the lines with irrelevant `ATTR{idProduct}`. Here is a summary of which scanners have which
+
+| Model | `ATTR{idProduct}` |
+|---|---|
+| DigitDia 6000 Multiple Slide Scanner | 0x0142 |
+| CrystalScan 7200 | 0x0145 |
+| ProScan 7200 | 0x0145 |
+| ProScan 10T | 0x0145 |
+| CrystalScan 3600 | 0x0145 |
+| DigitDia 4000 | 0x0142 |
+| RPS 10M (aka Pacific Image PrimeFilm XAs) | 0x0144 |
+
+### macOS
+
+It *should* just work™
+
 ## Install
 
 ```shell
