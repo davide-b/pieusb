@@ -271,7 +271,12 @@ class Scanner:
         }
 
     def stop_scan(self) -> None:
-        self.dev.command(SCSI_SCAN, cdb_length=0)
+        try:
+            self.dev.command(SCSI_SCAN, cdb_length=0)
+        except CheckCondition as e:
+            # This command is supposed to raise key=0x0b, code=0x00, qualifier=0x06
+            if e.sense_key != 0x0b or e.sense_code != 0 or e.sense_qualifier != 0x06:
+                raise
 
     def cancel(self) -> None:
         """Ask a running scan to stop; returns immediately, no-op if idle.
@@ -527,7 +532,6 @@ class Scanner:
         set_options(self.dev, self.params)
         self.wait_ready()
 
-        self._emit(UpdateData(phase=ScanPhase.WARMING_UP))
         log.debug("[scan] starting scan...")
         for attempt in range(START_SCAN_ATTEMPTS):
             try:
@@ -535,6 +539,7 @@ class Scanner:
                 break
             except CheckCondition as e:
                 if e.warming_up:
+                    self._emit(UpdateData(phase=ScanPhase.WARMING_UP))
                     log.debug(f"[scan]   still warming up, waiting {START_SCAN_RETRY_S}s "
                               f"(attempt {attempt + 1}/{START_SCAN_ATTEMPTS})...")
                     time.sleep(START_SCAN_RETRY_S)
@@ -700,9 +705,9 @@ class Scanner:
         if self.closed:
             raise PieusbError('Scanner is closed')
 
+        # This will raise id there is a problem with the parameters
         self.params.validate()
 
-        # TODO this could probably be checked with a hardware call
         if self.scan_in_progress:
             raise ScanInProgress
 
