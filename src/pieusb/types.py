@@ -78,6 +78,10 @@ class DeviceInfo:
     inquiry: InquiryResponse
 
 class ScanPhase(StrEnum):
+    # Every phase of the auto-exposure preview pass reports as METERING, so a
+    # progress bar sees one 0->100% sweep for it and a second for the real scan,
+    # rather than two indistinguishable SCANNING sweeps.
+    METERING = 'Metering'
     CONFIGURING = 'Configuring'
     WARMING_UP = 'Warming up'
     CALIBRATING = 'Calibrating'

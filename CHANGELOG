@@ -1,3 +1,37 @@
+# Unreleased
+
+- Implemented the `auto_exp` option, which until now warned and did nothing. It
+  runs a preview pass at the device's preview resolution, measures the 99th
+  percentile of each colour plane against the CCD saturation levels, and derives
+  new `gain_*`/`exp_*` settings before the real scan. A port of the SANE
+  backend's "calibration from preview" path (`sanei_pieusb_analyze_preview`,
+  `sanei_pieusb_set_gain_offset`, `updateGain2`), in the new
+  `pieusb.calibration` module. The preview pass reports its progress under a new
+  `ScanPhase.METERING` so it is distinguishable from the real scan
+- `_get_gain_offset()` now also returns the `saturation_level` triple that
+  auto-exposure meters against (GET GAIN OFFSET byte 54)
+- **Breaking:** split the exposure options, which conflated two independent
+  device controls behind one name. `exp_r`/`exp_g`/`exp_b`/`exp_i` are gone;
+  there are now two families:
+  - `exp_time_r`/`_g`/`_b`/`_i` -- ABSOLUTE integration time in Timer 1 counts,
+    carried by SET GAIN OFFSET. This is the real exposure control and the one
+    auto-exposure moves. Its default changes from 100 to 2937 (SANE's
+    DEFAULT_EXPOSURE, the value the firmware itself falls back to) and its upper
+    bound is the inquiry maximum times 4 -- without which the device's own
+    default is outside the range the device reports
+  - `exp_rel_r`/`_g`/`_b` -- RELATIVE exposure percentage, sent by the
+    SCSI_EXPOSURE write. No infrared entry, because the device has none. **Leave
+    this at 100.** SANE hard-codes it and exposes no option for it, so no other
+    value has been exercised against this hardware; it is redundant with
+    `exp_time_*`; and auto-exposure's saturation reference assumes it is at 100.
+    `OptionsTable.validate()` warns once per scan if it is moved
+  The previous single option fed *both* commands, so the value written to the
+  SET GAIN OFFSET exposure time was the relative percentage's 100 rather than an
+  exposure time. Existing callers setting `exp_*` must rename to `exp_time_*`
+- Added `Unit.PERCENT` and `Unit.TIMER_COUNTS`; exposure times are not
+  expressible in microseconds without the Timer 1 clock rate, which the device
+  does not report
+
 # 0.2.0
 
 - Added wait() API to block until the scan is finished

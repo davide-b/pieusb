@@ -1,3 +1,8 @@
+from pieusb.calibration import (
+    gain_increase,
+    percentile_bounds,
+    update_gain,
+)
 from pieusb.option import generate_options, set_options, MODE_PLANES, Parameter
 from pieusb.postprocess import (
     apply_shading_correction,
@@ -37,6 +42,8 @@ import struct
 import numpy
 
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +56,12 @@ MAX_LINES_PER_READ = 255
 # channel tag (poc:820).
 TAG_TO_CHANNEL = {b'RR': 0, b'GG': 1, b'BB': 2, b'II': 3}
 CHANNEL_NAMES = ('R', 'G', 'B', 'I')
+# Channel index -> the suffix its gain_*/exp_time_*/offset_* options carry.
+CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
+
+# Used for the auto-exposure metering pass only if the device's own reported
+# preview resolution is unusable. Matches the 'resolution' option default.
+PREVIEW_RESOLUTION_FALLBACK = 300
 
 # START SCAN is retried while the device reports warming up, as in
 # pieusb.c:1088-1093. 30 attempts at 5s is the PoC's proven budget (poc:719).
@@ -73,6 +86,10 @@ class Scanner:
         self.cancel_requested = threading.Event()
         self.shading_params: list[dict] | None = None
         self.closed: bool = False
+        # Set while the metering pass runs, so its progress is not reported as
+        # the real scan's; see _emit().
+        self._phase_override: ScanPhase | None = None
+        self.info = info
         self.params = generate_options(info.inquiry)
         self.dev.open()
 
@@ -232,6 +249,12 @@ class Scanner:
 
     def _get_gain_offset(self):
         raw = self.dev.command(SCSI_READ_GAIN_OFFSET, in_size=103, cdb_length=103)
+        # Saturation levels are the average R/G/B the firmware reached while
+        # optimising its own exposure times during warm-up, targeting >=90% of
+        # full scale for R and B and >=80% for G (pieusb_scancmd.h:188-192).
+        # They are the reference auto-exposure meters against, and they are only
+        # refreshed on warm-up -- not after a scan, and not after gain changes.
+        saturation_rgb = struct.unpack_from("<3H", raw, 54)
         exposure_rgb = struct.unpack_from("<3H", raw, 60)
         offset_rgb = tuple(raw[66:69])
         gain_rgb = tuple(raw[72:75])
@@ -240,6 +263,7 @@ class Scanner:
         offset_i = raw[100]
         gain_i = raw[102]
         return {
+            "saturation_level": saturation_rgb,
             "exposure_time": exposure_rgb + (exposure_i,),
             "offset": offset_rgb + (offset_i,),
             "gain": gain_rgb + (gain_i,),
@@ -302,6 +326,12 @@ class Scanner:
 
     def _emit(self, update: UpdateData) -> None:
         """Fire on_update, never letting a caller's callback abort the scan."""
+        if self._phase_override is not None:
+            # The metering pass reuses _run_scan wholesale, so its progress would
+            # otherwise arrive labelled SCANNING and run 0->100% before the real
+            # scan starts again from 0. Relabelling here keeps that in one place
+            # rather than threading a flag through six emit sites.
+            update = replace(update, phase=self._phase_override)
         try:
             self.on_update(update)
         except Exception:
@@ -353,6 +383,120 @@ class Scanner:
         except Exception:
             log.exception("[scan] on_complete callback raised")
 
+    @contextmanager
+    def _overridden_options(self, **values):
+        """Temporarily force option values, restoring them on the way out.
+
+        Writes Parameter.value directly rather than going through __setattr__:
+        that path refuses any assignment while a scan is in progress, and this
+        only ever runs on the worker with the scan already marked in progress.
+        Type and range checks are therefore skipped -- callers pass constants and
+        device-reported values, not user input.
+        """
+        saved = {name: self.params[name].value for name in values}
+        for name, value in values.items():
+            self.params[name].value = value
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                self.params[name].value = value
+
+    def _meter_from_preview(self, started: float) -> ScanResult | None:
+        """Run a preview pass and rewrite gain_*/exp_time_* from what it measured.
+
+        Ports the SANE flow: a preview scan (pieusb.c:1284-1288 ->
+        sanei_pieusb_analyze_preview) followed by
+        sanei_pieusb_set_gain_offset(..., "from preview")
+        (pieusb_specific.c:1912). The preview pass is a real scan, only at the
+        device's own preview resolution and with the quality options that SANE
+        ignores during preview (pieusb_specific.c:1521-1546) turned off.
+
+        Returns None once the settings have been updated, or the preview's own
+        ScanResult if it was cancelled -- that result is what the caller should
+        deliver, since there is no point starting the real scan afterwards.
+        Failures propagate as exceptions, exactly as the real pass's do.
+        """
+        # Read before the preview: the levels are fixed at warm-up, and this also
+        # fails early if the device will not answer, before spending a scan.
+        saturation_levels = self._get_gain_offset()["saturation_level"]
+        log.debug(f"[autoexp] saturation levels {saturation_levels}")
+
+        # SANE trusts previewScanResolution unconditionally (pieusb_specific.c:386,
+        # 1840). A zero would reach SET MODE and be rejected there, well after the
+        # metering pass looked like it was working, so it is checked here instead.
+        preview_resolution = self.info.inquiry.preview_scan_resolution
+        if not self.params['resolution'].opt.validate(preview_resolution):
+            fallback = min(self.params['resolution'].value, PREVIEW_RESOLUTION_FALLBACK)
+            log.warning(f"[autoexp] the scanner reports an unusable preview resolution "
+                        f"({preview_resolution}); metering at {fallback} dpi instead")
+            preview_resolution = fallback
+        log.debug(f"[autoexp] metering pass at {preview_resolution} dpi")
+        self._phase_override = ScanPhase.METERING
+        try:
+            # auto_exp off is what stops _run_scan recursing back in here.
+            with self._overridden_options(
+                auto_exp=False,
+                resolution=preview_resolution,
+                sharpen=False,
+                fast_infrared=False,
+                advance=False,
+            ):
+                preview = self._run_scan(started)
+        finally:
+            self._phase_override = None
+
+        if preview.cancelled:
+            return preview
+        if preview.rgb is None:
+            raise PieusbError("metering pass returned no image data")
+
+        # Which colour channels the pass actually measured, mirroring the switch
+        # on mode.passes (pieusb_specific.c:1916-1958). Infrared is excluded even
+        # in rgbi: updateGain2 is only ever called for indices 0-2. Gray is the
+        # green filter alone, so its single plane meters channel 1.
+        channels = (1,) if self.params['mode'].value == 'gray' else (0, 1, 2)
+
+        # gain_increase() takes one entry per channel it should consider, so a
+        # single-filter pass passes a 1-tuple of each.
+        bounds = tuple(
+            percentile_bounds(preview.rgb[:, :, plane])[1]
+            for plane in range(len(channels))
+        )
+        levels = tuple(saturation_levels[c] for c in channels)
+        log.debug(f"[autoexp] preview 99% bounds {bounds} for channels {channels}")
+
+        dg = gain_increase(bounds, levels)
+        log.info(f"[autoexp] applying a uniform gain increase of {dg:.3f}")
+        if dg == 1.0:
+            return None
+
+        # exp_time_*, the absolute integration time -- never exp_rel_*, which
+        # auto-exposure's saturation reference assumes is left at 100%.
+        for c in channels:
+            gain_name = f'gain_{CHANNEL_SUFFIX[c]}'
+            exp_name = f'exp_time_{CHANNEL_SUFFIX[c]}'
+            new_gain, new_exp = update_gain(
+                self.params[gain_name].value, self.params[exp_name].value, dg
+            )
+            self._set_metered(gain_name, new_gain)
+            self._set_metered(exp_name, new_exp)
+        return None
+
+    def _set_metered(self, name: str, value: int) -> None:
+        """Store a metered option value, warning if it left the device's range.
+
+        updateGain2 does not clamp, and neither do we -- clamping silently would
+        break the invariant that gain and exposure together deliver exactly dg.
+        But an out-of-range value is worth saying out loud, because the next
+        set_options() will send it to the scanner regardless.
+        """
+        par = self.params[name]
+        if not par.opt.validate(value):
+            log.warning(f"[autoexp] metered {name}={value} is outside the range the "
+                        f"scanner reports; sending it anyway")
+        par.value = value
+
     def _run_scan(self, started: float) -> ScanResult:
         """The scan sequence proper. Raises; _scan_worker turns that into result.error.
 
@@ -362,6 +506,11 @@ class Scanner:
         read makes the device reject the following CCD MASK and GET PARAMETERS as
         "invalid command" (poc:741-747).
         """
+        if self.params['auto_exp'].value:
+            cancelled = self._meter_from_preview(started)
+            if cancelled is not None:
+                return cancelled
+
         self._emit(UpdateData(phase=ScanPhase.CONFIGURING))
 
         self.shading_params = self._get_shading_parms()

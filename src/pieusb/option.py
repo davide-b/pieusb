@@ -71,12 +71,22 @@ COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
 # pieusb_scancmd.c:757 sends, and what the PoC uses.
 LINE_THRESHOLD = 128
 
+# The only relative-exposure value SANE ever sends, for any filter, in any
+# calibration mode (pieusb.c:878-882). See the exp_rel_* options.
+DEFAULT_RELATIVE_EXPOSURE = 100
+
 class Unit(Enum):
     MM = 0
     PIXEL = 1
     BITS = 2
     MICROSECONDS = 3
     NONE = 4
+    PERCENT = 5
+    # Timer 1 counts: the unit the scanner's own exposure times are expressed in.
+    # Not convertible to a wall-clock duration without the Timer 1 clock rate,
+    # which the device does not report -- hence its own unit rather than
+    # MICROSECONDS.
+    TIMER_COUNTS = 6
 
 T = TypeVar("T")
 
@@ -191,11 +201,24 @@ class OptionsTable:
             log.warning(f"option 'sharpen' has no effect in '{mode}' mode (one-pass colour only)")
         if self['fast_infrared'].value and mode != 'rgbi':
             log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
-        if self['auto_exp'].value:
-            log.warning("option 'auto_exp' is not implemented yet and will be ignored")
         if self['advance'].value:
             log.warning("option 'advance' is not implemented yet and will be ignored: "
                         "slide-transport commands are not sent (TODO 12c)")
+
+        # Unexplored rather than wrong, so this warns instead of refusing -- but
+        # it warns every scan, because a stray relative exposure is invisible in
+        # the result and silently undermines auto-exposure's reference levels.
+        moved = [
+            f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
+            if self[n].value != DEFAULT_RELATIVE_EXPOSURE
+        ]
+        if moved:
+            log.warning(
+                f"relative exposure moved off {DEFAULT_RELATIVE_EXPOSURE}% ({', '.join(moved)}). "
+                f"No shipping driver sends anything but {DEFAULT_RELATIVE_EXPOSURE}, the device's "
+                f"response is unknown, and auto exposure's saturation reference assumes "
+                f"{DEFAULT_RELATIVE_EXPOSURE}. Prefer exp_time_* to change exposure."
+            )
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
     out: list[Parameter] = []
@@ -268,7 +291,9 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Perform a preview pass to determine best exposure parameters
+    # Run a preview pass first and derive gain_*/exp_time_* from it, rather than
+    # scanning with whatever they currently hold. Costs one extra pass at the
+    # device's preview resolution; see pieusb.calibration.
     out.append(Parameter(Option(
         name='auto_exp',
         type=bool,
@@ -322,43 +347,73 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=inq.max_scan_h
     )))
 
-    # SANE exposure default 2937
-    # Though setting the option does nothing as the value is hardcoded to 100 per channel
-    # Exposure for red channel
-    out.append(Parameter(Option(
-        name='exp_r',
-        type=int,
-        unit=Unit.MICROSECONDS,
-        validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        default=100
-    )))
-    
-    # Exposure for green channel
-    out.append(Parameter(Option(
-        name='exp_g',
-        type=int,
-        unit=Unit.MICROSECONDS,
-        validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        default=100
-    )))
-    
-    # Exposure for blue channel
-    out.append(Parameter(Option(
-        name='exp_b',
-        type=int,
-        unit=Unit.MICROSECONDS,
-        validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        default=100
-    )))
-    
-    # Exposure for infrared channel
-    out.append(Parameter(Option(
-        name='exp_i',
-        type=int,
-        unit=Unit.MICROSECONDS,
-        validate=lambda v: v >= inq.minimum_exposure and v <= inq.maximum_exposure, # SANE multiplies the max by 4
-        default=100
-    )))
+    # --- Exposure -------------------------------------------------------------
+    #
+    # The scanner has TWO independent exposure controls, sent by two different
+    # commands. They are not alternative spellings of one setting, and mixing
+    # them up is easy, so they are named apart here:
+    #
+    #   exp_time_*  ABSOLUTE. Integration time in Timer 1 counts, one per filter
+    #               including infrared, carried by SET GAIN OFFSET. This is the
+    #               real exposure knob and the one auto-exposure moves.
+    #   exp_rel_*   RELATIVE. A percentage, R/G/B only, sent by the SCSI_EXPOSURE
+    #               write. See below -- leave it alone.
+    #
+    # ABSOLUTE. The firmware optimises these during warm-up so that R and B reach
+    # >=90% of full scale and G >=80% (pieusb_scancmd.h:188-197) -- that is the
+    # device's own white balance against a green-heavy lamp -- and then usually
+    # resets them to 0x0B79 = 2937, which is what SANE's DEFAULT_EXPOSURE sends
+    # back (pieusb_specific.h:105).
+    #
+    # Raising this is the expensive way to brighten a scan: it is the per-line
+    # integration period, so it scales scan time and lamp-on time one for one.
+    # pieusb.calibration therefore only spends half its correction here (in log
+    # terms) and takes the other half in gain.
+    #
+    # The advertised maximum is multiplied by 4 because it does not otherwise
+    # contain 2937 -- the device's own default is out of its own reported range.
+    # SANE hits the same wall and applies the same factor (pieusb_specific.c:391).
+    DEFAULT_EXPOSURE_TIME = 2937
+    exposure_time_max = inq.maximum_exposure * 4
+    for filt in ('r', 'g', 'b', 'i'):
+        out.append(Parameter(Option(
+            name=f'exp_time_{filt}',
+            type=int,
+            unit=Unit.TIMER_COUNTS,
+            validate=lambda v: inq.minimum_exposure <= v <= exposure_time_max,
+            default=DEFAULT_EXPOSURE_TIME
+        )))
+
+    # RELATIVE. A percentage scaling applied on top of the absolute exposure
+    # time, sent as a 16-bit field per filter by the SCSI_EXPOSURE write
+    # (pieusb_scancmd.c:521-544). Infrared has no entry: the C struct holds three
+    # colours and the loop runs 0..2.
+    #
+    # PROBABLY LEAVE THIS AT 100. It is exposed for experiments, not for tuning:
+    #
+    #   - SANE hard-codes all three to 100 and never varies them, auto-exposure
+    #     included (pieusb.c:878-882, 927). There is no SANE option for it, so
+    #     no value other than 100 has ever been exercised against this hardware
+    #     by a shipping driver.
+    #   - It is redundant with exp_time_*, which covers the same ground with a
+    #     known range and a known meaning.
+    #   - Nothing here knows what the device does out of range, or whether >100
+    #     is even accepted; the bound below is the width of the wire field, not a
+    #     documented limit. Only 100 is known-good.
+    #   - Auto-exposure meters the preview against saturation levels the firmware
+    #     measured at warm-up with this at 100. Changing it silently invalidates
+    #     that reference, so pieusb.calibration's arithmetic stops meaning what
+    #     it says.
+    #
+    # OptionsTable.validate() warns if you move it, rather than refusing.
+    for filt in ('r', 'g', 'b'):
+        out.append(Parameter(Option(
+            name=f'exp_rel_{filt}',
+            type=int,
+            unit=Unit.PERCENT,
+            validate=lambda v: 0 <= v <= 0xFFFF,
+            default=DEFAULT_RELATIVE_EXPOSURE
+        )))
 
     # SANE gain default 19
     # Gain for red channel
@@ -442,12 +497,11 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
         payload = struct.pack("<HHHH", SCSI_HIGHLIGHT_SHADOW, 4, filt, value)
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
 
-    # Hard-coded to 100 in SANE. The auto exposure usually uses the gain instead
-    r = options['exp_r'].value
-    g = options['exp_g'].value
-    b = options['exp_b'].value
-    for filt, value in ((0x02, r), (0x04, g), (0x08, b)):
-        payload = struct.pack("<HHHH", SCSI_EXPOSURE, 4, filt, value)
+    # RELATIVE exposure, a percentage. NOT the same quantity as exp_time_*, which
+    # is an absolute integration time and goes out with SET GAIN OFFSET below.
+    # Three filters only -- infrared has no relative-exposure entry.
+    for filt, name in ((0x02, 'exp_rel_r'), (0x04, 'exp_rel_g'), (0x08, 'exp_rel_b')):
+        payload = struct.pack("<HHHH", SCSI_EXPOSURE, 4, filt, options[name].value)
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
 
     index = 128 # Trust me bro
@@ -458,11 +512,11 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
     payload = struct.pack("<HHHHHHH", SCSI_SCAN_FRAME, 10, index, x0, y0, x1, y1)
     dev.command(SCSI_WRITE, out_data=payload, cdb_length=14)
 
-    # Set exposure, gain and offset
+    # Set ABSOLUTE exposure time, gain and offset
     payload = struct.pack('<HHHBBBBBBBBBBBBHBBBBBBBBB',
-        options['exp_r'].value,
-        options['exp_g'].value,
-        options['exp_b'].value,
+        options['exp_time_r'].value,
+        options['exp_time_g'].value,
+        options['exp_time_b'].value,
         options['offset_r'].value,
         options['offset_g'].value,
         options['offset_b'].value,
@@ -475,7 +529,7 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
         0, # Light, maybe in SANE is 5?
         0, # Extra entried
         0, # Double times
-        options['exp_i'].value,
+        options['exp_time_i'].value,
         options['offset_i'].value,
         0,
         options['gain_i'].value,
