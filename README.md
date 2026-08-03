@@ -100,6 +100,14 @@ determines whether a pass pays for its own calibration, never whether the image
 gets corrected. Since the cache lives on the `Scanner`, a fresh one starts cold:
 a loop that opens a `Scanner` per frame is correct but calibrates every time.
 
+## Status of verification
+
+### Verified on hardware
+
+- ProScan 10T
+
+That's it for now
+
 # WARNING
 
 No guarantees are made as far as hardware safety goes.
