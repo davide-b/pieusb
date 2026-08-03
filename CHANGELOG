@@ -1,3 +1,11 @@
+# v0.3.3
+
+- Relaxed python and numpy minimum requirements
+
+# v0.3.2
+
+- Made it possible to set the resolution to the maximum reported by the inquiry
+
 # v0.3.1
 
 - **Breaking:** `UpdateData.scanned_lines`/`total_lines` are replaced by a single
