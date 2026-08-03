@@ -48,16 +48,13 @@ pip install pieusb
 import numpy
 import pieusb
 from pieusb.scanner import Scanner
-from pieusb.types import ScanPhase
 
 for info in pieusb.get_devices():
     print(info.vendor, info.model)
 
 def on_update(data):
-    if data.phase == ScanPhase.SCANNING:
-        print(f"{data.scanned_lines}/{data.total_lines}")
-    else:
-        print(data.phase)
+    # progress runs 0.0 -> 1.0 within each phase, not across the scan
+    print(f"{data.phase}: {data.progress * 100:.1f}%")
 
 def on_complete(result):
     if result.error:

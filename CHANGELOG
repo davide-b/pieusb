@@ -1,5 +1,12 @@
-# Unreleased
+# v0.3.1
 
+- **Breaking:** `UpdateData.scanned_lines`/`total_lines` are replaced by a single
+  `progress` float, 0.0 -> 1.0 within the current `phase`. Line counts only ever
+  meant anything during SCANNING, which left every other phase reporting `None`
+  and each consumer writing the same division; a fraction is what a progress
+  indicator wants and it now applies to every phase. CALIBRATING reports the
+  shading read's fraction and WARMING_UP its progress through the START SCAN
+  retry budget; phases whose length the device does not announce report 0.0
 - **Breaking:** the `calibrate` option is replaced by `reuse_calibration`, with
   the opposite polarity and the same default behaviour (`calibrate=True` is
   `reuse_calibration=False`, still the default). The old name promised something

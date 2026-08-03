@@ -201,27 +201,26 @@ class Progress:
             self.phase_started = now
             header = f"[{now - self.started:7.1f}s] {u.phase}"
             # Without a TTY the bar cannot be rewritten in place, so the header
-            # gets its own line and only the final count is reported.
-            keep_open = self.tty and u.scanned_lines is not None
-            print(header, end='' if keep_open else '\n', flush=True)
-            self.line_open = keep_open
+            # gets its own line and only the phase's last update is reported.
+            print(header, end='' if self.tty else '\n', flush=True)
+            self.line_open = self.tty
 
-        if u.scanned_lines is None or not u.total_lines:
+        # Phases the device gives no length for sit at 0.0 throughout; the header
+        # above is all there is to show for them.
+        if u.progress <= 0:
             return
 
-        frac = u.scanned_lines / u.total_lines
         elapsed = now - self.phase_started
-        eta = (elapsed / frac - elapsed) if frac > 0 else 0
+        eta = elapsed / u.progress - elapsed
         bar_w = 28
-        filled = int(bar_w * frac)
+        filled = int(bar_w * u.progress)
         line = (f"[{now - self.started:7.1f}s] {u.phase} "
                 f"[{'#' * filled}{'.' * (bar_w - filled)}] "
-                f"{u.scanned_lines}/{u.total_lines} lines "
-                f"{frac * 100:5.1f}%  ETA {eta:5.1f}s")
+                f"{u.progress * 100:5.1f}%  ETA {eta:5.1f}s")
         if self.tty:
             print('\r' + line, end='', flush=True)
             self.line_open = True
-        elif u.scanned_lines == u.total_lines:
+        elif u.progress >= 1.0:
             print(line, flush=True)
 
     def _finish_line(self) -> None:

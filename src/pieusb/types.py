@@ -79,7 +79,7 @@ class DeviceInfo:
 
 class ScanPhase(StrEnum):
     # Every phase of the auto-exposure preview pass reports as METERING, so a
-    # progress bar sees one 0->100% sweep for it and a second for the real scan,
+    # progress bar sees one 0->1 sweep for it and a second for the real scan,
     # rather than two indistinguishable SCANNING sweeps.
     METERING = 'Metering'
     CONFIGURING = 'Configuring'
@@ -90,9 +90,17 @@ class ScanPhase(StrEnum):
 
 @dataclass(frozen=True)
 class UpdateData:
+    '''Progress within one phase of a scan, delivered to scan()'s on_update.
+
+    `progress` runs 0.0 -> 1.0 within `phase` and says nothing about the scan as a
+    whole: each phase sweeps the range again, and how many phases a scan has
+    depends on the options (auto-exposure adds a metering pass, a reused
+    calibration removes CALIBRATING). A phase whose length the device does not
+    tell us in advance reports 0.0 throughout, so treat a phase change as the
+    real event and `progress` as detail within it.
+    '''
     phase: ScanPhase
-    scanned_lines: int | None = None
-    total_lines: int | None = None
+    progress: float = 0.0
 
 @dataclass(frozen=True)
 class ScanResult:

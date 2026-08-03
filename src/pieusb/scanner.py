@@ -232,10 +232,15 @@ class Scanner:
             log.debug(f"[scan]   {label}: {done}/{total_lines} lines read (remaining {remaining})")
             yield chunk, lines_this_read
 
-    def _get_scanned_lines(self, total_lines, bytes_per_line, label="lines") -> bytes:
+    def _get_scanned_lines(self, total_lines, bytes_per_line, label="lines",
+                           report: Callable[[float], None] | None = None) -> bytes:
         collected = bytearray()
-        for chunk, _ in self._iter_scanned_lines(total_lines, bytes_per_line, label):
+        done = 0
+        for chunk, n_lines in self._iter_scanned_lines(total_lines, bytes_per_line, label):
             collected.extend(chunk)
+            done += n_lines
+            if report is not None:
+                report(done / total_lines)
         return bytes(collected)
 
     def _get_shading_parms(self) -> list[dict]:
@@ -359,8 +364,8 @@ class Scanner:
         """Emit a pass's update relabelled as the metering pass.
 
         The metering pass runs the same sequence as the real one, so its updates
-        would otherwise arrive labelled SCANNING and sweep 0->100% before the
-        real scan started again from 0. Line counts are kept: the pass is a real
+        would otherwise arrive labelled SCANNING and sweep 0->1 before the real
+        scan started again from 0. `progress` is kept as it is: the pass is a real
         scan and a progress bar can follow it.
         """
         self._emit(replace(update, phase=ScanPhase.METERING))
@@ -600,7 +605,10 @@ class Scanner:
                 break
             except CheckCondition as e:
                 if e.warming_up:
-                    emit(UpdateData(phase=ScanPhase.WARMING_UP))
+                    # Progress against the retry budget, which is all we know: the
+                    # scanner does not say how much warming up it has left.
+                    emit(UpdateData(phase=ScanPhase.WARMING_UP,
+                                    progress=attempt / START_SCAN_ATTEMPTS))
                     log.debug(f"[scan]   still warming up, waiting {START_SCAN_RETRY_S}s "
                               f"(attempt {attempt + 1}/{START_SCAN_ATTEMPTS})...")
                     time.sleep(START_SCAN_RETRY_S)
@@ -646,7 +654,10 @@ class Scanner:
             log.debug(f"[scan] reading shading reference ({total_shading_lines} lines, "
                       f"{total_shading_lines * shading_bytes_per_line} bytes)...")
             shading_raw = self._get_scanned_lines(
-                total_shading_lines, shading_bytes_per_line, label="shading"
+                total_shading_lines, shading_bytes_per_line, label="shading",
+                report=lambda frac: emit(
+                    UpdateData(phase=ScanPhase.CALIBRATING, progress=frac)
+                ),
             )
             self.wait_ready()
         else:
@@ -683,7 +694,7 @@ class Scanner:
 
         log.debug(f"[scan] reading {n_planes} planes x {height} lines "
                   f"({raw_bytes_per_line} bytes/line incl. 2-byte tag)...")
-        emit(UpdateData(phase=ScanPhase.SCANNING, scanned_lines=0, total_lines=total_lines))
+        emit(UpdateData(phase=ScanPhase.SCANNING, progress=0.0))
 
         # Planes arrive as sequential blocks -- all R lines, then all G, and so
         # on -- but the 255-line read cap does not align to those boundaries, so
@@ -714,9 +725,7 @@ class Scanner:
                     chunk, dtype=sample_dtype, count=width, offset=off + 2
                 )
             done += n_lines
-            emit(UpdateData(
-                phase=ScanPhase.SCANNING, scanned_lines=done, total_lines=total_lines
-            ))
+            emit(UpdateData(phase=ScanPhase.SCANNING, progress=done / total_lines))
 
             if self.cancel_requested.is_set():
                 log.debug(f"[scan] cancelled after {done}/{total_lines} lines; stopping")
