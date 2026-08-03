@@ -45,32 +45,63 @@ pip install pieusb
 ## Usage example
 
 ```python
+import numpy
 import pieusb
+from pieusb.scanner import Scanner
 from pieusb.types import ScanPhase
 
-for info in pieusb.available_devices():
+for info in pieusb.get_devices():
     print(info.vendor, info.model)
 
-scanner = pieusb.Scanner(pieusb.available_devices()[0])
-scanner.mode = "rgbi"
-scanner.resolution = 5000
-scanner.color_depth = 16
-scanner.tl_x, scanner.tl_y = 0, 0
-scanner.br_x, scanner.br_y = 14200, 9600
-
-def on_progress(data):
+def on_update(data):
     if data.phase == ScanPhase.SCANNING:
         print(f"{data.scanned_lines}/{data.total_lines}")
+    else:
+        print(data.phase)
 
 def on_complete(result):
     if result.error:
         raise result.error
-    numpy.save("scan.npy", result.image)
+    numpy.save("scan.npy", result.rgb)
 
-scanner.scan(progress=on_progress, scan_complete=on_complete)   # returns immediately
-scanner.wait()                                                  # optional
-scanner.close()
+with Scanner(pieusb.get_devices()[0]) as scanner:
+    scanner.mode = "rgbi"
+    scanner.resolution = 5000
+    scanner.color_depth = 16
+    scanner.tl_x, scanner.tl_y = 0, 0
+    scanner.br_x, scanner.br_y = 14200, 9600
+
+    scanner.scan(on_update, on_complete)   # returns immediately
+    scanner.wait()                         # optional
 ```
+
+### Scanning more than one frame
+
+Keep one `Scanner` open for the whole batch rather than opening one per frame.
+It is faster, and the reason is `reuse_calibration`:
+
+```python
+with Scanner(pieusb.get_devices()[0]) as scanner:
+    scanner.resolution = 5000
+    scanner.reuse_calibration = True
+
+    for _ in range(50):
+        scanner.scan(on_update, on_complete)
+        scanner.wait()
+```
+
+Shading (flat-field) correction is applied on the host from a reference the
+scanner produces during a calibration pass, so the reference has to be read at
+least once before it can be reused. The first scan above therefore calibrates
+whatever the option says; the rest skip it and correct from the cached reference,
+which is what saves the time. The scanner keeps the last word: when it decides
+its calibration has gone stale -- after a power cycle, or on its own drift
+checks -- it refuses the skip and that scan calibrates again.
+
+Every scan is shading-corrected either way. `reuse_calibration` only ever
+determines whether a pass pays for its own calibration, never whether the image
+gets corrected. Since the cache lives on the `Scanner`, a fresh one starts cold:
+a loop that opens a `Scanner` per frame is correct but calibrates every time.
 
 # WARNING
 

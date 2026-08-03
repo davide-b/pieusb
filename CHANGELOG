@@ -1,11 +1,29 @@
 # Unreleased
 
-- `calibrate=False` is now honoured: the shading reference read, and the
-  `ScanPhase.CALIBRATING` update with it, happen only when the option asks for
-  calibration or the scanner insists on it by answering START SCAN with
-  MUST_CALIBRATE. Previously the read was unconditional, so turning the option
-  off changed the SET MODE quality bit and nothing else. A pass that skips it
-  returns `shading_corrected=False` and uncorrected pixels. The default stays on
+- **Breaking:** the `calibrate` option is replaced by `reuse_calibration`, with
+  the opposite polarity and the same default behaviour (`calibrate=True` is
+  `reuse_calibration=False`, still the default). The old name promised something
+  it could not deliver: skipping calibration is a request, not a decision, and
+  the option now says so
+- Skipping calibration is honoured, where before it changed the SET MODE quality
+  bit and nothing else. A pass acquires a shading reference unless
+  `reuse_calibration` is set AND one is already cached; the scanner can still
+  refuse, which it signals by answering START SCAN with MUST_CALIBRATE, and then
+  the pass calibrates anyway. `ScanPhase.CALIBRATING` is reported only when a
+  pass actually calibrates
+- Shading references are cached on the `Scanner` for the life of the device
+  session, so a pass that skips calibration corrects from the one an earlier pass
+  read. Following the C backend, which keeps `shading_ref`/`shading_mean` on the
+  open device handle (`pieusb_specific.h:292-294`). Practical consequence: keep
+  one `Scanner` open across a batch, since a fresh one starts with a cold cache
+  and calibrates on its first scan regardless of the option. The cache is dropped
+  if the device starts reporting a different shading width, and an unusable read
+  keeps the previous reference rather than falling back to raw pixels
+- With `auto_exp`, the metering pass calibrates and the real pass reuses that
+  reference: one calibration per scan instead of two
+- `set_options()` takes `skip_shading_analysis` as a keyword argument, since
+  whether a pass can skip depends on the Scanner's cache and not on an option
+  alone
 - The scan sequence proper is now `Scanner._scan_pass(started, emit)`, shared by
   the real scan and the auto-exposure metering pass, which differ only in the
   options in force and in the `emit` callback that labels their progress.

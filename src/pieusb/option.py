@@ -269,22 +269,26 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Collect shading (flat-field) information as part of the scan. Turning this
-    # off sets the skipShadingAnalysis quality bit, which the scanner is free to
-    # refuse: it then answers START SCAN with MUST_CALIBRATE and the pass
-    # calibrates anyway. So this asks for calibration rather than suppressing it,
-    # and off means "only if the scanner insists".
+    # Try to reuse the shading (flat-field) reference an earlier scan on this
+    # Scanner already acquired, instead of acquiring a fresh one. BEST EFFORT in
+    # two ways, neither of which can produce an uncorrected image:
     #
-    # Defaults ON, unlike SANE's shading-analysis option (pieusb_specific.c:722):
-    # without a shading reference there is no flat-field correction, so the image
-    # keeps the CCD's per-column response, and it is the only path exercised
-    # against this hardware.
+    #  - The scanner may refuse. Asking to skip sets the skipShadingAnalysis
+    #    quality bit in SET MODE, and the scanner answers START SCAN with
+    #    MUST_CALIBRATE when it wants to calibrate regardless -- after a power
+    #    cycle, or when its own drift checks say the reference is stale.
+    #  - There may be nothing to reuse. Shading correction is applied on the
+    #    host, so a reference is only cached once a pass has read one; with an
+    #    empty cache Scanner acquires anyway, whatever this option says.
+    #
+    # Off by default: acquiring is correct always, reusing only saves the
+    # calibration pass. See Scanner._scan_pass.
     out.append(Parameter(Option(
-        name='calibrate',
+        name='reuse_calibration',
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
-        default=True
+        default=False
     )))
 
     # Acquire the infrared plane in a faster, lower-quality pass. Requires a
@@ -497,7 +501,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
 
     return OptionsTable(out, inq)
 
-def set_options(dev: UASDevice, options: OptionsTable) -> None:
+def set_options(dev: UASDevice, options: OptionsTable, *,
+                skip_shading_analysis: bool = False) -> None:
+    """Send every option to the device, in the order the scan sequence needs.
+
+    `skip_shading_analysis` is passed rather than read off the options table:
+    whether a pass can skip acquiring a shading reference depends on what the
+    Scanner has cached, not on the option alone (see 'reuse_calibration').
+    """
     # Hard-coded in SANE. Experiment with setting different values
     for filt, value in ((0x02, 100), (0x04, 100), (0x08, 100)):
         payload = struct.pack("<HHHH", SCSI_HIGHLIGHT_SHADOW, 4, filt, value)
@@ -552,10 +563,9 @@ def set_options(dev: UASDevice, options: OptionsTable) -> None:
     quality = 0
     if options['sharpen'].value:
         quality |= 0x02
-    if not options['calibrate'].value:
-        # skipShadingAnalysis. The C backend sets this bit when shading analysis
-        # is *not* wanted: skipShadingAnalysis = !OPT_SHADING_ANALYSIS
-        # (pieusb_specific.c:1857), so 'calibrate' inverts into it.
+    if skip_shading_analysis:
+        # skipShadingAnalysis, set when shading analysis is *not* wanted, as in
+        # skipShadingAnalysis = !OPT_SHADING_ANALYSIS (pieusb_specific.c:1857).
         quality |= 0x08
     if options['fast_infrared'].value:
         quality |= 0x80

@@ -43,7 +43,7 @@ import numpy
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +73,25 @@ START_SCAN_RETRY_S = 5
 # over transport.COMMAND_TIMEOUT_S.
 CLOSE_WAIT_S = 90
 
+@dataclass(frozen=True)
+class _ShadingReference:
+    """A shading reference read from the device, ready to correct with.
+
+    Cached on the Scanner because that is the lifetime it belongs to: it
+    describes the CCD's per-column response under the current calibration, which
+    outlives a single scan but not the device session. The same choice the C
+    backend makes -- shading_ref/shading_mean live on Pieusb_Scanner, the open
+    device handle, and shading_data_present starts false at sane_open
+    (pieusb_specific.h:292-294, pieusb.c:418).
+
+    `pixels_per_line` is the CCD-native width the reference was read at, which
+    the image's own width is mapped onto through that pass's CCD mask. It is kept
+    so a reference cannot be applied to a pass the device sized differently.
+    """
+    ref: dict[int, numpy.ndarray]
+    mean: dict[int, float]
+    pixels_per_line: int
+
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
@@ -86,6 +105,9 @@ class Scanner:
         self.cancel_requested = threading.Event()
         self.shading_params: list[dict] | None = None
         self.closed: bool = False
+        # The most recent shading reference any pass on this Scanner acquired, or
+        # None if none has yet. What 'reuse_calibration' reuses.
+        self._shading: _ShadingReference | None = None
         self.info = info
         self.params = generate_options(info.inquiry)
         self.dev.open()
@@ -508,6 +530,13 @@ class Scanner:
             cancelled = self._meter_from_preview(started)
             if cancelled is not None:
                 return cancelled
+            # The metering pass just calibrated, moments ago, on this medium and
+            # this lamp -- as fresh a reference as the real pass could acquire for
+            # itself. So reuse it and pay for one calibration rather than two. The
+            # scanner still gets the last word: if it refuses the skip, the real
+            # pass acquires anyway.
+            with self._overridden_options(reuse_calibration=True):
+                return self._scan_pass(started, self._emit)
 
         return self._scan_pass(started, self._emit)
 
@@ -519,6 +548,12 @@ class Scanner:
         _meter_from_preview) and in how their progress is labelled -- hence `emit`
         rather than self._emit, which is what keeps the two passes distinguishable
         to a caller without this method knowing which one it is running.
+
+        Whether the pass acquires its own shading reference or reuses the one
+        cached on the Scanner is decided here, from 'reuse_calibration' and what
+        the cache holds -- but the scanner gets the last word (see the
+        must_calibrate branch below). Either way the image is corrected from
+        self._shading, so the choice costs a calibration pass, never a correction.
 
         Raises; _scan_worker turns that into result.error. Follows sane_start()
         (pieusb.c:865-1140) and the PoC (poc:645-893), which is the sequence
@@ -536,15 +571,27 @@ class Scanner:
         # unused pixels, which is what the CCD mask later maps away.
         shading_ppl = self.shading_params[0]["pixels_per_line"]
 
-        self.wait_ready()
-        set_options(self.dev, self.params)
-        self.wait_ready()
+        if self._shading is not None and self._shading.pixels_per_line != shading_ppl:
+            log.warning(f"[scan] the device now reports a {shading_ppl}-pixel shading "
+                        f"reference, not {self._shading.pixels_per_line}; dropping the "
+                        f"cached one")
+            self._shading = None
 
-        # Whether this pass will have shading reference data waiting to be read.
-        # 'calibrate' asks for it through the skipShadingAnalysis quality bit in
-        # SET MODE; with it off the scanner may still insist, which it says by
-        # answering START SCAN with MUST_CALIBRATE below.
-        shading = self.params['calibrate'].value
+        # Whether this pass acquires a shading reference of its own. Skipping is
+        # what 'reuse_calibration' asks for, but it can only be honoured with one
+        # already cached to correct from -- shading correction is applied on the
+        # host, so a granted skip and an empty cache would mean raw pixels. Never
+        # producing an uncorrected image outranks honouring the option.
+        acquire = not self.params['reuse_calibration'].value or self._shading is None
+        if acquire and self.params['reuse_calibration'].value:
+            log.info("[scan] reuse_calibration is set but no shading reference has been "
+                     "acquired on this Scanner yet; calibrating this pass. Keep the "
+                     "Scanner open across scans for later ones to reuse it")
+
+        self.wait_ready()
+        # The quality bit only asks. The scanner answers below.
+        set_options(self.dev, self.params, skip_shading_analysis=not acquire)
+        self.wait_ready()
 
         log.debug("[scan] starting scan...")
         for attempt in range(START_SCAN_ATTEMPTS):
@@ -560,15 +607,14 @@ class Scanner:
                     continue
                 if e.must_calibrate:
                     # NOT an error: "calibration disable not granted". The scanner
-                    # is overriding calibrate=False and telling us it will calibrate
-                    # anyway, so the shading reference data must be read whatever
-                    # the option said. The SANE backend reads the sense identically
-                    # (pieusb.c:1091-1092). Only reachable with calibrate off; with
-                    # it on START SCAN returns OK and shading data is read because
-                    # we asked for it.
-                    log.debug("[scan]   scanner overrode calibrate=False and will "
-                              "calibrate; its shading reference will be read")
-                    shading = True
+                    # refuses the skip and will calibrate regardless, so a fresh
+                    # reference is waiting to be read whatever we asked for. This is
+                    # the mechanism that keeps a reused reference from going stale:
+                    # the device says when its own drift checks want a new one. The
+                    # SANE backend reads the sense identically (pieusb.c:1091-1092).
+                    log.info("[scan]   the scanner refused to skip calibration; "
+                             "acquiring a fresh shading reference")
+                    acquire = True
                     break
                 raise
         else:
@@ -587,7 +633,7 @@ class Scanner:
             return self._result(started=started, cancelled=True)
 
         shading_raw = None
-        if shading:
+        if acquire:
             emit(UpdateData(phase=ScanPhase.CALIBRATING))
 
             # Shading data is always 16-bit, with the same two-byte channel tag per
@@ -605,9 +651,10 @@ class Scanner:
             self.wait_ready()
         else:
             # Nothing to read and nothing to drain: the scanner granted the skip,
-            # so no CALIBRATING is reported and the image comes back uncorrected.
-            log.info("[scan] calibrate=False and the scanner did not override it; "
-                     "no shading reference, so no shading correction")
+            # so no CALIBRATING is reported and this pass saves the calibration it
+            # would have cost. The cached reference corrects the image instead.
+            log.debug("[scan] calibration skipped; correcting from the reference "
+                      "cached on this Scanner")
 
         # Read unconditionally, as sane_start() does (pieusb.c:1149) -- it sits
         # outside the calibration branch there. Only shading correction consumes
@@ -702,20 +749,29 @@ class Scanner:
         # --- Post-processing ---------------------------------------------------
         emit(UpdateData(phase=ScanPhase.PROCESSING))
 
+        # A pass that acquired one replaces the cache; a pass that skipped leaves
+        # the reference the previous one left there, which is the point of the
+        # cache. Either way the correction below reads it from the same place.
+        if shading_raw is not None:
+            shading_ref, shading_mean = calculate_shading(shading_raw, shading_ppl)
+            if shading_ref is None:
+                # Keep the older reference rather than dropping to raw pixels over
+                # one bad read; it describes the same CCD under a calibration the
+                # device was, until this pass, content with.
+                log.warning("[scan] no usable shading reference lines in what the device "
+                            "returned; keeping the reference already cached, if any")
+            else:
+                self._shading = _ShadingReference(shading_ref, shading_mean, shading_ppl)
+
         shading_corrected = False
-        shading_ref, shading_mean = (
-            calculate_shading(shading_raw, shading_ppl) if shading_raw is not None
-            else (None, None)
-        )
-        if shading_raw is None:
-            log.debug("[scan] no shading analysis this pass; returning raw pixel data")
-        elif shading_ref is None:
-            log.warning("[scan] no usable shading reference lines; returning raw pixel data")
+        if self._shading is None:
+            log.warning("[scan] no shading reference available; returning raw pixel data")
         else:
             log.debug(f"[scan] shading mean per channel = "
-                      f"{[round(shading_mean[c], 1) for c in range(n_planes)]}")
+                      f"{[round(self._shading.mean[c], 1) for c in range(n_planes)]}")
             apply_shading_correction(
-                planes, shading_ref, shading_mean, build_width_to_loc(ccd_mask, width)
+                planes, self._shading.ref, self._shading.mean,
+                build_width_to_loc(ccd_mask, width)
             )
             shading_corrected = True
 
