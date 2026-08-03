@@ -57,7 +57,7 @@ MODE_PLANES = {'gray': 1, 'rgb': 3, 'rgbi': 4}
 # in the worker, validate() refuses the mode outright. See TODO 12a.
 UNSUPPORTED_MODES = ('gray',)
 
-# Sample sizes the deinterleave in Scanner._run_scan understands. INQUIRY can
+# Sample sizes the deinterleave in Scanner._scan_pass understands. INQUIRY can
 # advertise 1/4/10/12 as well, but only 8 and 16 map cleanly onto a numpy dtype
 # and only those two have been seen on the wire.
 SUPPORTED_COLOR_DEPTHS = (8, 16)
@@ -270,9 +270,15 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     )))
 
     # Collect shading (flat-field) information as part of the scan. Turning this
-    # off sets the 'skip calibration' quality bit, which makes the scanner reject
-    # the subsequent CCD MASK and GET PARAMETERS commands as invalid -- the whole
-    # read sequence in Scanner.scan() depends on the shading pass having run.
+    # off sets the skipShadingAnalysis quality bit, which the scanner is free to
+    # refuse: it then answers START SCAN with MUST_CALIBRATE and the pass
+    # calibrates anyway. So this asks for calibration rather than suppressing it,
+    # and off means "only if the scanner insists".
+    #
+    # Defaults ON, unlike SANE's shading-analysis option (pieusb_specific.c:722):
+    # without a shading reference there is no flat-field correction, so the image
+    # keeps the CCD's per-column response, and it is the only path exercised
+    # against this hardware.
     out.append(Parameter(Option(
         name='calibrate',
         type=bool,

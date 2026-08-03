@@ -1,5 +1,16 @@
 # Unreleased
 
+- `calibrate=False` is now honoured: the shading reference read, and the
+  `ScanPhase.CALIBRATING` update with it, happen only when the option asks for
+  calibration or the scanner insists on it by answering START SCAN with
+  MUST_CALIBRATE. Previously the read was unconditional, so turning the option
+  off changed the SET MODE quality bit and nothing else. A pass that skips it
+  returns `shading_corrected=False` and uncorrected pixels. The default stays on
+- The scan sequence proper is now `Scanner._scan_pass(started, emit)`, shared by
+  the real scan and the auto-exposure metering pass, which differ only in the
+  options in force and in the `emit` callback that labels their progress.
+  Replaces the `_phase_override` attribute that relabelled updates inside
+  `_emit()`
 - Implemented the `auto_exp` option, which until now warned and did nothing. It
   runs a preview pass at the device's preview resolution, measures the 99th
   percentile of each colour plane against the CCD saturation levels, and derives

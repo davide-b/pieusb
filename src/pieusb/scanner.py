@@ -86,9 +86,6 @@ class Scanner:
         self.cancel_requested = threading.Event()
         self.shading_params: list[dict] | None = None
         self.closed: bool = False
-        # Set while the metering pass runs, so its progress is not reported as
-        # the real scan's; see _emit().
-        self._phase_override: ScanPhase | None = None
         self.info = info
         self.params = generate_options(info.inquiry)
         self.dev.open()
@@ -331,16 +328,20 @@ class Scanner:
 
     def _emit(self, update: UpdateData) -> None:
         """Fire on_update, never letting a caller's callback abort the scan."""
-        if self._phase_override is not None:
-            # The metering pass reuses _run_scan wholesale, so its progress would
-            # otherwise arrive labelled SCANNING and run 0->100% before the real
-            # scan starts again from 0. Relabelling here keeps that in one place
-            # rather than threading a flag through six emit sites.
-            update = replace(update, phase=self._phase_override)
         try:
             self.on_update(update)
         except Exception:
             log.exception("[scan] on_update callback raised; continuing the scan")
+
+    def _emit_metering(self, update: UpdateData) -> None:
+        """Emit a pass's update relabelled as the metering pass.
+
+        The metering pass runs the same sequence as the real one, so its updates
+        would otherwise arrive labelled SCANNING and sweep 0->100% before the
+        real scan started again from 0. Line counts are kept: the pass is a real
+        scan and a progress bar can follow it.
+        """
+        self._emit(replace(update, phase=ScanPhase.METERING))
 
     def _result(self, rgb=None, ir=None, *, started: float, width: int = 0, height: int = 0,
                 shading_corrected: bool = False, cancelled: bool = False,
@@ -413,8 +414,8 @@ class Scanner:
         Ports the SANE flow: a preview scan (pieusb.c:1284-1288 ->
         sanei_pieusb_analyze_preview) followed by
         sanei_pieusb_set_gain_offset(..., "from preview")
-        (pieusb_specific.c:1912). The preview pass is a real scan, only at the
-        device's own preview resolution and with the quality options that SANE
+        (pieusb_specific.c:1912). The preview pass is _scan_pass() itself, only at
+        the device's own preview resolution and with the quality options that SANE
         ignores during preview (pieusb_specific.c:1521-1546) turned off.
 
         Returns None once the settings have been updated, or the preview's own
@@ -437,19 +438,13 @@ class Scanner:
                         f"({preview_resolution}); metering at {fallback} dpi instead")
             preview_resolution = fallback
         log.debug(f"[autoexp] metering pass at {preview_resolution} dpi")
-        self._phase_override = ScanPhase.METERING
-        try:
-            # auto_exp off is what stops _run_scan recursing back in here.
-            with self._overridden_options(
-                auto_exp=False,
-                resolution=preview_resolution,
-                sharpen=False,
-                fast_infrared=False,
-                advance=False,
-            ):
-                preview = self._run_scan(started)
-        finally:
-            self._phase_override = None
+        with self._overridden_options(
+            resolution=preview_resolution,
+            sharpen=False,
+            fast_infrared=False,
+            advance=False,
+        ):
+            preview = self._scan_pass(started, self._emit_metering)
 
         if preview.cancelled:
             return preview
@@ -503,20 +498,33 @@ class Scanner:
         par.value = value
 
     def _run_scan(self, started: float) -> ScanResult:
-        """The scan sequence proper. Raises; _scan_worker turns that into result.error.
+        """Orchestrate the passes one scan() needs. Raises; _scan_worker catches.
 
-        Follows sane_start() (pieusb.c:865-1140) and the PoC (poc:645-893), which
-        is the sequence actually verified against hardware. The reads in the
-        calibration phase are not optional extras: skipping the shading reference
-        read makes the device reject the following CCD MASK and GET PARAMETERS as
-        "invalid command" (poc:741-747).
+        Auto-exposure costs an extra pass, so a scan is one or two runs of
+        _scan_pass(); which phases each of them reports is decided here, by the
+        emit callback handed to it.
         """
         if self.params['auto_exp'].value:
             cancelled = self._meter_from_preview(started)
             if cancelled is not None:
                 return cancelled
 
-        self._emit(UpdateData(phase=ScanPhase.CONFIGURING))
+        return self._scan_pass(started, self._emit)
+
+    def _scan_pass(self, started: float, emit: Callable[[UpdateData], None]) -> ScanResult:
+        """One pass over the medium, from configuration to a finished ScanResult.
+
+        Shared by the real scan and the auto-exposure metering pass: both need the
+        identical device sequence, and differ only in the options in force (see
+        _meter_from_preview) and in how their progress is labelled -- hence `emit`
+        rather than self._emit, which is what keeps the two passes distinguishable
+        to a caller without this method knowing which one it is running.
+
+        Raises; _scan_worker turns that into result.error. Follows sane_start()
+        (pieusb.c:865-1140) and the PoC (poc:645-893), which is the sequence
+        actually verified against hardware.
+        """
+        emit(UpdateData(phase=ScanPhase.CONFIGURING))
 
         self.shading_params = self._get_shading_parms()
         if not self.shading_params:
@@ -532,6 +540,12 @@ class Scanner:
         set_options(self.dev, self.params)
         self.wait_ready()
 
+        # Whether this pass will have shading reference data waiting to be read.
+        # 'calibrate' asks for it through the skipShadingAnalysis quality bit in
+        # SET MODE; with it off the scanner may still insist, which it says by
+        # answering START SCAN with MUST_CALIBRATE below.
+        shading = self.params['calibrate'].value
+
         log.debug("[scan] starting scan...")
         for attempt in range(START_SCAN_ATTEMPTS):
             try:
@@ -539,20 +553,22 @@ class Scanner:
                 break
             except CheckCondition as e:
                 if e.warming_up:
-                    self._emit(UpdateData(phase=ScanPhase.WARMING_UP))
+                    emit(UpdateData(phase=ScanPhase.WARMING_UP))
                     log.debug(f"[scan]   still warming up, waiting {START_SCAN_RETRY_S}s "
                               f"(attempt {attempt + 1}/{START_SCAN_ATTEMPTS})...")
                     time.sleep(START_SCAN_RETRY_S)
                     continue
                 if e.must_calibrate:
-                    # NOT an error: the scanner is telling us it will calibrate and
-                    # expects us to read the shading reference data below. The SANE
-                    # backend treats MUST_CALIBRATE identically -- it proceeds into
-                    # the calibration phase (pieusb.c:1091). Only reachable if
-                    # set_mode(..., skip_shading_analysis=True) was used; with the
-                    # default (skip=False) START SCAN normally returns OK.
-                    log.debug("[scan]   scanner requires calibration, proceeding to "
-                            "read shading reference data...")
+                    # NOT an error: "calibration disable not granted". The scanner
+                    # is overriding calibrate=False and telling us it will calibrate
+                    # anyway, so the shading reference data must be read whatever
+                    # the option said. The SANE backend reads the sense identically
+                    # (pieusb.c:1091-1092). Only reachable with calibrate off; with
+                    # it on START SCAN returns OK and shading data is read because
+                    # we asked for it.
+                    log.debug("[scan]   scanner overrode calibrate=False and will "
+                              "calibrate; its shading reference will be read")
+                    shading = True
                     break
                 raise
         else:
@@ -563,8 +579,6 @@ class Scanner:
         self.wait_ready()
 
         # --- Calibration: shading reference, CCD mask, GET PARAMETERS ---------
-        self._emit(UpdateData(phase=ScanPhase.CALIBRATING))
-
         # The last cancellation point before the pixel read; the calibration
         # reads below are short enough not to be worth interrupting mid-way.
         if self.cancel_requested.is_set():
@@ -572,20 +586,32 @@ class Scanner:
             self.stop_scan()
             return self._result(started=started, cancelled=True)
 
-        # Shading data is always 16-bit, with the same two-byte channel tag per
-        # line as the image data. The C backend reads 4 * entry[0].nLines
-        # (pieusb_specific.c:2078); summing nLines over all entries agrees with
-        # that as long as the entries share a line count, and does not assume
-        # four of them.
-        total_shading_lines = sum(e["n_lines"] for e in self.shading_params)
-        shading_bytes_per_line = 2 + shading_ppl * 2
-        log.debug(f"[scan] reading shading reference ({total_shading_lines} lines, "
-                  f"{total_shading_lines * shading_bytes_per_line} bytes)...")
-        shading_raw = self._get_scanned_lines(
-            total_shading_lines, shading_bytes_per_line, label="shading"
-        )
-        self.wait_ready()
+        shading_raw = None
+        if shading:
+            emit(UpdateData(phase=ScanPhase.CALIBRATING))
 
+            # Shading data is always 16-bit, with the same two-byte channel tag per
+            # line as the image data. The C backend reads 4 * entry[0].nLines
+            # (pieusb_specific.c:2078); summing nLines over all entries agrees with
+            # that as long as the entries share a line count, and does not assume
+            # four of them.
+            total_shading_lines = sum(e["n_lines"] for e in self.shading_params)
+            shading_bytes_per_line = 2 + shading_ppl * 2
+            log.debug(f"[scan] reading shading reference ({total_shading_lines} lines, "
+                      f"{total_shading_lines * shading_bytes_per_line} bytes)...")
+            shading_raw = self._get_scanned_lines(
+                total_shading_lines, shading_bytes_per_line, label="shading"
+            )
+            self.wait_ready()
+        else:
+            # Nothing to read and nothing to drain: the scanner granted the skip,
+            # so no CALIBRATING is reported and the image comes back uncorrected.
+            log.info("[scan] calibrate=False and the scanner did not override it; "
+                     "no shading reference, so no shading correction")
+
+        # Read unconditionally, as sane_start() does (pieusb.c:1149) -- it sits
+        # outside the calibration branch there. Only shading correction consumes
+        # it, so with no reference read it goes unused rather than unread.
         log.debug("[scan] reading CCD mask...")
         ccd_mask = self._get_ccd_mask(shading_ppl)
 
@@ -610,7 +636,7 @@ class Scanner:
 
         log.debug(f"[scan] reading {n_planes} planes x {height} lines "
                   f"({raw_bytes_per_line} bytes/line incl. 2-byte tag)...")
-        self._emit(UpdateData(phase=ScanPhase.SCANNING, scanned_lines=0, total_lines=total_lines))
+        emit(UpdateData(phase=ScanPhase.SCANNING, scanned_lines=0, total_lines=total_lines))
 
         # Planes arrive as sequential blocks -- all R lines, then all G, and so
         # on -- but the 255-line read cap does not align to those boundaries, so
@@ -641,7 +667,7 @@ class Scanner:
                     chunk, dtype=sample_dtype, count=width, offset=off + 2
                 )
             done += n_lines
-            self._emit(UpdateData(
+            emit(UpdateData(
                 phase=ScanPhase.SCANNING, scanned_lines=done, total_lines=total_lines
             ))
 
@@ -674,11 +700,16 @@ class Scanner:
             planes = planes[:, :usable_height, :]
 
         # --- Post-processing ---------------------------------------------------
-        self._emit(UpdateData(phase=ScanPhase.PROCESSING))
+        emit(UpdateData(phase=ScanPhase.PROCESSING))
 
         shading_corrected = False
-        shading_ref, shading_mean = calculate_shading(shading_raw, shading_ppl)
-        if shading_ref is None:
+        shading_ref, shading_mean = (
+            calculate_shading(shading_raw, shading_ppl) if shading_raw is not None
+            else (None, None)
+        )
+        if shading_raw is None:
+            log.debug("[scan] no shading analysis this pass; returning raw pixel data")
+        elif shading_ref is None:
             log.warning("[scan] no usable shading reference lines; returning raw pixel data")
         else:
             log.debug(f"[scan] shading mean per channel = "
