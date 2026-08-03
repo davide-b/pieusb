@@ -252,7 +252,7 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         name='resolution',
         type=int,
         unit=Unit.NONE,
-        validate=lambda v: v < min(inq.max_resolution_x, inq.max_resolution_y),
+        validate=lambda v: v <= min(inq.max_resolution_x, inq.max_resolution_y),
         default=300
     )))
 
