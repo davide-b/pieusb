@@ -1,3 +1,32 @@
+# v0.3.4
+
+- Fixed auto-exposure metering from the wrong baseline, which under-exposed
+  every `auto_exp` scan. The metering pass now seeds `gain_*`/`exp_time_*`/
+  `offset_*` from the scanner's own warm-up calibration (GET GAIN OFFSET) before
+  it previews, which is what the C backend meters from: asked to calibrate "from
+  preview" with no preview yet taken, `sanei_pieusb_set_gain_offset()` falls
+  through to `SCAN_CALIBRATION_AUTO` and reads the device
+  (`pieusb_specific.c:1986-1989`), and `updateGain2()` later multiplies `dg` onto
+  those same values. Before this the baseline was the option defaults, whose
+  `exp_time_*` of 2937 is the device's *minimum* exposure time
+  (`pieusb_scancmd.h:214`) -- the C only ever sends it from
+  `SCAN_CALIBRATION_DEFAULT`, which is neither its default calibration mode nor
+  reachable from the preview path. Metering up from the floor left the 3.0x cap
+  on `dg` to cover the whole distance to a correct exposure, capping what
+  auto-exposure could deliver at roughly a quarter of the hardware's range, and
+  losing the rest with no error and no warning. If the device reports no
+  exposure times the seeding is skipped and the current options are metered from
+  instead, since a scanner that has not finished warming up would otherwise
+  contribute a black frame
+- Auto-exposure no longer leaves its settings behind: `gain_*`/`exp_time_*`/
+  `offset_*` are restored after the scan that derived them, so a second
+  `auto_exp` scan meters from the caller's settings rather than compounding on
+  the first one's amplification. The C reaches the same place by clearing
+  `preview_done` after every non-preview scan (`pieusb.c:1288`), which sends the
+  next scan back to reading the device
+- Only `auto_exp` scans consult the device's calibration; a scan without it runs
+  with the options as set, unchanged from before
+
 # v0.3.3
 
 - Relaxed python and numpy minimum requirements

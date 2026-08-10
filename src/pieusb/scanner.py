@@ -59,6 +59,17 @@ CHANNEL_NAMES = ('R', 'G', 'B', 'I')
 # Channel index -> the suffix its gain_*/exp_time_*/offset_* options carry.
 CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
 
+# The options auto-exposure rewrites: first from the device's own warm-up
+# calibration, then from what the metering pass derives on top of it. gain_* and
+# exp_time_* are the two update_gain() moves; offset_* comes along because the C
+# adopts the whole settings struct at once (pieusb_specific.c:1986-1989, 2046)
+# and the black level shifts the very histogram the metering reads.
+CALIBRATION_OPTIONS = tuple(
+    f'{field}_{suffix}'
+    for field in ('gain', 'exp_time', 'offset')
+    for suffix in CHANNEL_SUFFIX
+)
+
 # Used for the auto-exposure metering pass only if the device's own reported
 # preview resolution is unusable. Matches the 'resolution' option default.
 PREVIEW_RESOLUTION_FALLBACK = 300
@@ -435,6 +446,65 @@ class Scanner:
             for name, value in saved.items():
                 self.params[name].value = value
 
+    @contextmanager
+    def _saved_options(self, *names):
+        """Restore these options on the way out, whatever ran in between.
+
+        _overridden_options() for the case where the new values are not known up
+        front: auto-exposure derives them from the device and from its own
+        metering pass, and they belong to the scan that derived them.
+        """
+        saved = {name: self.params[name].value for name in names}
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                self.params[name].value = value
+
+    def _seed_from_device(self, settings: dict) -> None:
+        """Adopt the scanner's own warm-up calibration as the metering baseline.
+
+        Ports SCAN_CALIBRATION_AUTO (pieusb_specific.c:1986-1989), which is what
+        the C's preview pass runs with. Asked to calibrate 'from preview' with no
+        preview taken yet, sanei_pieusb_set_gain_offset() fails its preview_done
+        guard and falls through to reading GET GAIN OFFSET; the real scan's
+        updateGain2() then multiplies dg onto those same values
+        (pieusb_specific.c:2537-2545). So in the C the preview and the
+        amplification share one baseline -- the gain and exposure the firmware
+        optimised at warm-up to reach its saturation levels.
+
+        Without this the baseline is whatever the options hold, and exp_time_*
+        defaults to 2937, which is the device's MINIMUM exposure time
+        (pieusb_scancmd.h:214, pieusb_specific.h:105). The C only ever sends that
+        value from SCAN_CALIBRATION_DEFAULT, which is neither the default
+        calibration mode nor reachable from the preview path. Metering up from
+        the floor leaves gain_increase()'s 3.0x cap to carry the whole distance
+        to a correct exposure, and every stop beyond it is lost silently -- the
+        scan simply comes out dark.
+        """
+        exposure = settings["exposure_time"]
+        gain = settings["gain"]
+        offset = settings["offset"]
+
+        # The firmware only determines these while warming up, so zeroes mean it
+        # has not yet. Adopting them would scan a black frame; the options the
+        # caller set are the better guess.
+        if not all(exposure[c] > 0 for c in range(3)):
+            log.warning(f"[autoexp] the scanner reports no exposure times ({exposure}); "
+                        f"it may not have finished its warm-up calibration. Metering from "
+                        f"the current gain and exposure options instead")
+            return
+
+        log.debug(f"[autoexp] baseline from the device: gain {gain}, exposure {exposure}, "
+                  f"offset {offset}")
+        for c, suffix in enumerate(CHANNEL_SUFFIX):
+            # Infrared is optimised with the others but is often reset afterwards
+            # (pieusb_scancmd.h:194-199), so it alone may come back unset.
+            if exposure[c] > 0:
+                self._set_metered(f'exp_time_{suffix}', exposure[c], source="device-reported")
+            self._set_metered(f'gain_{suffix}', gain[c], source="device-reported")
+            self._set_metered(f'offset_{suffix}', offset[c], source="device-reported")
+
     def _meter_from_preview(self, started: float) -> ScanResult | None:
         """Run a preview pass and rewrite gain_*/exp_time_* from what it measured.
 
@@ -452,8 +522,14 @@ class Scanner:
         """
         # Read before the preview: the levels are fixed at warm-up, and this also
         # fails early if the device will not answer, before spending a scan.
-        saturation_levels = self._get_gain_offset()["saturation_level"]
+        settings = self._get_gain_offset()
+        saturation_levels = settings["saturation_level"]
         log.debug(f"[autoexp] saturation levels {saturation_levels}")
+
+        # Meter from the baseline the C meters from -- the device's own
+        # calibration -- and not from whatever the options happen to hold. Both
+        # the preview below and the amplification derived from it start here.
+        self._seed_from_device(settings)
 
         # SANE trusts previewScanResolution unconditionally (pieusb_specific.c:386,
         # 1840). A zero would reach SET MODE and be rejected there, well after the
@@ -510,17 +586,19 @@ class Scanner:
             self._set_metered(exp_name, new_exp)
         return None
 
-    def _set_metered(self, name: str, value: int) -> None:
-        """Store a metered option value, warning if it left the device's range.
+    def _set_metered(self, name: str, value: int, source: str = "metered") -> None:
+        """Store an auto-exposure option value, warning if it left the device's range.
 
         updateGain2 does not clamp, and neither do we -- clamping silently would
         break the invariant that gain and exposure together deliver exactly dg.
         But an out-of-range value is worth saying out loud, because the next
-        set_options() will send it to the scanner regardless.
+        set_options() will send it to the scanner regardless. That goes for the
+        device's own reported settings too: they arrive through here so a
+        scanner disagreeing with the ranges it advertises does not pass unnoticed.
         """
         par = self.params[name]
         if not par.opt.validate(value):
-            log.warning(f"[autoexp] metered {name}={value} is outside the range the "
+            log.warning(f"[autoexp] {source} {name}={value} is outside the range the "
                         f"scanner reports; sending it anyway")
         par.value = value
 
@@ -532,16 +610,24 @@ class Scanner:
         emit callback handed to it.
         """
         if self.params['auto_exp'].value:
-            cancelled = self._meter_from_preview(started)
-            if cancelled is not None:
-                return cancelled
-            # The metering pass just calibrated, moments ago, on this medium and
-            # this lamp -- as fresh a reference as the real pass could acquire for
-            # itself. So reuse it and pay for one calibration rather than two. The
-            # scanner still gets the last word: if it refuses the skip, the real
-            # pass acquires anyway.
-            with self._overridden_options(reuse_calibration=True):
-                return self._scan_pass(started, self._emit)
+            # Auto-exposure rewrites the calibration options twice -- once from
+            # the device, once from what it metered -- and both writes belong to
+            # this scan alone. The C arrives at the same place by clearing
+            # preview_done after every non-preview scan (pieusb.c:1288), which
+            # sends the following one back to reading the device for its
+            # baseline. Without the restore, the next scan here would meter on
+            # top of this one's amplification and the two would compound.
+            with self._saved_options(*CALIBRATION_OPTIONS):
+                cancelled = self._meter_from_preview(started)
+                if cancelled is not None:
+                    return cancelled
+                # The metering pass just calibrated, moments ago, on this medium
+                # and this lamp -- as fresh a reference as the real pass could
+                # acquire for itself. So reuse it and pay for one calibration
+                # rather than two. The scanner still gets the last word: if it
+                # refuses the skip, the real pass acquires anyway.
+                with self._overridden_options(reuse_calibration=True):
+                    return self._scan_pass(started, self._emit)
 
         return self._scan_pass(started, self._emit)
 
