@@ -6,10 +6,25 @@ This is the manual test for the whole acquisition path. It needs a real scanner;
 nothing here is a unit test.
 
     python tests/exercise.py --list                      # what is connected
+    python tests/exercise.py --gain-offset               # what the device says its own
+                                                         #   exposure/gain/offset/light are
     python tests/exercise.py --dry-run                   # resolve + validate options, touch nothing
     python tests/exercise.py                             # 300 dpi, device defaults, full frame
     python tests/exercise.py --mode rgbi --resolution 2000 --frame-mm 0 0 36 24
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
+
+The light level is byte 15 of SET GAIN OFFSET and scales the whole acquisition;
+it used to be sent as 0, which is outside the device's documented 4..7 band. It
+now defaults to 4 and auto-exposure adopts whatever the scanner reports. To
+compare by hand:
+
+    python tests/exercise.py --gain-offset                    # what the lamp is at now
+    python tests/exercise.py -o light=4 --output light4       # ... and 5, 6, 7
+    python tests/exercise.py -o auto_exp=true --output auto   # what auto-exposure picks
+
+Every pass logs the exposure, gain, offset and light it actually sent, and
+auto-exposure logs its baseline and the gain increase it derived, at INFO -- so
+the numbers behind a scan are on the console without needing -v.
 
 Ctrl-C during a scan cancels it cleanly (STOP SCAN at the next chunk boundary)
 rather than leaving the device mid-acquisition.
@@ -75,6 +90,31 @@ def native_to_mm(value: int, inq) -> float:
 
 def mm_to_native(value: float, inq) -> int:
     return round(value / MM_PER_INCH * inq.max_resolution_x)
+
+
+def report_gain_offset(scanner: Scanner) -> None:
+    '''Print the scanner's own idea of its calibration: GET GAIN OFFSET.
+
+    These are the values the C backend's default calibration mode adopts before
+    every scan (SCAN_CALIBRATION_AUTO, pieusb_specific.c:733, 1986-1989), and the
+    ones auto-exposure meters from here. Worth seeing before blaming the exposure
+    arithmetic: saturation levels are the target it aims at, and 'light' scales
+    everything the sensor sees.
+    '''
+    s = scanner._get_gain_offset()
+    print("\nScanner-reported calibration (GET GAIN OFFSET):")
+    print(f"  saturation levels : {s['saturation_level']}  "
+          f"({', '.join(f'{v * 100 / 65536:.0f}%' for v in s['saturation_level'])} of full scale)")
+    print(f"  exposure times    : {s['exposure_time']} timer counts (R, G, B, I)")
+    print(f"  gain              : {s['gain']}")
+    print(f"  offset            : {s['offset']}")
+    print(f"  light             : {s['light']}", end='')
+    if s['light'] == 0:
+        print("   <- 0 means the device did not report one; scans use the 'light' option")
+    else:
+        print(f"   <- lamp level; scan manually with -o light={s['light']} to match it")
+    print("  (the lamp decrements from 7 as it warms and settles at 4; "
+          "pieusb_scancmd.h:208-213)")
 
 
 def show_options(scanner: Scanner) -> None:
@@ -336,6 +376,10 @@ def parse_args(argv=None):
                    help='also write an 8-bit PNG preview, if Pillow is installed')
 
     g = p.add_argument_group('diagnostics')
+    g.add_argument('--gain-offset', action='store_true',
+                   help="read and print the scanner's own exposure/gain/offset/light and "
+                        'saturation levels before doing anything else; combine with --dry-run '
+                        'for the readout alone')
     g.add_argument('-v', '--verbose', action='store_true',
                    help='DEBUG logging to stderr -- one line per SCSI command, very chatty')
     g.add_argument('--log', metavar='FILE',
@@ -350,7 +394,11 @@ def setup_logging(args) -> None:
     root.setLevel(logging.DEBUG if (args.verbose or args.log) else logging.INFO)
 
     console = logging.StreamHandler(sys.stderr)
-    console.setLevel(logging.DEBUG if args.verbose else logging.WARNING)
+    # INFO rather than WARNING: that level is a handful of lines per scan, and it
+    # is where the settings each pass sent and the factor auto-exposure derived
+    # are reported -- the numbers you need to explain a scan's exposure. DEBUG is
+    # the chatty one (a line per SCSI command) and stays behind -v.
+    console.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     console.setFormatter(logging.Formatter('%(levelname)s %(name)s: %(message)s'))
     root.addHandler(console)
 
@@ -392,6 +440,15 @@ def main(argv=None) -> int:
             return 1
 
         show_options(scanner)
+
+        if args.gain_offset:
+            try:
+                report_gain_offset(scanner)
+            except PieusbError as e:
+                print(f"\nCould not read the scanner's calibration: "
+                      f"{type(e).__name__}: {e}")
+                print("  (a warming-up scanner may refuse this read; try again in a minute)")
+
         report_frame(scanner)
 
         try:

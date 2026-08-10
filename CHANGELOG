@@ -1,5 +1,35 @@
-# v0.3.4
+# v0.3.5
 
+- **Fixed the light level being sent as 0 on every scan.** Byte 15 of SET GAIN
+  OFFSET is the lamp level; it was hard-coded to 0 with a `# Light, maybe in SANE
+  is 5?` comment. The C never sends 0: its *default* calibration mode is
+  `SCAN_CALIBRATION_AUTO` (`pieusb_specific.c:733`), which echoes back whatever
+  GET GAIN OFFSET reported at byte 75 (`pieusb_scancmd.c:1048`, `1111`), and the
+  DEFAULT and OPTIONS modes send `DEFAULT_LIGHT`/`OPT_LIGHT`, both 4. The
+  documented band is 4..7 -- the firmware starts at 7 or 6 and decrements as the
+  lamp warms, settling at 4, where "the scanner produces stable scans"
+  (`pieusb_scancmd.h:208-213`). This under-exposed *every* scan, manual ones
+  included, and starved auto-exposure's metering pass before its arithmetic ran:
+  the frame it metered was ~20x below the saturation levels it aims at, so it
+  asked for ~20x, got the 3.0x cap, and came out short with no error
+- New `light` option, default 4, so the lamp level is settable and shows up in the
+  option table. `auto_exp` adopts the scanner's own reported value over the
+  default, as the C's AUTO mode does, and falls back to the option (with a
+  warning) if the device reports 0
+- `extraEntries`, byte 16, is now sent as 1 rather than 0, matching SANE's
+  `DEFAULT_ADDITIONAL_ENTRIES`. `sane_start()` notes it sizes the device's BADF
+  table and that leaving it unset costs a "large difference in speed"
+  (`pieusb.c:1027-1033`). `doubleTimes`, byte 17, was already 0 and stays 0. The
+  SET GAIN OFFSET payload now matches `sanei_pieusb_cmd_set_gain_offset()`
+  byte for byte
+- Every pass now logs the exposure, gain, offset and light it actually sent, and
+  auto-exposure logs its device baseline, both at INFO. Auto-exposure restores
+  those options after the scan that derived them, so the log is the only place the
+  values a pass ran with can be seen afterwards
+- `tests/exercise.py`: new `--gain-offset` prints the scanner's own saturation
+  levels, exposure times, gain, offset and light (pair with `--dry-run` for the
+  readout alone). Console logging now shows INFO, which is where the two lines
+  above land; `-v` is still needed for the per-command DEBUG chatter
 - Fixed auto-exposure metering from the wrong baseline, which under-exposed
   every `auto_exp` scan. The metering pass now seeds `gain_*`/`exp_time_*`/
   `offset_*` from the scanner's own warm-up calibration (GET GAIN OFFSET) before

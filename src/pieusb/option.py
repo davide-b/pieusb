@@ -75,6 +75,23 @@ LINE_THRESHOLD = 128
 # calibration mode (pieusb.c:878-882). See the exp_rel_* options.
 DEFAULT_RELATIVE_EXPOSURE = 100
 
+# Light level to fall back on when the device does not report one of its own.
+# SANE's DEFAULT_LIGHT (pieusb_specific.h:107), which is also OPT_LIGHT's default,
+# and the value the firmware settles at once the lamp is warm
+# (pieusb_scancmd.h:208-213). See the 'light' option.
+DEFAULT_LIGHT = 4
+
+# 'extraEntries', byte 16 of SET GAIN OFFSET. SANE's DEFAULT_ADDITIONAL_ENTRIES
+# (pieusb_specific.h:108); it has no option, and every calibration mode sends 1.
+# sane_start() notes that it drives the size of the device's BADF table and that
+# leaving it unset costs a "large difference in speed" (pieusb.c:1027-1033).
+ADDITIONAL_ENTRIES = 1
+
+# 'doubleTimes', byte 17. SANE's DEFAULT_DOUBLE_TIMES (pieusb_specific.h:109) and
+# OPT_DOUBLE_TIMES' default. Undocumented beyond the name, and no shipping driver
+# sends anything else, so it stays a constant rather than becoming an option.
+DOUBLE_TIMES = 0
+
 class Unit(Enum):
     MM = 0
     PIXEL = 1
@@ -499,6 +516,34 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=0
     )))
 
+    # Light level, byte 15 of SET GAIN OFFSET. Sent on EVERY scan, so a wrong
+    # value here starves the whole acquisition -- auto-exposure included, since
+    # its metering pass goes out through the same command.
+    #
+    #   "Current light level. The stability of the light source is tested during
+    #    warming up. The check starts with a light value 7 or 6, and decrements
+    #    it when the light warms up. At a light value of 4, the scanner produces
+    #    stable scans (i.e. successive 'white' scan values don't differ more than
+    #    0x200)." (pieusb_scancmd.h:208-213)
+    #
+    # So the documented operating band is 4..7 and 4 is the warmed-up value; SANE
+    # calls it a duration in microseconds (pieusb_specific.c:916). The C never
+    # sends 0: SCAN_CALIBRATION_AUTO -- its DEFAULT calibration mode
+    # (pieusb_specific.c:733) -- echoes back whatever GET GAIN OFFSET reported at
+    # byte 75 (pieusb_scancmd.c:1048, 1111), and the DEFAULT and OPTIONS modes
+    # send DEFAULT_LIGHT (pieusb_specific.h:107) or OPT_LIGHT, both 4.
+    #
+    # The range is the width of the wire field rather than a documented limit,
+    # like exp_rel_*: nothing here knows what the device does outside 4..7.
+    # auto_exp adopts the device's own value over this default (_seed_from_device).
+    out.append(Parameter(Option(
+        name='light',
+        type=int,
+        unit=Unit.MICROSECONDS,
+        validate=lambda v: 0 <= v <= 0xFF,
+        default=DEFAULT_LIGHT
+    )))
+
     return OptionsTable(out, inq)
 
 def set_options(dev: UASDevice, options: OptionsTable, *,
@@ -529,7 +574,10 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     payload = struct.pack("<HHHHHHH", SCSI_SCAN_FRAME, 10, index, x0, y0, x1, y1)
     dev.command(SCSI_WRITE, out_data=payload, cdb_length=14)
 
-    # Set ABSOLUTE exposure time, gain and offset
+    # Set ABSOLUTE exposure time, gain and offset -- and the light level, which is
+    # part of the same command and is what makes the exposure mean anything. Byte
+    # for byte this is sanei_pieusb_cmd_set_gain_offset() (pieusb_scancmd.c:1102-1116);
+    # bytes 9-11, 21 and 23-28 are the ones it leaves zeroed.
     payload = struct.pack('<HHHBBBBBBBBBBBBHBBBBBBBBB',
         options['exp_time_r'].value,
         options['exp_time_g'].value,
@@ -543,9 +591,9 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
         options['gain_r'].value,
         options['gain_g'].value,
         options['gain_b'].value,
-        0, # Light, maybe in SANE is 5?
-        0, # Extra entried
-        0, # Double times
+        options['light'].value,
+        ADDITIONAL_ENTRIES,
+        DOUBLE_TIMES,
         options['exp_time_i'].value,
         options['offset_i'].value,
         0,

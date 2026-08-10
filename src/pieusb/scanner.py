@@ -61,14 +61,15 @@ CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
 
 # The options auto-exposure rewrites: first from the device's own warm-up
 # calibration, then from what the metering pass derives on top of it. gain_* and
-# exp_time_* are the two update_gain() moves; offset_* comes along because the C
-# adopts the whole settings struct at once (pieusb_specific.c:1986-1989, 2046)
-# and the black level shifts the very histogram the metering reads.
+# exp_time_* are the two update_gain() moves; offset_* and light come along
+# because the C adopts the whole settings struct at once
+# (pieusb_specific.c:1986-1989, 2046) -- the black level shifts the very histogram
+# the metering reads, and the light level decides what the exposure is exposing.
 CALIBRATION_OPTIONS = tuple(
     f'{field}_{suffix}'
     for field in ('gain', 'exp_time', 'offset')
     for suffix in CHANNEL_SUFFIX
-)
+) + ('light',)
 
 # Used for the auto-exposure metering pass only if the device's own reported
 # preview resolution is unusable. Matches the 'resolution' option default.
@@ -485,6 +486,7 @@ class Scanner:
         exposure = settings["exposure_time"]
         gain = settings["gain"]
         offset = settings["offset"]
+        light = settings["light"]
 
         # The firmware only determines these while warming up, so zeroes mean it
         # has not yet. Adopting them would scan a black frame; the options the
@@ -495,8 +497,20 @@ class Scanner:
                         f"the current gain and exposure options instead")
             return
 
-        log.debug(f"[autoexp] baseline from the device: gain {gain}, exposure {exposure}, "
-                  f"offset {offset}")
+        log.info(f"[autoexp] baseline from the device: gain {gain}, exposure {exposure}, "
+                 f"offset {offset}, light {light}")
+
+        # The lamp level the firmware is currently running at, which is what the
+        # C's default calibration mode echoes back (pieusb_scancmd.c:1048, 1111).
+        # It decrements from 7 as the lamp warms and settles at 4
+        # (pieusb_scancmd.h:208-213), so a 0 means the device has not told us --
+        # never that the lamp should be off.
+        if light > 0:
+            self._set_metered('light', light, source="device-reported")
+        else:
+            log.warning(f"[autoexp] the scanner reports light level 0; keeping "
+                        f"light={self.params['light'].value}")
+
         for c, suffix in enumerate(CHANNEL_SUFFIX):
             # Infrared is optimised with the others but is often reset afterwards
             # (pieusb_scancmd.h:194-199), so it alone may come back unset.
@@ -680,6 +694,15 @@ class Scanner:
                      "Scanner open across scans for later ones to reuse it")
 
         self.wait_ready()
+        # Logged rather than returned on the ScanResult because auto-exposure
+        # restores these options afterwards (see _saved_options): at the moment
+        # SET GAIN OFFSET goes out is the only place the values a pass really ran
+        # with can be observed.
+        log.info("[scan] sending exposure %s, gain %s, offset %s, light %d",
+                 tuple(self.params[f'exp_time_{s}'].value for s in CHANNEL_SUFFIX),
+                 tuple(self.params[f'gain_{s}'].value for s in CHANNEL_SUFFIX),
+                 tuple(self.params[f'offset_{s}'].value for s in CHANNEL_SUFFIX),
+                 self.params['light'].value)
         # The quality bit only asks. The scanner answers below.
         set_options(self.dev, self.params, skip_shading_analysis=not acquire)
         self.wait_ready()
