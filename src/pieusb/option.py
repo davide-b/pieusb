@@ -70,9 +70,18 @@ LINE_THRESHOLD = 128
 # floor the device clamps to: 50 measures the same as 100.
 DEFAULT_RELATIVE_EXPOSURE = 100
 
-# Highest exp_rel_* measured linear on a ProScan 10T (x11.09 against a nominal
-# x10.86). Above this the device's response is unknown, so validate() warns.
-MAX_TESTED_RELATIVE_EXPOSURE = 1086
+# Highest exp_rel_* that behaves on a ProScan 10T: x14.69 measured against a
+# nominal x15.00. ABOVE THIS THE DEVICE MISBEHAVES rather than merely being
+# untested -- the response goes non-monotonic and mostly collapses:
+#
+#   requested   2200   3300   5000   7500  10000
+#   measured   x5.79  x1.06  x2.01 x10.72  x3.94   (nominal x22 .. x100)
+#
+# 3300 is indistinguishable from leaving it at 100. The differences share no common
+# modulus so it is not a clean bit-width wrap, though 2048 falls in the untested gap
+# between 1500 and 2200. Whatever the cause, the register does not hold these
+# values, and the line rate audibly changes with them.
+MAX_TESTED_RELATIVE_EXPOSURE = 1500
 
 # Light level used when the device reports none of its own. SANE's DEFAULT_LIGHT
 # (pieusb_specific.h:107) and the value the firmware settles at once warm.
@@ -204,18 +213,19 @@ class OptionsTable:
             log.warning("option 'advance' is not implemented yet and will be ignored: "
                         "slide-transport commands are not sent")
 
-        # Only the top of the range is unexplored now: exp_rel_* is the exposure
-        # control and is meant to be moved. Measured linear to 1086; above that
-        # nothing is known, so say so rather than refuse.
+        # exp_rel_* is the exposure control and is meant to be moved. Warned about
+        # rather than refused even above the working ceiling, so the 1500..2200 gap
+        # can still be narrowed by experiment.
         high = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
             if self[n].value > MAX_TESTED_RELATIVE_EXPOSURE
         ]
         if high:
             log.warning(
-                f"relative exposure above {MAX_TESTED_RELATIVE_EXPOSURE}% ({', '.join(high)}); "
-                f"linearity has only been measured up to {MAX_TESTED_RELATIVE_EXPOSURE}. "
-                f"Check the result for clipping"
+                f"relative exposure above {MAX_TESTED_RELATIVE_EXPOSURE}% ({', '.join(high)}). "
+                f"A ProScan 10T MISBEHAVES here: the response is non-monotonic and often "
+                f"collapses to near 100%, so the scan may come out far darker than asked "
+                f"for rather than brighter"
             )
         low = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
@@ -402,13 +412,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     # THIS IS THE EXPOSURE CONTROL, at least on a ProScan 10T, and it is per
     # channel. Measured against a colour negative at 300 dpi, 16-bit:
     #
-    #   exp_rel   50    100    200    250    400    800   1086
-    #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x11.1
+    #   exp_rel   50    100    200    250    400    800   1086   1500 | 2200   3300
+    #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x10.5  x14.7 | x5.8   x1.1
     #
-    # Linear to within 2% from 100 to at least 1086, and clamped at the bottom --
-    # 50 behaves as 100, so it scales up only. It is the per-line integration
-    # period, so the line rate halves as it doubles and scan time scales with the
-    # largest of the three channels.
+    # Linear to within 4% from 100 to 1500, clamped at the bottom -- 50 behaves as
+    # 100, so it scales up only -- and broken above 1500, see
+    # MAX_TESTED_RELATIVE_EXPOSURE. It is the per-line integration period, so the
+    # line rate halves as it doubles and scan time scales with the largest of the
+    # three channels.
     #
     # Setting it per channel is how a colour negative gets exposed: the orange mask
     # attenuates blue about 4.4x more than red, and 247/563/1086 put all three

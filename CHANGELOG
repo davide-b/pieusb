@@ -12,8 +12,11 @@
   `exp_time_*` and `light` are inert.** Measured by sweeping each in isolation at
   300 dpi / 16-bit: gain 10/30/60, exp_time 500/1500/2500/2937/6000/10000 and
   light 4/5/6/7 all produce the same image to within 0.2%, while `exp_rel_*` is
-  linear to within 2% from 100 to at least 1086 (x11.09 measured against a nominal
-  x10.86) and clamps at the bottom -- 50 behaves as 100. `exp_rel_*` is the
+  linear to within 4% from 100 to 1500 and clamps at the bottom -- 50 behaves as
+  100. Above 1500 the device misbehaves rather than merely being unmeasured: the
+  response goes non-monotonic and mostly collapses (2200 -> x5.8, 3300 -> x1.1,
+  5000 -> x2.0, 7500 -> x10.7, 10000 -> x3.9, against nominals of x22 to x100), so
+  3300 is indistinguishable from leaving it at 100. `exp_rel_*` is the
   per-line integration period, so the line rate halves as it doubles. SANE
   hard-codes all three to 100 and never varies them (`pieusb.c:878-882`), which is
   why neither backend could ever expose this film
@@ -33,8 +36,9 @@
   the left and right edges with 55 percentage points of column-to-column swing
 - `OptionsTable.validate()` no longer warns on every `exp_rel_*` away from 100 --
   it is meant to be moved. It now warns only above `MAX_TESTED_RELATIVE_EXPOSURE`
-  (1086, where linearity stops being measured) or below 100 (where the device
-  clamps, so the setting does nothing)
+  (1500, above which the device misbehaves) or below 100 (where the device clamps,
+  so the setting does nothing). Not refused, so the 1500..2200 gap can still be
+  narrowed by experiment
 - The per-scan settings line now includes the relative exposures, since `auto_exp`
   restores them afterwards and the log is the only record of what a scan ran with
 - The high-resolution stall is a device characteristic with no host-side fix: the

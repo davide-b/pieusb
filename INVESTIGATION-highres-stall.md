@@ -345,10 +345,14 @@ by sweeping each in isolation at 300 dpi / 16-bit:
 | `exp_time_*` | 500, 1500, 2500, 2937, 6000, 10000 | none (±0.2%) |
 | `light` | 4, 5, 6, 7 | none (±0.1%) |
 | `exp_rel_*` | 50 | none — clamps at 100 |
-| `exp_rel_*` | 200, 250, 400, 800, 1086 | **×1.97, ×2.46, ×3.93, ×8.03, ×11.09** |
+| `exp_rel_*` | 200, 250, 400, 800, 1086, 1500 | **×1.97, ×2.46, ×3.93, ×8.03, ×10.5, ×14.7** |
+| `exp_rel_*` | 2200, 3300, 5000, 7500, 10000 | broken: ×5.8, ×1.1, ×2.0, ×10.7, ×3.9 |
 
-`exp_rel_*` is the exposure system: linear to within 2% across at least ×11, per
-channel, upward only. It is the per-line integration period, so the line rate halves
+`exp_rel_*` is the exposure system: linear to within 4% from 100 to 1500 (×15), per
+channel, upward only, and unusable above 1500 -- the response there is
+non-monotonic and mostly collapses toward ×1, which is audible as a wrong line
+rate. The differences fit no simple modulus, so the mechanism is unexplained;
+2048 falls in the untested 1500..2200 gap. It is the per-line integration period, so the line rate halves
 as it doubles — which is why it also cures the stall.
 
 Per-channel 247/563/1086 puts all three channels within 1% of each other at ~88% of
