@@ -2,8 +2,9 @@ from pieusb.option import (
     generate_options,
     set_options,
     DEFAULT_RELATIVE_EXPOSURE,
-    MAX_TESTED_RELATIVE_EXPOSURE,
+    MAX_RELATIVE_EXPOSURE,
     MODE_PLANES,
+    max_relative_exposure,
     Parameter,
 )
 from pieusb.postprocess import (
@@ -461,6 +462,12 @@ class Scanner:
         level does not depend on resolution, so metering at preview resolution
         carries over to the real scan.
 
+        The ceiling per channel comes from the device: exp_rel scales the exposure
+        time the scanner reports for itself into a 16-bit Timer 1 count, and past
+        the point where that product overflows the exposure drops instead of rising
+        (see option.max_relative_exposure). Asking for more than the ceiling would
+        make the scan darker, so it is clamped there and the shortfall reported.
+
         Returns None once exp_rel_* has been set, or the metering pass's own
         ScanResult if it was cancelled -- there is no point starting the real scan
         after that. Failures propagate as the real pass's do.
@@ -489,10 +496,28 @@ class Scanner:
         if preview.rgb is None:
             raise PieusbError("metering pass returned no image data")
 
+        # The device's own exposure time is the multiplicand that decides where
+        # exp_rel overflows Timer 1. A scanner that has not finished warming up
+        # reports 0 for it, which says nothing about the register it actually uses --
+        # so assume the ceiling for the value this hardware is known to run at
+        # rather than giving up on metering entirely.
+        exposure_time = self._get_gain_offset()["exposure_time"]
+        ceilings = [
+            max_relative_exposure(exposure_time[c]) if exposure_time[c] > 0
+            else MAX_RELATIVE_EXPOSURE
+            for c in range(3)
+        ]
+        if not all(exposure_time[c] > 0 for c in range(3)):
+            log.warning(f"[autoexp] the scanner reports no exposure time ({exposure_time}), "
+                        f"so where exp_rel overflows its Timer 1 is unknown; assuming the "
+                        f"ceiling of {MAX_RELATIVE_EXPOSURE} that its usual exposure time "
+                        f"implies")
+
         full_scale = numpy.iinfo(preview.rgb.dtype).max
         target = METERING_TARGET * full_scale
         for c, suffix in enumerate(('r', 'g', 'b')):
             name = f'exp_rel_{suffix}'
+            ceiling = ceilings[c]
             measured = float(numpy.percentile(preview.rgb[:, :, c], METERING_PERCENTILE))
             if measured <= 0:
                 log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} metered 0 at the "
@@ -501,17 +526,14 @@ class Scanner:
                 continue
 
             wanted = round(DEFAULT_RELATIVE_EXPOSURE * target / measured)
-            value = min(max(wanted, DEFAULT_RELATIVE_EXPOSURE), MAX_TESTED_RELATIVE_EXPOSURE)
+            value = min(max(wanted, DEFAULT_RELATIVE_EXPOSURE), ceiling)
             log.info(f"[autoexp] {CHANNEL_NAMES[c]}: metered {measured:.0f}/{full_scale} "
                      f"({measured / full_scale * 100:.1f}%), {name} -> {value}")
-            if wanted > MAX_TESTED_RELATIVE_EXPOSURE:
-                # Not clamped for the device's sake -- higher values may well work --
-                # but because nothing above this has been measured for linearity.
+            if wanted > ceiling:
                 log.warning(
-                    f"[autoexp] channel {CHANNEL_NAMES[c]} wants {name}={wanted} but "
-                    f"{MAX_TESTED_RELATIVE_EXPOSURE} is the highest measured; using that, "
-                    f"which leaves it {wanted / MAX_TESTED_RELATIVE_EXPOSURE:.2f}x under "
-                    f"the target"
+                    f"[autoexp] channel {CHANNEL_NAMES[c]} wants {name}={wanted}, above the "
+                    f"{ceiling} at which exp_rel overflows the scanner's Timer 1; using "
+                    f"{ceiling}, which leaves it {wanted / ceiling:.2f}x under the target"
                 )
             elif wanted < DEFAULT_RELATIVE_EXPOSURE:
                 log.warning(

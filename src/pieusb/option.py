@@ -70,18 +70,41 @@ LINE_THRESHOLD = 128
 # floor the device clamps to: 50 measures the same as 100.
 DEFAULT_RELATIVE_EXPOSURE = 100
 
-# Highest exp_rel_* that behaves on a ProScan 10T: x14.69 measured against a
-# nominal x15.00. ABOVE THIS THE DEVICE MISBEHAVES rather than merely being
-# untested -- the response goes non-monotonic and mostly collapses:
+# Width of the scanner's Timer 1 count. The relative exposure is applied to the
+# device's own absolute exposure time before it lands in that register:
 #
-#   requested   2200   3300   5000   7500  10000
-#   measured   x5.79  x1.06  x2.01 x10.72  x3.94   (nominal x22 .. x100)
+#     timer = exposure_time * exp_rel / 100      (mod TIMER_FULL_SCALE)
 #
-# 3300 is indistinguishable from leaving it at 100. The differences share no common
-# modulus so it is not a clean bit-width wrap, though 2048 falls in the untested gap
-# between 1500 and 2200. Whatever the cause, the register does not hold these
-# values, and the line rate audibly changes with them.
-MAX_TESTED_RELATIVE_EXPOSURE = 1500
+# so exp_rel_* is only usable while the product fits. Past that the register wraps
+# and the exposure drops, non-monotonically, which is audible as a wrong line rate.
+# Measured on a ProScan 10T, whose exposure_time is 4100 -- giving a ceiling of
+# 65535 * 100 // 4100 = 1598 -- against a nominal of exp_rel/100:
+#
+#   exp_rel   1086   1500  |  1598  1599  |  2200  3300  5000  7500  10000
+#   predicted x10.9  x15.0 | x15.98 x1.00 | x6.02 x1.03 x2.05 x11.1  x4.09
+#   measured  x10.5  x14.7 |   clip x1.00 | x5.79 x1.06 x2.01 x10.7  x3.94
+#
+# Every value matches to within 4%, and the 1598/1599 step is exactly where the
+# product crosses 65535. It lands on x1.00 rather than near zero because a wrapped
+# result below 100 meets the same floor that makes exp_rel=50 behave as 100.
+TIMER_FULL_SCALE = 65536
+
+
+def max_relative_exposure(exposure_time: int) -> int:
+    '''Largest exp_rel_* that does not overflow the device's Timer 1 count.'''
+    if exposure_time <= 0:
+        return DEFAULT_RELATIVE_EXPOSURE
+    return max(
+        DEFAULT_RELATIVE_EXPOSURE,
+        (TIMER_FULL_SCALE - 1) * DEFAULT_RELATIVE_EXPOSURE // exposure_time,
+    )
+
+
+# The exposure time a ProScan 10T reports and uses whatever is written to it, and
+# the ceiling that follows from it. Scanner reads the real value per scan; this is
+# for OptionsTable.validate(), which has no device reading to work from.
+OBSERVED_EXPOSURE_TIME = 4100
+MAX_RELATIVE_EXPOSURE = max_relative_exposure(OBSERVED_EXPOSURE_TIME)
 
 # Light level used when the device reports none of its own. SANE's DEFAULT_LIGHT
 # (pieusb_specific.h:107) and the value the firmware settles at once warm.
@@ -214,18 +237,17 @@ class OptionsTable:
                         "slide-transport commands are not sent")
 
         # exp_rel_* is the exposure control and is meant to be moved. Warned about
-        # rather than refused even above the working ceiling, so the 1500..2200 gap
-        # can still be narrowed by experiment.
+        # rather than refused: the real ceiling depends on the exposure time the
+        # device reports, which only Scanner gets to read.
         high = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
-            if self[n].value > MAX_TESTED_RELATIVE_EXPOSURE
+            if self[n].value > MAX_RELATIVE_EXPOSURE
         ]
         if high:
             log.warning(
-                f"relative exposure above {MAX_TESTED_RELATIVE_EXPOSURE}% ({', '.join(high)}). "
-                f"A ProScan 10T MISBEHAVES here: the response is non-monotonic and often "
-                f"collapses to near 100%, so the scan may come out far darker than asked "
-                f"for rather than brighter"
+                f"relative exposure above {MAX_RELATIVE_EXPOSURE}% ({', '.join(high)}); "
+                f"exposure_time * exp_rel / 100 overflows the scanner's 16-bit Timer 1 "
+                f"there, and the scan comes out DARKER than asked for, not brighter"
             )
         low = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
@@ -412,14 +434,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     # THIS IS THE EXPOSURE CONTROL, at least on a ProScan 10T, and it is per
     # channel. Measured against a colour negative at 300 dpi, 16-bit:
     #
-    #   exp_rel   50    100    200    250    400    800   1086   1500 | 2200   3300
-    #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x10.5  x14.7 | x5.8   x1.1
+    #   exp_rel   50    100    200    250    400    800   1086   1500   1598
+    #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x10.5  x14.7  clips
     #
-    # Linear to within 4% from 100 to 1500, clamped at the bottom -- 50 behaves as
-    # 100, so it scales up only -- and broken above 1500, see
-    # MAX_TESTED_RELATIVE_EXPOSURE. It is the per-line integration period, so the
-    # line rate halves as it doubles and scan time scales with the largest of the
-    # three channels.
+    # Linear to within 4% and clamped at the bottom -- 50 behaves as 100, so it
+    # scales up only. The top is set by Timer 1 overflow, see
+    # max_relative_exposure(). It is the per-line integration period, so the line
+    # rate halves as it doubles and scan time scales with the largest of the three
+    # channels.
     #
     # Setting it per channel is how a colour negative gets exposed: the orange mask
     # attenuates blue about 4.4x more than red, and 247/563/1086 put all three

@@ -1,3 +1,35 @@
+# v0.3.7
+
+- **The `exp_rel_*` ceiling is a 16-bit Timer 1 overflow, and is now derived rather
+  than guessed.** The relative exposure scales the *device's own* absolute exposure
+  time into a 16-bit count:
+
+      timer = exposure_time * exp_rel / 100      (mod 65536)
+
+  so the usable maximum is `65535 * 100 // exposure_time` -- 1598 for the 4100 a
+  ProScan 10T reports. Past it the register wraps and the exposure *drops*, and a
+  wrapped result below 100 meets the same floor that makes `exp_rel=50` behave as
+  100. A binary search puts the step at exactly 1598/1599, for all three channels,
+  which is where the product crosses 65535. The model predicts every measurement
+  taken to within 4%:
+
+      exp_rel   1086   1500  |  1598  1599  |  2200  3300  5000  7500  10000
+      predicted x10.9  x15.0 | x15.98 x1.00 | x6.02 x1.03 x2.05 x11.1  x4.09
+      measured  x10.5  x14.7 |   clip x1.00 | x5.79 x1.06 x2.01 x10.7  x3.94
+
+  New `option.max_relative_exposure(exposure_time)`; `MAX_TESTED_RELATIVE_EXPOSURE`
+  (a hard-coded 1500, itself a raised guess from 1086) is replaced by
+  `MAX_RELATIVE_EXPOSURE`, the ceiling implied by `OBSERVED_EXPOSURE_TIME`, used by
+  `OptionsTable.validate()` which has no device reading available
+- `auto_exp` clamps each channel to the ceiling the device's own reported exposure
+  time implies, per channel, and reports the shortfall. A scanner that has not
+  warmed up reports no exposure time at all, which says nothing about the register
+  it uses, so the observed ceiling is assumed and said out loud rather than
+  abandoning the correction
+- This also explains why `exp_time_*` looked inert but is not irrelevant: the device
+  ignores what is written to it and keeps its own value, and that value is the
+  multiplicand deciding where `exp_rel_*` overflows
+
 # v0.3.6
 
 - **`auto_exp` now meters, and it works.** It runs a preview pass at the device's
@@ -12,11 +44,8 @@
   `exp_time_*` and `light` are inert.** Measured by sweeping each in isolation at
   300 dpi / 16-bit: gain 10/30/60, exp_time 500/1500/2500/2937/6000/10000 and
   light 4/5/6/7 all produce the same image to within 0.2%, while `exp_rel_*` is
-  linear to within 4% from 100 to 1500 and clamps at the bottom -- 50 behaves as
-  100. Above 1500 the device misbehaves rather than merely being unmeasured: the
-  response goes non-monotonic and mostly collapses (2200 -> x5.8, 3300 -> x1.1,
-  5000 -> x2.0, 7500 -> x10.7, 10000 -> x3.9, against nominals of x22 to x100), so
-  3300 is indistinguishable from leaving it at 100. `exp_rel_*` is the
+  linear to within 4% and clamps at the bottom -- 50 behaves as 100. The top is set
+  by a Timer 1 overflow, explained in v0.3.7. `exp_rel_*` is the
   per-line integration period, so the line rate halves as it doubles. SANE
   hard-codes all three to 100 and never varies them (`pieusb.c:878-882`), which is
   why neither backend could ever expose this film
@@ -35,10 +64,9 @@
   white. Measured at `exp_rel` 400, red clipped 12.7% of samples, concentrated at
   the left and right edges with 55 percentage points of column-to-column swing
 - `OptionsTable.validate()` no longer warns on every `exp_rel_*` away from 100 --
-  it is meant to be moved. It now warns only above `MAX_TESTED_RELATIVE_EXPOSURE`
-  (1500, above which the device misbehaves) or below 100 (where the device clamps,
-  so the setting does nothing). Not refused, so the 1500..2200 gap can still be
-  narrowed by experiment
+  it is meant to be moved. It now warns only above the Timer 1 ceiling (see v0.3.7)
+  or below 100, where the device clamps and the setting does nothing. Warned about
+  rather than refused, since the real ceiling depends on a value only Scanner reads
 - The per-scan settings line now includes the relative exposures, since `auto_exp`
   restores them afterwards and the log is the only record of what a scan ran with
 - The high-resolution stall is a device characteristic with no host-side fix: the

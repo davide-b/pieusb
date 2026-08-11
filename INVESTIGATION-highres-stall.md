@@ -346,13 +346,28 @@ by sweeping each in isolation at 300 dpi / 16-bit:
 | `light` | 4, 5, 6, 7 | none (±0.1%) |
 | `exp_rel_*` | 50 | none — clamps at 100 |
 | `exp_rel_*` | 200, 250, 400, 800, 1086, 1500 | **×1.97, ×2.46, ×3.93, ×8.03, ×10.5, ×14.7** |
-| `exp_rel_*` | 2200, 3300, 5000, 7500, 10000 | broken: ×5.8, ×1.1, ×2.0, ×10.7, ×3.9 |
+| `exp_rel_*` | 1598 / 1599 | ×15.98 / **×1.00** — the Timer 1 overflow step |
+| `exp_rel_*` | 2200, 3300, 5000, 7500, 10000 | wrapped: ×5.8, ×1.1, ×2.0, ×10.7, ×3.9 |
 
-`exp_rel_*` is the exposure system: linear to within 4% from 100 to 1500 (×15), per
-channel, upward only, and unusable above 1500 -- the response there is
-non-monotonic and mostly collapses toward ×1, which is audible as a wrong line
-rate. The differences fit no simple modulus, so the mechanism is unexplained;
-2048 falls in the untested 1500..2200 gap. It is the per-line integration period, so the line rate halves
+`exp_rel_*` is the exposure system: linear to within 4%, per channel, upward only,
+and bounded by a **16-bit Timer 1 overflow**. It scales the device's own absolute
+exposure time into that register:
+
+    timer = exposure_time * exp_rel / 100      (mod 65536)
+
+so the ceiling is `65535 * 100 // exposure_time`, which for the 4100 this unit
+reports is 1598. A binary search put the step at exactly 1598/1599 for all three
+channels. Above it the exposure *drops* — and lands on ×1.00 rather than near zero
+because a wrapped result below 100 meets the same floor that makes `exp_rel=50`
+behave as 100. The model predicts every measurement to within 4%:
+
+    exp_rel   1086   1500  |  1598  1599  |  2200  3300  5000  7500  10000
+    predicted x10.9  x15.0 | x15.98 x1.00 | x6.02 x1.03 x2.05 x11.1  x4.09
+    measured  x10.5  x14.7 |   clip x1.00 | x5.79 x1.06 x2.01 x10.7  x3.94
+
+Which also explains why `exp_time_*` looked inert without being irrelevant: the
+device ignores what is written to it and keeps its own value, and that value is the
+multiplicand. It is the per-line integration period, so the line rate halves
 as it doubles — which is why it also cures the stall.
 
 Per-channel 247/563/1086 puts all three channels within 1% of each other at ~88% of
