@@ -106,6 +106,12 @@ def apply_shading_correction(
     - Rounding is floor(x + 0.5), which reproduces the C's lround() for the
       non-negative values involved. numpy.rint would not: it rounds halves to
       even.
+
+    Clamping is counted and warned about, because it is not uniform across the
+    image: the per-column gain is >1 where the lamp falls off, so edge columns
+    reach the ceiling at a lower raw value than centre columns. Highlights near
+    full scale therefore clip column by column and the result reads as vertical
+    banding rather than as flat white.
     '''
     n_planes, _height, width = image_planes.shape
     dtype = image_planes.dtype
@@ -121,6 +127,13 @@ def apply_shading_correction(
         gain = numpy.where(ref_cols > 0, shading_mean[c] / ref_cols, 1.0)
         corrected = image_planes[c, :, :loc.size].astype(numpy.float64) * gain
         numpy.floor(corrected + 0.5, out=corrected)
+        clipped = int(numpy.count_nonzero(corrected > maxval))
         numpy.clip(corrected, 0, maxval, out=corrected)
         image_planes[c, :, :loc.size] = corrected.astype(dtype)
+        if clipped:
+            log.warning(
+                f"shading correction: channel {c} clipped {clipped} samples "
+                f"({clipped * 100 / corrected.size:.2f}%) at {maxval}. Highlight "
+                f"detail is lost and will show as vertical banding; reduce exposure"
+            )
     return image_planes

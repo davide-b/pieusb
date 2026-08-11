@@ -1,3 +1,49 @@
+# v0.3.6
+
+- **`auto_exp` now meters, and it works.** It runs a preview pass at the device's
+  preview resolution with `exp_rel_*` at 100, takes the 99th percentile of each
+  colour plane, and scales that channel's relative exposure to land it at 85% of
+  full scale. Per channel, no cap on the correction beyond the measured-linear
+  range, and no dependency on anything the device reports about itself. On a PIE
+  ProScan 10T against a colour negative it derives 247/563/1086, which puts all
+  three channels within 1% of each other at ~88% of full scale with nothing
+  clipped -- where untouched they sit at 4.39 : 1.93 : 1.00 with red at 34%
+- **`exp_rel_*` is the exposure control on this hardware, and `gain_*`,
+  `exp_time_*` and `light` are inert.** Measured by sweeping each in isolation at
+  300 dpi / 16-bit: gain 10/30/60, exp_time 500/1500/2500/2937/6000/10000 and
+  light 4/5/6/7 all produce the same image to within 0.2%, while `exp_rel_*` is
+  linear to within 2% from 100 to at least 1086 (x11.09 measured against a nominal
+  x10.86) and clamps at the bottom -- 50 behaves as 100. `exp_rel_*` is the
+  per-line integration period, so the line rate halves as it doubles. SANE
+  hard-codes all three to 100 and never varies them (`pieusb.c:878-882`), which is
+  why neither backend could ever expose this film
+- **`auto_exp` no longer adopts the device's own calibration.** `gain_*`,
+  `exp_time_*`, `offset_*` and `light` from GET GAIN OFFSET are inert, so the
+  v0.3.5 behaviour was a no-op that cost a command. `Scanner._adopt_device_calibration`
+  and `_set_from_device` are gone; `CALIBRATION_OPTIONS` is replaced by
+  `METERED_OPTIONS`, the three `exp_rel_*` names, which are restored after the scan
+  that derived them. The v0.3.5 note that the light byte was "worth roughly the
+  entire exposure range" was wrong -- it came from a comparison confounded by
+  resolution. Sending 0 was still incorrect and 4 is still the right default
+- Shading correction counts and warns about clamped samples. Clipping is not
+  uniform: the per-column gain is >1 where the lamp falls off, so edge columns
+  reach the ceiling at a lower raw value than centre columns, and highlights near
+  full scale clip column by column and read as vertical banding rather than flat
+  white. Measured at `exp_rel` 400, red clipped 12.7% of samples, concentrated at
+  the left and right edges with 55 percentage points of column-to-column swing
+- `OptionsTable.validate()` no longer warns on every `exp_rel_*` away from 100 --
+  it is meant to be moved. It now warns only above `MAX_TESTED_RELATIVE_EXPOSURE`
+  (1086, where linearity stops being measured) or below 100 (where the device
+  clamps, so the setting does nothing)
+- The per-scan settings line now includes the relative exposures, since `auto_exp`
+  restores them afterwards and the log is the only record of what a scan ran with
+- The high-resolution stall is a device characteristic with no host-side fix: the
+  host is unattended for 1.9% of a 5000 dpi scan, the device's buffer never fills
+  (it drains to 0 every fifth read), and the C backend stalls identically at
+  matched bit depth. It is also self-correcting -- raising `exp_rel_*` slows the
+  line rate to match the readout, and a 5000 dpi scan at x11.1 took 150 s against
+  190 s at 100%, because the reversals stop
+
 # v0.3.5
 
 - **`auto_exp` is now "scan with the calibration the scanner reports for itself"**,

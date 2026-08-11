@@ -66,8 +66,13 @@ COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
 # lineart/halftone modes. 128 is what the capture in pieusb_scancmd.c:757 sends.
 LINE_THRESHOLD = 128
 
-# The only relative-exposure value SANE ever sends (pieusb.c:878-882).
+# The only relative-exposure value SANE ever sends (pieusb.c:878-882), and the
+# floor the device clamps to: 50 measures the same as 100.
 DEFAULT_RELATIVE_EXPOSURE = 100
+
+# Highest exp_rel_* measured linear on a ProScan 10T (x11.09 against a nominal
+# x10.86). Above this the device's response is unknown, so validate() warns.
+MAX_TESTED_RELATIVE_EXPOSURE = 1086
 
 # Light level used when the device reports none of its own. SANE's DEFAULT_LIGHT
 # (pieusb_specific.h:107) and the value the firmware settles at once warm.
@@ -199,17 +204,27 @@ class OptionsTable:
             log.warning("option 'advance' is not implemented yet and will be ignored: "
                         "slide-transport commands are not sent")
 
-        # Warns every scan rather than refusing: a stray relative exposure is
-        # invisible in the result.
-        moved = [
+        # Only the top of the range is unexplored now: exp_rel_* is the exposure
+        # control and is meant to be moved. Measured linear to 1086; above that
+        # nothing is known, so say so rather than refuse.
+        high = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
-            if self[n].value != DEFAULT_RELATIVE_EXPOSURE
+            if self[n].value > MAX_TESTED_RELATIVE_EXPOSURE
         ]
-        if moved:
+        if high:
             log.warning(
-                f"relative exposure moved off {DEFAULT_RELATIVE_EXPOSURE}% ({', '.join(moved)}). "
-                f"No shipping driver sends anything else and the device's response is "
-                f"unknown. Prefer exp_time_* to change exposure."
+                f"relative exposure above {MAX_TESTED_RELATIVE_EXPOSURE}% ({', '.join(high)}); "
+                f"linearity has only been measured up to {MAX_TESTED_RELATIVE_EXPOSURE}. "
+                f"Check the result for clipping"
+            )
+        low = [
+            f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
+            if self[n].value < DEFAULT_RELATIVE_EXPOSURE
+        ]
+        if low:
+            log.warning(
+                f"relative exposure below {DEFAULT_RELATIVE_EXPOSURE}% ({', '.join(low)}); "
+                f"the device clamps there, so this scales nothing"
             )
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
@@ -285,14 +300,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Take gain_*, exp_time_*, offset_* and light from GET GAIN OFFSET instead of
-    # from whatever those options hold. The firmware optimises them per channel
-    # while warming up; this is the C's default calibration mode
-    # (SCAN_CALIBRATION_AUTO, pieusb_specific.c:733, 1988) and costs no extra pass.
+    # Meter a preview pass and set exp_rel_* per channel from it, instead of
+    # scanning with whatever they hold. Costs one extra pass at the device's preview
+    # resolution; see Scanner._meter_exposure.
     #
-    # The scanner only fills those fields in during its first scan, so the first
-    # auto_exp scan of a session finds zeros, warns and runs with the options as
-    # set. Scan twice. See Scanner._adopt_device_calibration.
+    # Nothing else is derived, because nothing else has an effect: exp_rel_* is the
+    # only exposure control this hardware honours (see the exposure section below).
+    # In particular this does NOT adopt the device's own gain/exposure calibration
+    # the way the C's SCAN_CALIBRATION_AUTO does -- those values are inert here.
     out.append(Parameter(Option(
         name='auto_exp',
         type=bool,
@@ -348,20 +363,23 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
 
     # --- Exposure -------------------------------------------------------------
     #
-    # Two independent controls, sent by different commands. Easy to confuse, hence
-    # the distinct names:
+    # Two independent controls, sent by different commands:
     #
     #   exp_time_*  ABSOLUTE integration time in Timer 1 counts, one per filter
     #               including infrared, carried by SET GAIN OFFSET.
     #   exp_rel_*   RELATIVE percentage, R/G/B only, sent by SCSI_EXPOSURE.
-    #               See below -- leave it alone.
     #
-    # The firmware optimises exp_time_* during warm-up until R and B reach >=90% of
-    # full scale and G >=80% (pieusb_scancmd.h:188-197), then usually resets them
-    # to 0x0B79 = 2937, SANE's DEFAULT_EXPOSURE (pieusb_specific.h:105).
+    # MEASURED ON A PIE ProScan 10T (rev 1.70): exp_rel_* is the only one that does
+    # anything. exp_time_* has no effect on the image at any value -- 500, 1500,
+    # 2500, 2937, 6000 and 10000 all produce the same exposure to within 0.2% --
+    # and neither does gain_* or light. Whether that generalises to other models is
+    # unknown, so all of them are still sent, and exp_time_*'s documented meaning
+    # is recorded below for the ones where it may work.
     #
-    # This is the per-line integration period, so raising it scales scan time and
-    # lamp-on time one for one. Prefer gain_*, or 'light' within its 4..7 band.
+    # Nominally the firmware optimises exp_time_* during warm-up until R and B
+    # reach >=90% of full scale and G >=80% (pieusb_scancmd.h:188-197), then resets
+    # them to 0x0B79 = 2937, SANE's DEFAULT_EXPOSURE (pieusb_specific.h:105). This
+    # unit reports a flat 4100 for all four channels and ignores what it is sent.
     #
     # The advertised maximum is multiplied by 4 because it does not otherwise
     # contain 2937 -- the device's own default is out of its own reported range.
@@ -377,21 +395,31 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
             default=DEFAULT_EXPOSURE_TIME
         )))
 
-    # RELATIVE percentage on top of the absolute exposure time, a 16-bit field per
-    # filter sent by SCSI_EXPOSURE (pieusb_scancmd.c:521-544). Infrared has no
-    # entry: the C struct holds three colours.
+    # RELATIVE percentage, a 16-bit field per filter sent by SCSI_EXPOSURE
+    # (pieusb_scancmd.c:521-544). Infrared has no entry: the C struct holds three
+    # colours.
     #
-    # LEAVE THIS AT 100. Exposed for experiments, not for tuning:
+    # THIS IS THE EXPOSURE CONTROL, at least on a ProScan 10T, and it is per
+    # channel. Measured against a colour negative at 300 dpi, 16-bit:
     #
-    #   - SANE hard-codes all three to 100 and never varies them (pieusb.c:878-882,
-    #     927), so no other value has been exercised against this hardware.
-    #   - Redundant with exp_time_*, which has a known range and meaning.
-    #   - The bound below is the width of the wire field, not a documented limit;
-    #     what the device does outside 100 is unknown.
-    #   - The gain and exposure times auto_exp adopts were optimised by the
-    #     firmware with this at 100, so moving it invalidates them.
+    #   exp_rel   50    100    200    250    400    800   1086
+    #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x11.1
     #
-    # OptionsTable.validate() warns if you move it, rather than refusing.
+    # Linear to within 2% from 100 to at least 1086, and clamped at the bottom --
+    # 50 behaves as 100, so it scales up only. It is the per-line integration
+    # period, so the line rate halves as it doubles and scan time scales with the
+    # largest of the three channels.
+    #
+    # Setting it per channel is how a colour negative gets exposed: the orange mask
+    # attenuates blue about 4.4x more than red, and 247/563/1086 put all three
+    # channels within 1% of each other at ~88% of full scale with nothing clipped.
+    # Driving any channel to saturation produces vertical banding rather than flat
+    # white, because the shading correction's per-column gain makes the clipping
+    # point column-dependent (see postprocess.apply_shading_correction).
+    #
+    # SANE hard-codes all three to 100 and never varies them (pieusb.c:878-882,
+    # 927), which is why its calibration could never expose this film. The bound
+    # below is the width of the wire field; behaviour above 1086 is untested.
     for filt in ('r', 'g', 'b'):
         out.append(Parameter(Option(
             name=f'exp_rel_{filt}',
@@ -475,8 +503,7 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=0
     )))
 
-    # Lamp level, byte 15 of SET GAIN OFFSET. Sent on every scan and it scales the
-    # whole acquisition, so a wrong value starves everything downstream.
+    # Lamp level, byte 15 of SET GAIN OFFSET.
     #
     #   "Current light level. The stability of the light source is tested during
     #    warming up. The check starts with a light value 7 or 6, and decrements
@@ -485,9 +512,12 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     #    0x200)." (pieusb_scancmd.h:208-213)
     #
     # So the operating band is 4..7, with 4 the warmed-up value; SANE types it as a
-    # duration in microseconds (pieusb_specific.c:916). The range below is the
-    # width of the wire field, not a documented limit. auto_exp adopts the device's
-    # own value over this default (Scanner._adopt_device_calibration).
+    # duration in microseconds (pieusb_specific.c:916). The range below is the width
+    # of the wire field, not a documented limit.
+    #
+    # No measurable effect on a ProScan 10T: 4, 5, 6 and 7 produce the same image to
+    # within 0.1%. Sent anyway, since 0 is outside the band and no other model has
+    # been tested. Use exp_rel_* to change exposure.
     out.append(Parameter(Option(
         name='light',
         type=int,

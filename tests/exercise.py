@@ -13,17 +13,18 @@ nothing here is a unit test.
     python tests/exercise.py --mode rgbi --resolution 2000 --frame-mm 0 0 36 24
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
 
-auto_exp takes gain, exposure, offset and light from GET GAIN OFFSET. The firmware
-only fills those in during its first scan, so the first auto_exp scan of a session
-finds zeros and runs with the options as set. Scan twice:
+auto_exp meters a preview pass and sets exp_rel_* per channel from it -- the only
+exposure control this hardware honours. It costs one extra pass:
 
-    python tests/exercise.py --gain-offset --dry-run          # (0,0,0,...) when cold
-    python tests/exercise.py -o auto_exp=true --output warmup # discard this one
-    python tests/exercise.py -o auto_exp=true --output auto   # the real one
+    python tests/exercise.py -o auto_exp=true --output auto
 
-Or set the exposure by hand, keeping light in the device's 4..7 band:
+Or set the relative exposures by hand. 247/563/1086 balances a colour negative on a
+ProScan 10T, all three channels at ~88% of full scale:
 
-    python tests/exercise.py -o light=4 -o exp_time_r=4100 --output manual
+    python tests/exercise.py -o exp_rel_r=247 -o exp_rel_g=563 -o exp_rel_b=1086 \
+        --output manual
+
+gain_*, exp_time_* and light have no measurable effect on that unit at any value.
 
 Every scan logs the exposure, gain, offset and light it sent, at INFO.
 
@@ -78,6 +79,7 @@ def describe(index: int, info: DeviceInfo) -> None:
     print(f"     slide transport   : {inq.slide_transport}")
     print(f"     exposure range    : {inq.minimum_exposure} .. {inq.maximum_exposure}")
     print(f"     production        : {inq.production} {inq.timestamp}")
+
 
 
 def native_to_mm(value: int, inq) -> float:

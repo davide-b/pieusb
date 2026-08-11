@@ -1,4 +1,11 @@
-from pieusb.option import generate_options, set_options, MODE_PLANES, Parameter
+from pieusb.option import (
+    generate_options,
+    set_options,
+    DEFAULT_RELATIVE_EXPOSURE,
+    MAX_TESTED_RELATIVE_EXPOSURE,
+    MODE_PLANES,
+    Parameter,
+)
 from pieusb.postprocess import (
     apply_shading_correction,
     build_width_to_loc,
@@ -38,7 +45,7 @@ import numpy
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 log = logging.getLogger(__name__)
 
@@ -53,13 +60,23 @@ CHANNEL_NAMES = ('R', 'G', 'B', 'I')
 # Channel index -> the suffix its gain_*/exp_time_*/offset_* options carry.
 CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
 
-# The options auto_exp overwrites with the device's own calibration -- the whole
-# settings struct at once, as the C adopts it (pieusb_specific.c:1988, 2046).
-CALIBRATION_OPTIONS = tuple(
-    f'{field}_{suffix}'
-    for field in ('gain', 'exp_time', 'offset')
-    for suffix in CHANNEL_SUFFIX
-) + ('light',)
+# The options auto_exp derives and therefore restores afterwards. Only the relative
+# exposures: they are the only exposure control this hardware honours (see the
+# exp_rel_* options).
+METERED_OPTIONS = ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
+
+# Where auto_exp aims the metered channel, as a fraction of full scale. Below 1.0
+# to leave room for specular highlights and for the shading correction's per-column
+# gain, which clips edge columns first (postprocess.apply_shading_correction).
+METERING_TARGET = 0.85
+
+# Percentile of each colour plane taken as "the top of the image", so that a
+# handful of dust specks or scratches cannot veto the whole exposure.
+METERING_PERCENTILE = 99
+
+# Used for the metering pass if the device's own reported preview resolution is
+# unusable. Matches the 'resolution' option default.
+PREVIEW_RESOLUTION_FALLBACK = 300
 
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
 START_SCAN_ATTEMPTS = 30
@@ -253,32 +270,9 @@ class Scanner:
             "width": struct.unpack_from("<H", raw, 0)[0],
             "lines": struct.unpack_from("<H", raw, 2)[0],
             "bytes_per_line": struct.unpack_from("<H", raw, 4)[0],
+            # Lines sitting in the device's own buffer, non-zero only while a scan
+            # is in progress (pieusb_scancmd.h:140).
             "available_lines": struct.unpack_from("<H", raw, 14)[0],
-        }
-
-    def _get_ccd_mask(self, mask_size):
-        return self.dev.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
-
-    def _get_gain_offset(self):
-        raw = self.dev.command(SCSI_READ_GAIN_OFFSET, in_size=103, cdb_length=103)
-        # Saturation levels: the average R/G/B the firmware reached while
-        # optimising its exposure times, targeting >=90% of full scale for R and B
-        # and >=80% for G (pieusb_scancmd.h:188-192). Known to read 0-0-0 on a PIE
-        # ProScan 10T, warm or cold; nothing here depends on them.
-        saturation_rgb = struct.unpack_from("<3H", raw, 54)
-        exposure_rgb = struct.unpack_from("<3H", raw, 60)
-        offset_rgb = tuple(raw[66:69])
-        gain_rgb = tuple(raw[72:75])
-        light = raw[75]
-        exposure_i = struct.unpack_from("<H", raw, 98)[0]
-        offset_i = raw[100]
-        gain_i = raw[102]
-        return {
-            "saturation_level": saturation_rgb,
-            "exposure_time": exposure_rgb + (exposure_i,),
-            "offset": offset_rgb + (offset_i,),
-            "gain": gain_rgb + (gain_i,),
-            "light": light,
         }
 
     def stop_scan(self) -> None:
@@ -344,6 +338,12 @@ class Scanner:
             self.on_update(update)
         except Exception:
             log.exception("[scan] on_update callback raised; continuing the scan")
+
+    def _emit_metering(self, update: UpdateData) -> None:
+        """Relabel a metering pass's updates, so a progress bar sees one sweep for
+        the metering pass and a second for the real scan rather than two
+        indistinguishable SCANNING sweeps."""
+        self._emit(replace(update, phase=ScanPhase.METERING))
 
     def _result(self, rgb=None, ir=None, *, started: float, width: int = 0, height: int = 0,
                 shading_corrected: bool = False, cancelled: bool = False,
@@ -421,81 +421,104 @@ class Scanner:
             for name, value in saved.items():
                 self.params[name].value = value
 
-    def _adopt_device_calibration(self) -> None:
-        """Overwrite the calibration options with the scanner's own, if it has any.
+    def _meter_exposure(self, started: float) -> ScanResult | None:
+        """Run a metering pass and set exp_rel_* per channel from what it measured.
 
-        SCAN_CALIBRATION_AUTO (pieusb_specific.c:1988), the C's default calibration
-        mode (:733): read GET GAIN OFFSET and send the settings struct straight
-        back. The firmware optimises gain and exposure per channel while warming
-        up, measured on this lamp at its current temperature.
+        exp_rel_* is the only exposure control this hardware honours, it is linear,
+        and it is per channel -- so metering is a ratio and nothing more. The pass
+        runs at DEFAULT_RELATIVE_EXPOSURE, the METERING_PERCENTILE of each colour
+        plane is compared against METERING_TARGET of full scale, and each channel's
+        relative exposure is scaled by the shortfall.
 
-        Not the "calibration from preview" path (pieusb_specific.c:1912), which
-        divides by settings.saturationLevel. A PIE ProScan 10T reports 0-0-0 there
-        warm or cold, and a zero makes updateGain2 produce gain 0 and exposure 0,
-        so there is nothing for a preview pass to meter against.
+        Measured on a PIE ProScan 10T against a colour negative: this puts all
+        three channels within 1% of each other at ~88% of full scale, where
+        untouched they sit at 4.39 : 1.93 : 1.00 with red at 34%. The per-pixel
+        level does not depend on resolution, so metering at preview resolution
+        carries over to the real scan.
 
-        Leaves every option untouched on a cold scanner, which reports zeros --
-        exposure (0, 0, 0, 4100), gain (0, 0, 0, 15), light 0 is the observed cold
-        state. The firmware fills them in during its first scan.
+        Returns None once exp_rel_* has been set, or the metering pass's own
+        ScanResult if it was cancelled -- there is no point starting the real scan
+        after that. Failures propagate as the real pass's do.
         """
-        settings = self._get_gain_offset()
-        exposure = settings["exposure_time"]
-        gain = settings["gain"]
-        offset = settings["offset"]
-        light = settings["light"]
+        preview_resolution = self.info.inquiry.preview_scan_resolution
+        if not self.params['resolution'].opt.validate(preview_resolution):
+            fallback = min(self.params['resolution'].value, PREVIEW_RESOLUTION_FALLBACK)
+            log.warning(f"[autoexp] the scanner reports an unusable preview resolution "
+                        f"({preview_resolution}); metering at {fallback} dpi instead")
+            preview_resolution = fallback
+        log.info(f"[autoexp] metering pass at {preview_resolution} dpi")
 
-        # Both are zero on a cold scanner: the exposure times it optimises, and
-        # the lamp level it settles at 4 once warm (pieusb_scancmd.h:208-213).
-        if not all(exposure[c] > 0 for c in range(3)) or light <= 0:
-            log.warning(
-                f"[autoexp] the scanner reports no calibration of its own yet "
-                f"(exposure {exposure}, gain {gain}, light {light}); it fills these in "
-                f"during its first scan. Scanning with the options as set instead -- "
-                f"a second scan in this session will pick up the real values"
-            )
-            return
+        with self._overridden_options(
+            resolution=preview_resolution,
+            sharpen=False,
+            fast_infrared=False,
+            advance=False,
+            exp_rel_r=DEFAULT_RELATIVE_EXPOSURE,
+            exp_rel_g=DEFAULT_RELATIVE_EXPOSURE,
+            exp_rel_b=DEFAULT_RELATIVE_EXPOSURE,
+        ):
+            preview = self._scan_pass(started, self._emit_metering)
 
-        log.info(f"[autoexp] adopting the scanner's calibration: gain {gain}, "
-                 f"exposure {exposure}, offset {offset}, light {light}")
+        if preview.cancelled:
+            return preview
+        if preview.rgb is None:
+            raise PieusbError("metering pass returned no image data")
 
-        self._set_from_device('light', light)
-        for c, suffix in enumerate(CHANNEL_SUFFIX):
-            # Infrared is optimised with the others but often reset afterwards
-            # (pieusb_scancmd.h:194-199), so it alone may come back unset.
-            if exposure[c] > 0:
-                self._set_from_device(f'exp_time_{suffix}', exposure[c])
-            self._set_from_device(f'gain_{suffix}', gain[c])
-            self._set_from_device(f'offset_{suffix}', offset[c])
+        full_scale = numpy.iinfo(preview.rgb.dtype).max
+        target = METERING_TARGET * full_scale
+        for c, suffix in enumerate(('r', 'g', 'b')):
+            name = f'exp_rel_{suffix}'
+            measured = float(numpy.percentile(preview.rgb[:, :, c], METERING_PERCENTILE))
+            if measured <= 0:
+                log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} metered 0 at the "
+                            f"{METERING_PERCENTILE}th percentile; leaving {name} at "
+                            f"{self.params[name].value}")
+                continue
 
-    def _set_from_device(self, name: str, value: int) -> None:
-        """Store a device-reported option value, warning if it left its own range.
-
-        Not clamped -- the C sends these back unexamined -- but a scanner
-        contradicting its own advertised range is worth a warning, because
-        set_options() will send it regardless.
-        """
-        par = self.params[name]
-        if not par.opt.validate(value):
-            log.warning(f"[autoexp] device-reported {name}={value} is outside the range "
-                        f"the scanner itself reports; sending it anyway")
-        par.value = value
+            wanted = round(DEFAULT_RELATIVE_EXPOSURE * target / measured)
+            value = min(max(wanted, DEFAULT_RELATIVE_EXPOSURE), MAX_TESTED_RELATIVE_EXPOSURE)
+            log.info(f"[autoexp] {CHANNEL_NAMES[c]}: metered {measured:.0f}/{full_scale} "
+                     f"({measured / full_scale * 100:.1f}%), {name} -> {value}")
+            if wanted > MAX_TESTED_RELATIVE_EXPOSURE:
+                # Not clamped for the device's sake -- higher values may well work --
+                # but because nothing above this has been measured for linearity.
+                log.warning(
+                    f"[autoexp] channel {CHANNEL_NAMES[c]} wants {name}={wanted} but "
+                    f"{MAX_TESTED_RELATIVE_EXPOSURE} is the highest measured; using that, "
+                    f"which leaves it {wanted / MAX_TESTED_RELATIVE_EXPOSURE:.2f}x under "
+                    f"the target"
+                )
+            elif wanted < DEFAULT_RELATIVE_EXPOSURE:
+                log.warning(
+                    f"[autoexp] channel {CHANNEL_NAMES[c]} is already brighter than the "
+                    f"target and the device clamps exp_rel below "
+                    f"{DEFAULT_RELATIVE_EXPOSURE}; it will be over-exposed by "
+                    f"{DEFAULT_RELATIVE_EXPOSURE / wanted:.2f}x"
+                )
+            self.params[name].value = value
+        return None
 
     def _run_scan(self, started: float) -> ScanResult:
-        """Run the one pass a scan needs. Raises; _scan_worker catches.
+        """Run the passes a scan needs. Raises; _scan_worker catches.
 
-        With auto_exp the scanner's own calibration is adopted first, inside a
-        restore so those values belong to this scan alone. Without it the options
-        are sent exactly as set.
+        With auto_exp that is a metering pass and then the real one, with exp_rel_*
+        restored afterwards so the derived values belong to this scan alone. Without
+        it, one pass with the options exactly as set.
         """
         if self.params['auto_exp'].value:
-            with self._saved_options(*CALIBRATION_OPTIONS):
-                self._adopt_device_calibration()
-                return self._scan_pass(started)
+            with self._saved_options(*METERED_OPTIONS):
+                cancelled = self._meter_exposure(started)
+                if cancelled is not None:
+                    return cancelled
+                return self._scan_pass(started, self._emit)
 
-        return self._scan_pass(started)
+        return self._scan_pass(started, self._emit)
 
-    def _scan_pass(self, started: float) -> ScanResult:
-        """The one pass over the medium, from configuration to a finished ScanResult.
+    def _scan_pass(self, started: float, emit: Callable[[UpdateData], None]) -> ScanResult:
+        """One pass over the medium, from configuration to a finished ScanResult.
+
+        Shared by the real scan and the metering pass, which differ only in the
+        options in force and in how their progress is labelled -- hence `emit`.
 
         Whether the pass acquires its own shading reference or reuses the cached
         one is decided here, from 'reuse_calibration' and what the cache holds,
@@ -506,7 +529,7 @@ class Scanner:
         Raises; _scan_worker turns that into result.error. Follows sane_start()
         (pieusb.c:865-1140).
         """
-        self._emit(UpdateData(phase=ScanPhase.CONFIGURING))
+        emit(UpdateData(phase=ScanPhase.CONFIGURING))
 
         self.shading_params = self._get_shading_parms()
         if not self.shading_params:
@@ -537,7 +560,8 @@ class Scanner:
         # Logged rather than returned on the ScanResult because auto_exp restores
         # these afterwards, making this the only place the values a pass ran with
         # can be observed.
-        log.info("[scan] sending exposure %s, gain %s, offset %s, light %d",
+        log.info("[scan] sending exp_rel %s, exposure %s, gain %s, offset %s, light %d",
+                 tuple(self.params[f'exp_rel_{s}'].value for s in ('r', 'g', 'b')),
                  tuple(self.params[f'exp_time_{s}'].value for s in CHANNEL_SUFFIX),
                  tuple(self.params[f'gain_{s}'].value for s in CHANNEL_SUFFIX),
                  tuple(self.params[f'offset_{s}'].value for s in CHANNEL_SUFFIX),
@@ -555,7 +579,7 @@ class Scanner:
                 if e.warming_up:
                     # Progress against the retry budget, which is all we know: the
                     # scanner does not say how much warming up it has left.
-                    self._emit(UpdateData(phase=ScanPhase.WARMING_UP,
+                    emit(UpdateData(phase=ScanPhase.WARMING_UP,
                                     progress=attempt / START_SCAN_ATTEMPTS))
                     log.debug(f"[scan]   still warming up, waiting {START_SCAN_RETRY_S}s "
                               f"(attempt {attempt + 1}/{START_SCAN_ATTEMPTS})...")
@@ -589,7 +613,7 @@ class Scanner:
 
         shading_raw = None
         if acquire:
-            self._emit(UpdateData(phase=ScanPhase.CALIBRATING))
+            emit(UpdateData(phase=ScanPhase.CALIBRATING))
 
             # Shading data is always 16-bit, with the same two-byte channel tag
             # per line as the image data. The C reads 4 * entry[0].nLines
@@ -601,7 +625,7 @@ class Scanner:
                       f"{total_shading_lines * shading_bytes_per_line} bytes)...")
             shading_raw = self._get_scanned_lines(
                 total_shading_lines, shading_bytes_per_line, label="shading",
-                report=lambda frac: self._emit(
+                report=lambda frac: emit(
                     UpdateData(phase=ScanPhase.CALIBRATING, progress=frac)
                 ),
             )
@@ -637,7 +661,7 @@ class Scanner:
 
         log.debug(f"[scan] reading {n_planes} planes x {height} lines "
                   f"({raw_bytes_per_line} bytes/line incl. 2-byte tag)...")
-        self._emit(UpdateData(phase=ScanPhase.SCANNING, progress=0.0))
+        emit(UpdateData(phase=ScanPhase.SCANNING, progress=0.0))
 
         # Planes arrive as sequential blocks -- all R lines, then all G -- but the
         # 255-line read cap does not align to those boundaries, so a single read can
@@ -667,7 +691,7 @@ class Scanner:
                     chunk, dtype=sample_dtype, count=width, offset=off + 2
                 )
             done += n_lines
-            self._emit(UpdateData(phase=ScanPhase.SCANNING, progress=done / total_lines))
+            emit(UpdateData(phase=ScanPhase.SCANNING, progress=done / total_lines))
 
             if self.cancel_requested.is_set():
                 log.debug(f"[scan] cancelled after {done}/{total_lines} lines; stopping")
@@ -698,7 +722,7 @@ class Scanner:
             planes = planes[:, :usable_height, :]
 
         # --- Post-processing ---------------------------------------------------
-        self._emit(UpdateData(phase=ScanPhase.PROCESSING))
+        emit(UpdateData(phase=ScanPhase.PROCESSING))
 
         # A pass that acquired a reference replaces the cache; a pass that skipped
         # leaves the previous one in place. The correction below reads either.
