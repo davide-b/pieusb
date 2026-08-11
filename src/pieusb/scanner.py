@@ -275,6 +275,31 @@ class Scanner:
             "available_lines": struct.unpack_from("<H", raw, 14)[0],
         }
 
+    def _get_ccd_mask(self, mask_size):
+        return self.dev.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
+
+    def _get_gain_offset(self):
+        raw = self.dev.command(SCSI_READ_GAIN_OFFSET, in_size=103, cdb_length=103)
+        # Saturation levels: the average R/G/B the firmware reached while
+        # optimising its exposure times, targeting >=90% of full scale for R and B
+        # and >=80% for G (pieusb_scancmd.h:188-192). Known to read 0-0-0 on a PIE
+        # ProScan 10T, warm or cold; nothing here depends on them.
+        saturation_rgb = struct.unpack_from("<3H", raw, 54)
+        exposure_rgb = struct.unpack_from("<3H", raw, 60)
+        offset_rgb = tuple(raw[66:69])
+        gain_rgb = tuple(raw[72:75])
+        light = raw[75]
+        exposure_i = struct.unpack_from("<H", raw, 98)[0]
+        offset_i = raw[100]
+        gain_i = raw[102]
+        return {
+            "saturation_level": saturation_rgb,
+            "exposure_time": exposure_rgb + (exposure_i,),
+            "offset": offset_rgb + (offset_i,),
+            "gain": gain_rgb + (gain_i,),
+            "light": light,
+        }
+
     def stop_scan(self) -> None:
         try:
             self.dev.command(SCSI_SCAN, cdb_length=0)
