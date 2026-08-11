@@ -76,12 +76,10 @@ class CheckCondition(PieusbError):
 
     @property
     def must_calibrate(self) -> bool:
-        # "Calibration disable not granted" -- returned by START SCAN when
+        # "Calibration disable not granted": returned by START SCAN when
         # skipShadingAnalysis was requested but the scanner insists on
-        # calibrating. In the SANE backend (sanei_pieusb_decode_sense) this maps
-        # to PIEUSB_STATUS_MUST_CALIBRATE, which is NOT an error: it is the
-        # signal to enter the calibration phase and read shading reference data
-        # (pieusb.c:1091-1121). We treat it the same way.
+        # calibrating. Not an error -- it is the signal to enter the calibration
+        # phase and read shading reference data (pieusb.c:1091-1121).
         return (self.sense_key == SENSE_KEY_UNIT_ATTENTION
                 and self.sense_code == 0x82
                 and self.sense_qualifier == 0x00)

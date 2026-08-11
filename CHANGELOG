@@ -1,61 +1,60 @@
 # v0.3.5
 
+- **`auto_exp` is now "scan with the calibration the scanner reports for itself"**,
+  and no longer runs a preview pass. It reads GET GAIN OFFSET and sends the gain,
+  exposure, offset and light it finds there -- `SCAN_CALIBRATION_AUTO`
+  (`pieusb_specific.c:1988`), which is the C backend's *default* calibration mode
+  (`:733`) and what its working scans run with. The firmware optimises those values
+  per channel while warming up, on this lamp at its current temperature, so they
+  beat anything derivable from outside. Without `auto_exp` the options are sent
+  exactly as set, unchanged
+- **Removed the "calibration from preview" port**, along with `pieusb.calibration`
+  and the extra pass it cost. That path divides by `settings.saturationLevel`, and
+  this hardware never populates it: GET GAIN OFFSET reports `0-0-0` for it cold and
+  warm alike -- confirmed on a PIE ProScan 10T, in the C backend's own captured
+  response (`pieusb_scancmd.c:1136-1146`), and in a SANE trace of the C reading it.
+  A zero there makes `dg` 0, and `updateGain2` turns a `dg` of 0 into gain 0 and
+  exposure 0. There was nothing for a preview to meter against, so there is no
+  longer a preview. `ScanPhase.METERING` is kept for compatibility but never
+  emitted; a scan now reports one sweep of the phases, not two
 - **Fixed the light level being sent as 0 on every scan.** Byte 15 of SET GAIN
   OFFSET is the lamp level; it was hard-coded to 0 with a `# Light, maybe in SANE
-  is 5?` comment. The C never sends 0: its *default* calibration mode is
-  `SCAN_CALIBRATION_AUTO` (`pieusb_specific.c:733`), which echoes back whatever
-  GET GAIN OFFSET reported at byte 75 (`pieusb_scancmd.c:1048`, `1111`), and the
-  DEFAULT and OPTIONS modes send `DEFAULT_LIGHT`/`OPT_LIGHT`, both 4. The
-  documented band is 4..7 -- the firmware starts at 7 or 6 and decrements as the
-  lamp warms, settling at 4, where "the scanner produces stable scans"
-  (`pieusb_scancmd.h:208-213`). This under-exposed *every* scan, manual ones
-  included, and starved auto-exposure's metering pass before its arithmetic ran:
-  the frame it metered was ~20x below the saturation levels it aims at, so it
-  asked for ~20x, got the 3.0x cap, and came out short with no error
-- New `light` option, default 4, so the lamp level is settable and shows up in the
-  option table. `auto_exp` adopts the scanner's own reported value over the
-  default, as the C's AUTO mode does, and falls back to the option (with a
-  warning) if the device reports 0
-- `extraEntries`, byte 16, is now sent as 1 rather than 0, matching SANE's
-  `DEFAULT_ADDITIONAL_ENTRIES`. `sane_start()` notes it sizes the device's BADF
-  table and that leaving it unset costs a "large difference in speed"
-  (`pieusb.c:1027-1033`). `doubleTimes`, byte 17, was already 0 and stays 0. The
-  SET GAIN OFFSET payload now matches `sanei_pieusb_cmd_set_gain_offset()`
-  byte for byte
-- Every pass now logs the exposure, gain, offset and light it actually sent, and
-  auto-exposure logs its device baseline, both at INFO. Auto-exposure restores
-  those options after the scan that derived them, so the log is the only place the
-  values a pass ran with can be seen afterwards
+  is 5?` comment. The C never sends 0 -- AUTO echoes back what GET GAIN OFFSET
+  reported at byte 75 (`pieusb_scancmd.c:1048`, `1111`), and the DEFAULT and OPTIONS
+  modes send `DEFAULT_LIGHT`/`OPT_LIGHT`, both 4. The documented band is 4..7: the
+  firmware starts at 7 or 6 and decrements as the lamp warms, settling at 4, where
+  "the scanner produces stable scans" (`pieusb_scancmd.h:208-213`). This
+  under-exposed *every* scan, manual ones included. Measured on hardware: a scan at
+  the *minimum* exposure (2937) with light 4 reaches the same level as one at
+  maximum exposure with light 0 -- the byte was worth roughly the entire exposure
+  range
+- New `light` option, default 4, so the lamp level is settable and appears in the
+  option table. `auto_exp` adopts the scanner's own value over it
+- `extraEntries` (byte 16) and `doubleTimes` (byte 17) are both sent as 0, which is
+  what a backend trace of a working C scan shows going out with the device's own
+  gain and exposure. Not the `DEFAULT_ADDITIONAL_ENTRIES` of 1 from
+  `pieusb_specific.h:108`: only the DEFAULT and OPTIONS calibration modes assign
+  that, while AUTO leaves the field alone because `get_gain_offset()` does not
+  decode it. The SET GAIN OFFSET payload now matches a captured C payload byte for
+  byte
+- A cold scanner reports zeros for its whole calibration -- exposure
+  `(0, 0, 0, 4100)`, gain `(0, 0, 0, 15)`, light 0 -- and fills the real values in
+  during its first scan. `auto_exp` detects that, warns, and scans with the options
+  as set rather than adopting zeros. Practical consequence: the first `auto_exp`
+  scan of a session is not calibrated, so scan twice and discard the first
+- Every scan logs the exposure, gain, offset and light it actually sent, at INFO.
+  `auto_exp` restores those options afterwards, so the log is the only place the
+  values a scan ran with can be seen after the fact
 - `tests/exercise.py`: new `--gain-offset` prints the scanner's own saturation
   levels, exposure times, gain, offset and light (pair with `--dry-run` for the
-  readout alone). Console logging now shows INFO, which is where the two lines
-  above land; `-v` is still needed for the per-command DEBUG chatter
-- Fixed auto-exposure metering from the wrong baseline, which under-exposed
-  every `auto_exp` scan. The metering pass now seeds `gain_*`/`exp_time_*`/
-  `offset_*` from the scanner's own warm-up calibration (GET GAIN OFFSET) before
-  it previews, which is what the C backend meters from: asked to calibrate "from
-  preview" with no preview yet taken, `sanei_pieusb_set_gain_offset()` falls
-  through to `SCAN_CALIBRATION_AUTO` and reads the device
-  (`pieusb_specific.c:1986-1989`), and `updateGain2()` later multiplies `dg` onto
-  those same values. Before this the baseline was the option defaults, whose
-  `exp_time_*` of 2937 is the device's *minimum* exposure time
-  (`pieusb_scancmd.h:214`) -- the C only ever sends it from
-  `SCAN_CALIBRATION_DEFAULT`, which is neither its default calibration mode nor
-  reachable from the preview path. Metering up from the floor left the 3.0x cap
-  on `dg` to cover the whole distance to a correct exposure, capping what
-  auto-exposure could deliver at roughly a quarter of the hardware's range, and
-  losing the rest with no error and no warning. If the device reports no
-  exposure times the seeding is skipped and the current options are metered from
-  instead, since a scanner that has not finished warming up would otherwise
-  contribute a black frame
-- Auto-exposure no longer leaves its settings behind: `gain_*`/`exp_time_*`/
-  `offset_*` are restored after the scan that derived them, so a second
-  `auto_exp` scan meters from the caller's settings rather than compounding on
-  the first one's amplification. The C reaches the same place by clearing
-  `preview_done` after every non-preview scan (`pieusb.c:1288`), which sends the
-  next scan back to reading the device
-- Only `auto_exp` scans consult the device's calibration; a scan without it runs
-  with the options as set, unchanged from before
+  readout alone). Console logging now shows INFO, which is where the line above
+  lands; `-v` is still needed for the per-command DEBUG chatter
+- `tests/exercise.py` also writes `<prefix>_rgb.tif` (and `_ir.tif`) next to the
+  .npy: uncompressed TIFF at the scan's own bit depth, pixels exactly as scanned.
+  Hand-rolled, because the package has no image-library dependency and Pillow
+  cannot write 16-bit RGB TIFF -- it drops the low byte of every sample, and
+  mis-reads such files too, which is worth knowing if you have been inspecting
+  scans through it
 
 # v0.3.3
 

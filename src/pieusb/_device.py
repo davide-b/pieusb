@@ -2,10 +2,10 @@ from pieusb.usb_utils import find_device
 from pieusb.transport import UASDevice, SCSI_INQUIRY
 from pieusb.scanner import Scanner
 
-from pieusb.inquiry import KNOWN_PIDS, PIE_VENDOR_ID, parse_inquiry
+from pieusb.inquiry import KNOWN_PIDS, PIE_VENDOR_ID, InquiryResponse, parse_inquiry
 from pieusb.types import DeviceInfo
 
-def _get_inquiry(dev: UASDevice):# -> InquiryResponse:
+def _get_inquiry(dev: UASDevice) -> InquiryResponse:
     header = dev.command(SCSI_INQUIRY, in_size=5, cdb_length=5)
     additional_length = header[4]
     total_size = additional_length + 4
@@ -30,8 +30,7 @@ def get_devices() -> list[DeviceInfo]:
 
     return devices
 
-# Probably unnecessary.
-# The user can just s = Scanner(devices[0]) or with Scanner(devices[0]) as s
-# Device gets "opened" in the Scanner constructor
+# Convenience alias; Scanner(dev) or `with Scanner(dev) as s` does the same, and
+# opens the device in the constructor either way.
 def open(dev: DeviceInfo) -> Scanner:
     return Scanner(dev)

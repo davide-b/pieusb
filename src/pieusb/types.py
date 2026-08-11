@@ -78,9 +78,7 @@ class DeviceInfo:
     inquiry: InquiryResponse
 
 class ScanPhase(StrEnum):
-    # Every phase of the auto-exposure preview pass reports as METERING, so a
-    # progress bar sees one 0->1 sweep for it and a second for the real scan,
-    # rather than two indistinguishable SCANNING sweeps.
+    # Never emitted. Kept so consumers matching on it still compile.
     METERING = 'Metering'
     CONFIGURING = 'Configuring'
     WARMING_UP = 'Warming up'
@@ -94,10 +92,9 @@ class UpdateData:
 
     `progress` runs 0.0 -> 1.0 within `phase` and says nothing about the scan as a
     whole: each phase sweeps the range again, and how many phases a scan has
-    depends on the options (auto-exposure adds a metering pass, a reused
-    calibration removes CALIBRATING). A phase whose length the device does not
-    tell us in advance reports 0.0 throughout, so treat a phase change as the
-    real event and `progress` as detail within it.
+    depends on the options (a reused calibration removes CALIBRATING). A phase
+    whose length the device does not report in advance stays at 0.0 throughout, so
+    treat a phase change as the event and `progress` as detail within it.
     '''
     phase: ScanPhase
     progress: float = 0.0
@@ -107,8 +104,8 @@ class ScanResult:
     '''What a finished scan reports, delivered exactly once per scan().
 
     `rgb` is (height, width, 3) and `ir` is (height, width); both are None if the
-    scan was cancelled or failed, so `error` is the only channel through which a
-    worker-thread failure reaches the caller -- check it before using `rgb`.
+    scan was cancelled or failed. `error` is the only channel through which a
+    worker-thread failure reaches the caller, so check it before using `rgb`.
 
     `width`/`height` come from the device's own GET PARAMETERS mid-scan, not from
     the requested frame, and can differ from what the options asked for.

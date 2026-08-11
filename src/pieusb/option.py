@@ -46,50 +46,42 @@ MODE_SETTINGS = {
 }
 
 # How many planes a mode produces, i.e. how many tagged line blocks the scanner
-# sends per image. Mirrors MODE_PLANES in the PoC (poc:462).
+# sends per image.
 MODE_PLANES = {'gray': 1, 'rgb': 3, 'rgbi': 4}
 
-# Modes this library can read back but not yet decode. 'gray' maps to
-# SCAN_COLOR_FORMAT_PIXEL, so its lines carry no 'RR'/'GG'/'BB'/'II' tag and the
-# tag-based deinterleave in Scanner does not apply -- per pieusb_scancmd.h:165-173
-# the data comes back as RGB pixel triples of which only the first is valid.
-# Nothing has ever exercised that layout on hardware, so rather than guess at it
-# in the worker, validate() refuses the mode outright. See TODO 12a.
+# Refused by validate(): 'gray' uses SCAN_COLOR_FORMAT_PIXEL, whose lines carry no
+# channel tag, so Scanner's tag-based deinterleave cannot decode it. The data comes
+# back as RGB pixel triples of which only the first is valid
+# (pieusb_scancmd.h:165-173).
 UNSUPPORTED_MODES = ('gray',)
 
-# Sample sizes the deinterleave in Scanner._scan_pass understands. INQUIRY can
-# advertise 1/4/10/12 as well, but only 8 and 16 map cleanly onto a numpy dtype
-# and only those two have been seen on the wire.
+# Sample sizes the deinterleave in Scanner._scan_pass understands. INQUIRY may
+# advertise 1/4/10/12 too; only these map onto a numpy dtype.
 SUPPORTED_COLOR_DEPTHS = (8, 16)
 
 # 'colorDepth' bitmask, pieusb_specific.h:64-70
 COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
 
-# 'lineThreshold', where 0xFF is 100%. Only meaningful for the lineart/halftone
-# modes, which aren't supported yet. The C backend derives it from OPT_THRESHOLD
-# (pieusb_specific.c:1864); 128 is what the cyberview capture quoted in
-# pieusb_scancmd.c:757 sends, and what the PoC uses.
+# 'lineThreshold', 0xFF being 100%. Only meaningful for the unsupported
+# lineart/halftone modes. 128 is what the capture in pieusb_scancmd.c:757 sends.
 LINE_THRESHOLD = 128
 
-# The only relative-exposure value SANE ever sends, for any filter, in any
-# calibration mode (pieusb.c:878-882). See the exp_rel_* options.
+# The only relative-exposure value SANE ever sends (pieusb.c:878-882).
 DEFAULT_RELATIVE_EXPOSURE = 100
 
-# Light level to fall back on when the device does not report one of its own.
-# SANE's DEFAULT_LIGHT (pieusb_specific.h:107), which is also OPT_LIGHT's default,
-# and the value the firmware settles at once the lamp is warm
-# (pieusb_scancmd.h:208-213). See the 'light' option.
+# Light level used when the device reports none of its own. SANE's DEFAULT_LIGHT
+# (pieusb_specific.h:107) and the value the firmware settles at once warm.
 DEFAULT_LIGHT = 4
 
-# 'extraEntries', byte 16 of SET GAIN OFFSET. SANE's DEFAULT_ADDITIONAL_ENTRIES
-# (pieusb_specific.h:108); it has no option, and every calibration mode sends 1.
-# sane_start() notes that it drives the size of the device's BADF table and that
-# leaving it unset costs a "large difference in speed" (pieusb.c:1027-1033).
-ADDITIONAL_ENTRIES = 1
+# 'extraEntries', byte 16 of SET GAIN OFFSET. Sizes the device's BADF table
+# (pieusb.c:1027-1033). 0 is what the C sends alongside the device's own gain and
+# exposure: SCAN_CALIBRATION_AUTO leaves the field untouched because
+# get_gain_offset() does not decode it (pieusb_scancmd.c:1042-1051). The
+# DEFAULT_ADDITIONAL_ENTRIES of 1 belongs to the DEFAULT and OPTIONS modes only.
+ADDITIONAL_ENTRIES = 0
 
-# 'doubleTimes', byte 17. SANE's DEFAULT_DOUBLE_TIMES (pieusb_specific.h:109) and
-# OPT_DOUBLE_TIMES' default. Undocumented beyond the name, and no shipping driver
-# sends anything else, so it stays a constant rather than becoming an option.
+# 'doubleTimes', byte 17. Undocumented beyond the name; no driver sends anything
+# but SANE's DEFAULT_DOUBLE_TIMES (pieusb_specific.h:109).
 DOUBLE_TIMES = 0
 
 class Unit(Enum):
@@ -99,10 +91,8 @@ class Unit(Enum):
     MICROSECONDS = 3
     NONE = 4
     PERCENT = 5
-    # Timer 1 counts: the unit the scanner's own exposure times are expressed in.
-    # Not convertible to a wall-clock duration without the Timer 1 clock rate,
-    # which the device does not report -- hence its own unit rather than
-    # MICROSECONDS.
+    # The unit the scanner's exposure times use. Not convertible to a duration
+    # without the Timer 1 clock rate, which the device does not report.
     TIMER_COUNTS = 6
 
 T = TypeVar("T")
@@ -124,8 +114,7 @@ class Parameter:
 class OptionsTable:
     def __init__(self, params: list[Parameter], inq: InquiryResponse) -> None:
         self.table = params
-        # Kept so validate() can re-check the frame against the device's own
-        # reported bed rather than trusting the per-option validators alone.
+        # Kept so validate() can re-check the frame against the reported bed.
         self.inq = inq
 
     def __getitem__(self, key) -> Parameter:
@@ -138,21 +127,12 @@ class OptionsTable:
     def validate(self) -> None:
         '''Validate the table as a whole, before anything reaches the device.
 
-        Two jobs, in order:
-
-        1. Re-run every per-option validator. Values normally arrive through
-           Scanner.__setitem__, which validates -- but the attribute interface
-           DESIGN.md specifies does not exist yet, and any future write path that
-           misses the check would otherwise reach SET SCAN FRAME unvalidated.
-           Getting the frame wrong has already cost this project one carriage
-           crash, so this re-checks rather than trusts.
-        2. The cross-option checks a single-option validator structurally cannot
-           express -- the frame corners against each other and against the bed,
-           and the mode/quality-bit combinations.
+        Re-runs every per-option validator, then applies the cross-option checks a
+        single-option validator cannot express: the frame corners against each
+        other and against the bed, and the mode/quality-bit combinations.
 
         Raises ParamError, naming the offending option(s). Combinations that are
-        merely ineffective rather than contradictory are logged as warnings, the
-        way sanei_pieusb_analyse_options does (pieusb_specific.c:1518-1620).
+        merely ineffective rather than contradictory are logged as warnings.
         '''
         for par in self.table:
             if type(par.value) is not par.opt.type:
@@ -172,12 +152,10 @@ class OptionsTable:
         if tl_y >= br_y:
             raise ParamError(f"Parameter 'tl_y' ({tl_y}) must be smaller than parameter 'br_y' ({br_y})")
 
-        # The frame against the bed the device itself reports (INQUIRY offsets
-        # 40/42, native-resolution units). The PoC added the same check after a
-        # real carriage crash caused by an X/Y axis mix-up (poc:690-703): X is the
-        # long axis, Y the short one, and swapping them drives the head off its
-        # rail. Asserted here even though br_x/br_y have their own validators,
-        # because this is the last gate before SET SCAN FRAME.
+        # The frame against the bed the device reports (INQUIRY offsets 40/42, in
+        # native-resolution units). X is the long axis and Y the short one;
+        # swapping them drives the head off its rail, so this is checked again
+        # here, the last gate before SET SCAN FRAME.
         if tl_x < 0 or br_x > self.inq.max_scan_w:
             raise ParamError(
                 f"Requested X range [{tl_x}, {br_x}] exceeds the scanner's reported bed "
@@ -204,9 +182,8 @@ class OptionsTable:
                 f"supported: {', '.join(str(d) for d in SUPPORTED_COLOR_DEPTHS)}"
             )
 
-        # 'sharpen' is documented as "only effective with fastInfrared off"
-        # (pieusb_scancmd.h:180), so asking for both is a contradiction rather
-        # than a preference -- the scanner would silently drop one of them.
+        # "Only effective with fastInfrared off" (pieusb_scancmd.h:180), so asking
+        # for both is a contradiction; the scanner would silently drop one.
         if self['sharpen'].value and self['fast_infrared'].value:
             raise ParamError(
                 "Options 'sharpen' and 'fast_infrared' are mutually exclusive: sharpening is "
@@ -220,11 +197,10 @@ class OptionsTable:
             log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
         if self['advance'].value:
             log.warning("option 'advance' is not implemented yet and will be ignored: "
-                        "slide-transport commands are not sent (TODO 12c)")
+                        "slide-transport commands are not sent")
 
-        # Unexplored rather than wrong, so this warns instead of refusing -- but
-        # it warns every scan, because a stray relative exposure is invisible in
-        # the result and silently undermines auto-exposure's reference levels.
+        # Warns every scan rather than refusing: a stray relative exposure is
+        # invisible in the result.
         moved = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
             if self[n].value != DEFAULT_RELATIVE_EXPOSURE
@@ -232,9 +208,8 @@ class OptionsTable:
         if moved:
             log.warning(
                 f"relative exposure moved off {DEFAULT_RELATIVE_EXPOSURE}% ({', '.join(moved)}). "
-                f"No shipping driver sends anything but {DEFAULT_RELATIVE_EXPOSURE}, the device's "
-                f"response is unknown, and auto exposure's saturation reference assumes "
-                f"{DEFAULT_RELATIVE_EXPOSURE}. Prefer exp_time_* to change exposure."
+                f"No shipping driver sends anything else and the device's response is "
+                f"unknown. Prefer exp_time_* to change exposure."
             )
 
 def generate_options(inq: InquiryResponse) -> OptionsTable:
@@ -273,9 +248,7 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=300
     )))
 
-    # Halftone
-
-    # Increase sharpness by giving more time to the CCD to discharge between each line.
+    # Increase sharpness by giving the CCD more time to discharge between lines.
     # Only effective with 'fast_infrared' off and a one-pass colour mode
     # (pieusb_scancmd.h:180).
     out.append(Parameter(Option(
@@ -286,20 +259,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Try to reuse the shading (flat-field) reference an earlier scan on this
-    # Scanner already acquired, instead of acquiring a fresh one. BEST EFFORT in
-    # two ways, neither of which can produce an uncorrected image:
+    # Reuse the shading (flat-field) reference an earlier scan on this Scanner
+    # acquired instead of acquiring a fresh one. BEST EFFORT, and neither failure
+    # mode can produce an uncorrected image:
     #
-    #  - The scanner may refuse. Asking to skip sets the skipShadingAnalysis
-    #    quality bit in SET MODE, and the scanner answers START SCAN with
-    #    MUST_CALIBRATE when it wants to calibrate regardless -- after a power
-    #    cycle, or when its own drift checks say the reference is stale.
-    #  - There may be nothing to reuse. Shading correction is applied on the
-    #    host, so a reference is only cached once a pass has read one; with an
-    #    empty cache Scanner acquires anyway, whatever this option says.
+    #  - The scanner may refuse, answering START SCAN with MUST_CALIBRATE.
+    #  - With nothing cached to reuse, Scanner acquires anyway.
     #
-    # Off by default: acquiring is correct always, reusing only saves the
-    # calibration pass. See Scanner._scan_pass.
+    # Only ever saves a calibration pass. See Scanner._scan_pass.
     out.append(Parameter(Option(
         name='reuse_calibration',
         type=bool,
@@ -318,9 +285,14 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=False
     )))
 
-    # Run a preview pass first and derive gain_*/exp_time_* from it, rather than
-    # scanning with whatever they currently hold. Costs one extra pass at the
-    # device's preview resolution; see pieusb.calibration.
+    # Take gain_*, exp_time_*, offset_* and light from GET GAIN OFFSET instead of
+    # from whatever those options hold. The firmware optimises them per channel
+    # while warming up; this is the C's default calibration mode
+    # (SCAN_CALIBRATION_AUTO, pieusb_specific.c:733, 1988) and costs no extra pass.
+    #
+    # The scanner only fills those fields in during its first scan, so the first
+    # auto_exp scan of a session finds zeros, warns and runs with the options as
+    # set. Scan twice. See Scanner._adopt_device_calibration.
     out.append(Parameter(Option(
         name='auto_exp',
         type=bool,
@@ -376,30 +348,24 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
 
     # --- Exposure -------------------------------------------------------------
     #
-    # The scanner has TWO independent exposure controls, sent by two different
-    # commands. They are not alternative spellings of one setting, and mixing
-    # them up is easy, so they are named apart here:
+    # Two independent controls, sent by different commands. Easy to confuse, hence
+    # the distinct names:
     #
-    #   exp_time_*  ABSOLUTE. Integration time in Timer 1 counts, one per filter
-    #               including infrared, carried by SET GAIN OFFSET. This is the
-    #               real exposure knob and the one auto-exposure moves.
-    #   exp_rel_*   RELATIVE. A percentage, R/G/B only, sent by the SCSI_EXPOSURE
-    #               write. See below -- leave it alone.
+    #   exp_time_*  ABSOLUTE integration time in Timer 1 counts, one per filter
+    #               including infrared, carried by SET GAIN OFFSET.
+    #   exp_rel_*   RELATIVE percentage, R/G/B only, sent by SCSI_EXPOSURE.
+    #               See below -- leave it alone.
     #
-    # ABSOLUTE. The firmware optimises these during warm-up so that R and B reach
-    # >=90% of full scale and G >=80% (pieusb_scancmd.h:188-197) -- that is the
-    # device's own white balance against a green-heavy lamp -- and then usually
-    # resets them to 0x0B79 = 2937, which is what SANE's DEFAULT_EXPOSURE sends
-    # back (pieusb_specific.h:105).
+    # The firmware optimises exp_time_* during warm-up until R and B reach >=90% of
+    # full scale and G >=80% (pieusb_scancmd.h:188-197), then usually resets them
+    # to 0x0B79 = 2937, SANE's DEFAULT_EXPOSURE (pieusb_specific.h:105).
     #
-    # Raising this is the expensive way to brighten a scan: it is the per-line
-    # integration period, so it scales scan time and lamp-on time one for one.
-    # pieusb.calibration therefore only spends half its correction here (in log
-    # terms) and takes the other half in gain.
+    # This is the per-line integration period, so raising it scales scan time and
+    # lamp-on time one for one. Prefer gain_*, or 'light' within its 4..7 band.
     #
     # The advertised maximum is multiplied by 4 because it does not otherwise
     # contain 2937 -- the device's own default is out of its own reported range.
-    # SANE hits the same wall and applies the same factor (pieusb_specific.c:391).
+    # SANE applies the same factor (pieusb_specific.c:391).
     DEFAULT_EXPOSURE_TIME = 2937
     exposure_time_max = inq.maximum_exposure * 4
     for filt in ('r', 'g', 'b', 'i'):
@@ -411,26 +377,19 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
             default=DEFAULT_EXPOSURE_TIME
         )))
 
-    # RELATIVE. A percentage scaling applied on top of the absolute exposure
-    # time, sent as a 16-bit field per filter by the SCSI_EXPOSURE write
-    # (pieusb_scancmd.c:521-544). Infrared has no entry: the C struct holds three
-    # colours and the loop runs 0..2.
+    # RELATIVE percentage on top of the absolute exposure time, a 16-bit field per
+    # filter sent by SCSI_EXPOSURE (pieusb_scancmd.c:521-544). Infrared has no
+    # entry: the C struct holds three colours.
     #
-    # PROBABLY LEAVE THIS AT 100. It is exposed for experiments, not for tuning:
+    # LEAVE THIS AT 100. Exposed for experiments, not for tuning:
     #
-    #   - SANE hard-codes all three to 100 and never varies them, auto-exposure
-    #     included (pieusb.c:878-882, 927). There is no SANE option for it, so
-    #     no value other than 100 has ever been exercised against this hardware
-    #     by a shipping driver.
-    #   - It is redundant with exp_time_*, which covers the same ground with a
-    #     known range and a known meaning.
-    #   - Nothing here knows what the device does out of range, or whether >100
-    #     is even accepted; the bound below is the width of the wire field, not a
-    #     documented limit. Only 100 is known-good.
-    #   - Auto-exposure meters the preview against saturation levels the firmware
-    #     measured at warm-up with this at 100. Changing it silently invalidates
-    #     that reference, so pieusb.calibration's arithmetic stops meaning what
-    #     it says.
+    #   - SANE hard-codes all three to 100 and never varies them (pieusb.c:878-882,
+    #     927), so no other value has been exercised against this hardware.
+    #   - Redundant with exp_time_*, which has a known range and meaning.
+    #   - The bound below is the width of the wire field, not a documented limit;
+    #     what the device does outside 100 is unknown.
+    #   - The gain and exposure times auto_exp adopts were optimised by the
+    #     firmware with this at 100, so moving it invalidates them.
     #
     # OptionsTable.validate() warns if you move it, rather than refusing.
     for filt in ('r', 'g', 'b'):
@@ -516,9 +475,8 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         default=0
     )))
 
-    # Light level, byte 15 of SET GAIN OFFSET. Sent on EVERY scan, so a wrong
-    # value here starves the whole acquisition -- auto-exposure included, since
-    # its metering pass goes out through the same command.
+    # Lamp level, byte 15 of SET GAIN OFFSET. Sent on every scan and it scales the
+    # whole acquisition, so a wrong value starves everything downstream.
     #
     #   "Current light level. The stability of the light source is tested during
     #    warming up. The check starts with a light value 7 or 6, and decrements
@@ -526,16 +484,10 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
     #    stable scans (i.e. successive 'white' scan values don't differ more than
     #    0x200)." (pieusb_scancmd.h:208-213)
     #
-    # So the documented operating band is 4..7 and 4 is the warmed-up value; SANE
-    # calls it a duration in microseconds (pieusb_specific.c:916). The C never
-    # sends 0: SCAN_CALIBRATION_AUTO -- its DEFAULT calibration mode
-    # (pieusb_specific.c:733) -- echoes back whatever GET GAIN OFFSET reported at
-    # byte 75 (pieusb_scancmd.c:1048, 1111), and the DEFAULT and OPTIONS modes
-    # send DEFAULT_LIGHT (pieusb_specific.h:107) or OPT_LIGHT, both 4.
-    #
-    # The range is the width of the wire field rather than a documented limit,
-    # like exp_rel_*: nothing here knows what the device does outside 4..7.
-    # auto_exp adopts the device's own value over this default (_seed_from_device).
+    # So the operating band is 4..7, with 4 the warmed-up value; SANE types it as a
+    # duration in microseconds (pieusb_specific.c:916). The range below is the
+    # width of the wire field, not a documented limit. auto_exp adopts the device's
+    # own value over this default (Scanner._adopt_device_calibration).
     out.append(Parameter(Option(
         name='light',
         type=int,
@@ -550,23 +502,22 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
                 skip_shading_analysis: bool = False) -> None:
     """Send every option to the device, in the order the scan sequence needs.
 
-    `skip_shading_analysis` is passed rather than read off the options table:
-    whether a pass can skip acquiring a shading reference depends on what the
-    Scanner has cached, not on the option alone (see 'reuse_calibration').
+    `skip_shading_analysis` is a parameter rather than an option because whether a
+    pass can skip acquiring a shading reference depends on what the Scanner has
+    cached, not on 'reuse_calibration' alone.
     """
-    # Hard-coded in SANE. Experiment with setting different values
+    # Highlight and shadow, hard-coded to 100 in SANE (pieusb.c:884-887).
     for filt, value in ((0x02, 100), (0x04, 100), (0x08, 100)):
         payload = struct.pack("<HHHH", SCSI_HIGHLIGHT_SHADOW, 4, filt, value)
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
 
-    # RELATIVE exposure, a percentage. NOT the same quantity as exp_time_*, which
-    # is an absolute integration time and goes out with SET GAIN OFFSET below.
-    # Three filters only -- infrared has no relative-exposure entry.
+    # RELATIVE exposure, a percentage -- not exp_time_*, which is an absolute
+    # integration time and goes out with SET GAIN OFFSET below. Three filters only.
     for filt, name in ((0x02, 'exp_rel_r'), (0x04, 'exp_rel_g'), (0x08, 'exp_rel_b')):
         payload = struct.pack("<HHHH", SCSI_EXPOSURE, 4, filt, options[name].value)
         dev.command(SCSI_WRITE, out_data=payload, cdb_length=8)
 
-    index = 128 # Trust me bro
+    index = 128 # Frame index; the scanner accepts this one.
     x0 = options["tl_x"].value
     y0 = options["tl_y"].value
     x1 = options["br_x"].value
@@ -574,10 +525,9 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     payload = struct.pack("<HHHHHHH", SCSI_SCAN_FRAME, 10, index, x0, y0, x1, y1)
     dev.command(SCSI_WRITE, out_data=payload, cdb_length=14)
 
-    # Set ABSOLUTE exposure time, gain and offset -- and the light level, which is
-    # part of the same command and is what makes the exposure mean anything. Byte
-    # for byte this is sanei_pieusb_cmd_set_gain_offset() (pieusb_scancmd.c:1102-1116);
-    # bytes 9-11, 21 and 23-28 are the ones it leaves zeroed.
+    # ABSOLUTE exposure time, gain, offset and lamp level, all one command. Byte
+    # for byte sanei_pieusb_cmd_set_gain_offset() (pieusb_scancmd.c:1102-1116);
+    # bytes 9-11, 21 and 23-28 are unused.
     payload = struct.pack('<HHHBBBBBBBBBBBBHBBBBBBBBB',
         options['exp_time_r'].value,
         options['exp_time_g'].value,
@@ -602,9 +552,8 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     )
     dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload, cdb_length=29)
 
-    # Set mode -- MODE SELECT, a fixed 16-byte payload built byte by byte, per
-    # sanei_pieusb_cmd_set_mode() (pieusb_scancmd.c:731-800). Bytes 0, 7, 10, 11
-    # and 15 are unused and stay zero.
+    # MODE SELECT, a fixed 16-byte payload per sanei_pieusb_cmd_set_mode()
+    # (pieusb_scancmd.c:731-800). Bytes 0, 7, 10, 11 and 15 are unused.
     passes, color_format = MODE_SETTINGS[options['mode'].value]
 
     # Quality bitmask, byte 9 (pieusb_scancmd.c:790-794)
@@ -612,7 +561,6 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     if options['sharpen'].value:
         quality |= 0x02
     if skip_shading_analysis:
-        # skipShadingAnalysis, set when shading analysis is *not* wanted, as in
         # skipShadingAnalysis = !OPT_SHADING_ANALYSIS (pieusb_specific.c:1857).
         quality |= 0x08
     if options['fast_infrared'].value:
@@ -628,6 +576,6 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     payload[9] = quality
     payload[12] = 0x00 # halftonePattern; the C backend only ever sends 0
     payload[13] = LINE_THRESHOLD
-    payload[14] = 0x10 # Unexplained, but sent unconditionally by the C backend
-                       # (pieusb_scancmd.c:797) and present in the cyberview capture
+    payload[14] = 0x10 # Unexplained; sent unconditionally by the C backend
+                       # (pieusb_scancmd.c:797) and present in the capture there
     dev.command(SCSI_MODE_SELECT, out_data=bytes(payload), cdb_length=16)

@@ -13,35 +13,37 @@ nothing here is a unit test.
     python tests/exercise.py --mode rgbi --resolution 2000 --frame-mm 0 0 36 24
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
 
-The light level is byte 15 of SET GAIN OFFSET and scales the whole acquisition;
-it used to be sent as 0, which is outside the device's documented 4..7 band. It
-now defaults to 4 and auto-exposure adopts whatever the scanner reports. To
-compare by hand:
+auto_exp takes gain, exposure, offset and light from GET GAIN OFFSET. The firmware
+only fills those in during its first scan, so the first auto_exp scan of a session
+finds zeros and runs with the options as set. Scan twice:
 
-    python tests/exercise.py --gain-offset                    # what the lamp is at now
-    python tests/exercise.py -o light=4 --output light4       # ... and 5, 6, 7
-    python tests/exercise.py -o auto_exp=true --output auto   # what auto-exposure picks
+    python tests/exercise.py --gain-offset --dry-run          # (0,0,0,...) when cold
+    python tests/exercise.py -o auto_exp=true --output warmup # discard this one
+    python tests/exercise.py -o auto_exp=true --output auto   # the real one
 
-Every pass logs the exposure, gain, offset and light it actually sent, and
-auto-exposure logs its baseline and the gain increase it derived, at INFO -- so
-the numbers behind a scan are on the console without needing -v.
+Or set the exposure by hand, keeping light in the device's 4..7 band:
 
-Ctrl-C during a scan cancels it cleanly (STOP SCAN at the next chunk boundary)
-rather than leaving the device mid-acquisition.
+    python tests/exercise.py -o light=4 -o exp_time_r=4100 --output manual
 
-Results are written as .npy: <prefix>_rgb.npy with shape (height, width, 3) and,
-for rgbi scans, <prefix>_ir.npy with shape (height, width). --png also writes an
-8-bit preview if Pillow happens to be installed.
+Every scan logs the exposure, gain, offset and light it sent, at INFO.
+
+Ctrl-C during a scan cancels it cleanly (STOP SCAN at the next chunk boundary).
+
+Results are written as <prefix>_rgb.npy, shape (height, width, 3), plus
+<prefix>_ir.npy for rgbi scans -- and as <prefix>_rgb.tif / <prefix>_ir.tif,
+uncompressed TIFF at the scan's own bit depth, for anything that opens images.
+Pixels are exactly as scanned: a negative stays a negative. --png also writes an
+8-bit PNG if Pillow is installed.
 '''
 
 import argparse
 import logging
+import struct
 import sys
 import time
 from pathlib import Path
 
-# The package is not installed in .venv yet (TODO 27), so make `python
-# tests/exercise.py` work from a checkout without PYTHONPATH=src.
+# Run from a checkout without PYTHONPATH=src or an install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 import numpy
@@ -49,7 +51,7 @@ import numpy
 import pieusb
 from pieusb.exceptions import DeviceNotReady, ParamError, PieusbError, WarmingUp
 from pieusb.option import Unit
-from pieusb.scanner import Scanner  # not exported from __init__ yet (TODO 18)
+from pieusb.scanner import Scanner
 from pieusb.types import DeviceInfo, ScanPhase, ScanResult, UpdateData
 
 MM_PER_INCH = 25.4
@@ -81,9 +83,8 @@ def describe(index: int, info: DeviceInfo) -> None:
 def native_to_mm(value: int, inq) -> float:
     '''Frame coordinates are in native-resolution units, not scan dpi.
 
-    Confirmed on hardware (poc:648-658) and matching the C backend, which
-    converts with a single `maximum_resolution / MM_PER_INCH` for both axes
-    (sanei_pieusb_set_frame_from_options, pieusb_specific.c:1791).
+    Both axes convert with maximum_resolution / MM_PER_INCH, as in
+    sanei_pieusb_set_frame_from_options (pieusb_specific.c:1791).
     '''
     return value / inq.max_resolution_x * MM_PER_INCH
 
@@ -93,13 +94,10 @@ def mm_to_native(value: float, inq) -> int:
 
 
 def report_gain_offset(scanner: Scanner) -> None:
-    '''Print the scanner's own idea of its calibration: GET GAIN OFFSET.
+    '''Print the scanner's own calibration: GET GAIN OFFSET.
 
-    These are the values the C backend's default calibration mode adopts before
-    every scan (SCAN_CALIBRATION_AUTO, pieusb_specific.c:733, 1986-1989), and the
-    ones auto-exposure meters from here. Worth seeing before blaming the exposure
-    arithmetic: saturation levels are the target it aims at, and 'light' scales
-    everything the sensor sees.
+    These are the values auto_exp adopts. Zeros mean the firmware has not measured
+    them yet, which it does during its first scan.
     '''
     s = scanner._get_gain_offset()
     print("\nScanner-reported calibration (GET GAIN OFFSET):")
@@ -149,9 +147,8 @@ def coerce(name: str, raw: str, target: type):
 def set_frame(scanner: Scanner, x0: int, y0: int, x1: int, y1: int) -> None:
     '''Assign the four frame corners, reporting a bed overrun in both unit systems.
 
-    Scanner.__setitem__ validates each corner but can only say "invalid value";
-    for the one option where a bad number moves the carriage, the caller deserves
-    the actual limit.
+    Scanner validates each corner but can only say "invalid value"; a bad number
+    here moves the carriage, so report the actual limit.
     '''
     inq = scanner.params.inq
     for name, value, limit in (('tl_x', x0, inq.max_scan_w), ('tl_y', y0, inq.max_scan_h),
@@ -198,8 +195,7 @@ def apply_options(scanner: Scanner, args) -> None:
 def report_frame(scanner: Scanner) -> None:
     '''Print the frame in both unit systems before anything is sent.
 
-    An X/Y mix-up here once drove the carriage off its rail, which is why
-    OptionsTable.validate() re-checks the bounds and why this prints them.
+    An X/Y mix-up drives the carriage off its rail, hence printing the bounds.
     '''
     inq = scanner.params.inq
     x0, y0 = scanner.params['tl_x'].value, scanner.params['tl_y'].value
@@ -222,8 +218,8 @@ def report_frame(scanner: Scanner) -> None:
 class Progress:
     '''Renders UpdateData as a single rewritten terminal line.
 
-    Both callbacks run on the worker thread, so this must not block -- a slow
-    callback stalls the read loop.
+    Runs on the worker thread, so it must not block: a slow callback stalls the
+    read loop.
     '''
 
     def __init__(self) -> None:
@@ -241,12 +237,11 @@ class Progress:
             self.phase_started = now
             header = f"[{now - self.started:7.1f}s] {u.phase}"
             # Without a TTY the bar cannot be rewritten in place, so the header
-            # gets its own line and only the phase's last update is reported.
+            # gets its own line and only the phase's last update is printed.
             print(header, end='' if self.tty else '\n', flush=True)
             self.line_open = self.tty
 
-        # Phases the device gives no length for sit at 0.0 throughout; the header
-        # above is all there is to show for them.
+        # Phases with no reported length stay at 0.0; the header is all there is.
         if u.progress <= 0:
             return
 
@@ -317,14 +312,87 @@ def report_result(r: ScanResult, args) -> int:
         numpy.save(ir_path, r.ir)
         print(f"  saved {ir_path}")
 
+    save_tiffs(r, prefix)
+
     if args.png:
         save_png(r, prefix)
     return 0
 
 
+def write_tiff(path: Path, image: numpy.ndarray) -> None:
+    '''Write a baseline TIFF: uncompressed, little-endian, 8- or 16-bit, grey or RGB.
+
+    Hand-rolled because the package has no image-library dependency, and because
+    Pillow cannot write 16-bit RGB TIFF -- it drops the low byte of every sample.
+
+    Pixels are written exactly as scanned: no inversion, gamma or level stretch.
+    Same data as the .npy, in something a viewer will open.
+    '''
+    a = numpy.ascontiguousarray(image)
+    if a.ndim == 2:
+        a = a[:, :, numpy.newaxis]
+    height, width, samples = a.shape
+    if samples not in (1, 3):
+        raise ValueError(f"can only write 1 or 3 samples per pixel, not {samples}")
+    if a.dtype.kind != 'u' or a.dtype.itemsize not in (1, 2):
+        raise ValueError(f"can only write uint8 or uint16 pixels, not {a.dtype}")
+    a = a.astype(f'<u{a.dtype.itemsize}', copy=False)
+    bits = a.dtype.itemsize * 8
+
+    SHORT, LONG = 3, 4
+    # (tag, type, count, value). A value of None is patched below with the offset
+    # of its out-of-line data, which is what a value wider than 4 bytes carries.
+    tags = [
+        (256, SHORT, 1, width),                 # ImageWidth
+        (257, SHORT, 1, height),                # ImageLength
+        (258, SHORT, samples, None if samples > 2 else bits),  # BitsPerSample
+        (259, SHORT, 1, 1),                     # Compression: none
+        (262, SHORT, 1, 2 if samples == 3 else 1),  # Photometric: RGB / BlackIsZero
+        (273, LONG, 1, None),                   # StripOffsets
+        (277, SHORT, 1, samples),               # SamplesPerPixel
+        (278, SHORT, 1, height),                # RowsPerStrip: the whole image
+        (279, LONG, 1, a.nbytes),               # StripByteCounts
+        (284, SHORT, 1, 1),                     # PlanarConfiguration: chunky
+    ]
+
+    header_size = 8
+    ifd_size = 2 + 12 * len(tags) + 4
+    # Out-of-line BitsPerSample, when there is one, then the pixels.
+    extra = struct.pack(f'<{samples}H', *([bits] * samples)) if samples > 2 else b''
+    bits_offset = header_size + ifd_size
+    pixel_offset = bits_offset + len(extra)
+
+    out = bytearray()
+    out += struct.pack('<2sHI', b'II', 42, header_size)
+    out += struct.pack('<H', len(tags))
+    for tag, typ, count, value in tags:
+        if value is None:
+            value = bits_offset if tag == 258 else pixel_offset
+        # A SHORT with count 1 sits in the low half of the 4-byte value field,
+        # which in a little-endian file is what packing it as a LONG produces.
+        out += struct.pack('<HHII', tag, typ, count, value)
+    out += struct.pack('<I', 0)                 # no next IFD
+    out += extra
+    assert len(out) == pixel_offset, (len(out), pixel_offset)
+    out += a.tobytes()
+
+    path.write_bytes(bytes(out))
+
+
+def save_tiffs(r: ScanResult, prefix: Path) -> None:
+    '''Write the scan as viewable TIFFs alongside the .npy.'''
+    rgb_path = prefix.with_name(prefix.name + '_rgb.tif')
+    write_tiff(rgb_path, r.rgb)
+    print(f"  saved {rgb_path}  ({r.rgb.dtype.itemsize * 8}-bit RGB, as scanned)")
+    if r.ir is not None:
+        ir_path = prefix.with_name(prefix.name + '_ir.tif')
+        write_tiff(ir_path, r.ir)
+        print(f"  saved {ir_path}  ({r.ir.dtype.itemsize * 8}-bit grey, as scanned)")
+
+
 def save_png(r: ScanResult, prefix: Path) -> None:
-    '''Optional eyeball check. Pillow is not a dependency -- DESIGN.md returns
-    numpy only -- so this is best-effort and 8-bit.'''
+    '''Optional 8-bit preview. Pillow is not a dependency, so this is
+    best-effort.'''
     try:
         from PIL import Image
     except ImportError:
@@ -394,10 +462,8 @@ def setup_logging(args) -> None:
     root.setLevel(logging.DEBUG if (args.verbose or args.log) else logging.INFO)
 
     console = logging.StreamHandler(sys.stderr)
-    # INFO rather than WARNING: that level is a handful of lines per scan, and it
-    # is where the settings each pass sent and the factor auto-exposure derived
-    # are reported -- the numbers you need to explain a scan's exposure. DEBUG is
-    # the chatty one (a line per SCSI command) and stays behind -v.
+    # INFO rather than WARNING: a handful of lines per scan, including the
+    # settings it sent. DEBUG is a line per SCSI command and stays behind -v.
     console.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     console.setFormatter(logging.Formatter('%(levelname)s %(name)s: %(message)s'))
     root.addHandler(console)
@@ -452,8 +518,8 @@ def main(argv=None) -> int:
         report_frame(scanner)
 
         try:
-            # scan() validates too; doing it here means --dry-run reports the
-            # same errors a real run would, before the device is touched.
+            # scan() validates too; doing it here lets --dry-run report the same
+            # errors a real run would.
             scanner.params.validate()
         except ParamError as e:
             print(f"\nInvalid option combination: {e}")
@@ -482,8 +548,8 @@ def main(argv=None) -> int:
             print(f"Could not start the scan: {type(e).__name__}: {e}")
             return 1
 
-        # Short waits in a loop rather than one open-ended wait(), so Ctrl-C
-        # stays responsive; join() itself does not deliver KeyboardInterrupt.
+        # Short waits in a loop keep Ctrl-C responsive; join() does not deliver
+        # KeyboardInterrupt.
         try:
             while not scanner.wait(0.2):
                 pass
@@ -492,8 +558,8 @@ def main(argv=None) -> int:
             scanner.cancel()
             scanner.wait()
 
-        # wait() returned True, so the worker thread is dead and on_complete has
-        # already run. Leaving this scope closes the device (Scanner.close()).
+        # wait() returned True, so the worker is done and on_complete has run.
+        # Leaving this scope closes the device.
         return report_result(box[0], args)
 
 
