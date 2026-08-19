@@ -105,8 +105,7 @@ a loop that opens a `Scanner` per frame is correct but calibrates every time.
 ### Verified on hardware
 
 - ProScan 10T
-
-That's it for now
+- RPS 10M (aka Pacific Image PrimeFilm XAs) - Scan only
 
 # WARNING
 
