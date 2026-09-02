@@ -27,7 +27,10 @@ from pieusb.transport import (
     SCSI_CALIBRATION_INFO,
     SCSI_READ_GAIN_OFFSET,
     SCSI_PARAM,
-    SCSI_COPY
+    SCSI_COPY,
+    SCSI_SLIDE,
+    SLIDE_INIT,
+    SLIDE_NEXT
 )
 from pieusb.exceptions import (
     CheckCondition,
@@ -87,6 +90,13 @@ START_SCAN_RETRY_S = 5
 # the next chunk boundary, so the bound is one outstanding command.
 CLOSE_WAIT_S = 90
 
+# REMOVE BEFORE RELEASE, together with the two log.warning calls that use it,
+# once a scanner with a slide transport has run these commands.
+UNVERIFIED_TRANSPORT = (
+    "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
+    "run these commands, and they move hardware"
+)
+
 @dataclass(frozen=True)
 class _ShadingReference:
     """A shading reference read from the device, ready to correct with.
@@ -117,6 +127,8 @@ class Scanner:
         # The most recent shading reference a pass acquired. What
         # 'reuse_calibration' reuses.
         self._shading: _ShadingReference | None = None
+        # Whether SLIDE INIT has been sent since this Scanner was opened.
+        self._transport_initialized: bool = False
         self.info = info
         self.params = generate_options(info.inquiry)
         self.dev.open()
@@ -213,6 +225,50 @@ class Scanner:
         if reason.warming_up:
             raise WarmingUp(f"scanner still warming up after {timeout_s}s")
         raise DeviceNotReady(f"scanner did not become ready within {timeout_s}s ({reason})")
+
+    def _slide(self, action: int) -> None:
+        """Issue one slide-transport command, returning once the mechanism is idle."""
+        self.dev.command(SCSI_SLIDE, out_data=bytes([action, 0x01, 0x00, 0x00]))
+        if action == SLIDE_INIT:
+            self._transport_initialized = True
+        self.wait_ready()
+
+    def _require_slide_transport(self) -> None:
+        """Raise unless the caller may drive the slide transport right now."""
+        if not self.info.inquiry.slide_transport:
+            raise PieusbError(f"{self.info.model} has no slide transport")
+        if self.scan_in_progress:
+            raise ScanInProgress("cannot drive the slide transport while a scan is running")
+
+    def init_transport(self) -> None:
+        """Prepare the slide transport, blocking until it is idle again.
+
+        Each scan pass does this for itself, so calling it directly is for priming
+        the transport before any scan has run, or for recovering after the
+        magazine has been handled by hand.
+        """
+        self._require_slide_transport()
+        log.warning(UNVERIFIED_TRANSPORT)
+        self._slide(SLIDE_INIT)
+
+    def advance(self) -> None:
+        """Advance the slide transport by one slide, blocking until it is idle.
+
+        scan() never moves the medium; the caller decides when it does. A batch can
+        therefore keep one frame in the gate for as many passes as it wants, and
+        advance once it is done with it.
+
+        Raises ScanInProgress while a scan is running -- the worker thread owns the
+        device -- and PieusbError on a scanner without a slide transport. Nothing
+        in the protocol describes magazine state, so this cannot report an
+        exhausted magazine: the device either fails the command in its own terms
+        or the advance appears to succeed.
+        """
+        self._require_slide_transport()
+        log.warning(UNVERIFIED_TRANSPORT)
+        if not self._transport_initialized:
+            self._slide(SLIDE_INIT)
+        self._slide(SLIDE_NEXT)
 
     def _start_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=1)
@@ -484,7 +540,6 @@ class Scanner:
             resolution=preview_resolution,
             sharpen=False,
             fast_infrared=False,
-            advance=False,
             exp_rel_r=DEFAULT_RELATIVE_EXPOSURE,
             exp_rel_g=DEFAULT_RELATIVE_EXPOSURE,
             exp_rel_b=DEFAULT_RELATIVE_EXPOSURE,
@@ -616,6 +671,12 @@ class Scanner:
         # The quality bit only asks. The scanner answers below.
         set_options(self.dev, self.params, skip_shading_analysis=not acquire)
         self.wait_ready()
+
+        # Sent before every START SCAN on a transport-equipped scanner, matching
+        # the SANE backend's ordering (pieusb.c:1062-1072).
+        if self.info.inquiry.slide_transport:
+            log.debug("[scan] initialising the slide transport...")
+            self._slide(SLIDE_INIT)
 
         log.debug("[scan] starting scan...")
         for attempt in range(START_SCAN_ATTEMPTS):

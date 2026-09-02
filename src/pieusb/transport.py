@@ -43,6 +43,11 @@ SCSI_SCAN = 0x1B
 SCSI_READ_GAIN_OFFSET = 0xD7
 SCSI_WRITE_GAIN_OFFSET = 0xDC
 SCSI_READ_STATE = 0xDD
+SCSI_SLIDE = 0xD1
+
+# SCSI_SLIDE actions, carried in the first byte of its payload
+SLIDE_NEXT = 0x04
+SLIDE_INIT = 0x10
 
 # "Virtual" sub-commands written via SCSI_WRITE (little-endian 16-bit code
 # in the first 2 bytes of the payload)

@@ -1,3 +1,26 @@
+# unreleased
+
+- **Slide transport, for the DigitDia 4000 and 6000.** `Scanner.advance()` moves
+  the magazine on by one slide and `Scanner.init_transport()` prepares the
+  transport; both are SCSI `0xD1` with the action in the first payload byte, and
+  both block until the mechanism is idle. Each scan pass sends SLIDE INIT before
+  START SCAN, matching the SANE backend's ordering (`pieusb.c:1062-1072`); the
+  DigitDia 4000 needs nothing else, since the `cmd_17` its sibling wants is the
+  one thing that model does not support
+- Advancing is a method rather than the `advance` option that used to be listed
+  and ignored. The medium moves when the caller says so, which keeps a frame in
+  the gate for as many passes as it wants, drops the interaction where an
+  `auto_exp` metering pass had to suppress the advance, and lets a failed advance
+  be raised at the caller instead of warned about mid-scan with an image already
+  in hand. `advance()` raises `ScanInProgress` while a scan is running, since the
+  scan worker owns the device
+- Nothing in the protocol describes magazine state, so an exhausted magazine is
+  not reported. Neither `READ STATE` nor the sense data the backend decodes
+  mentions it
+- Unverified on hardware: no scanner with a slide transport has been tested here,
+  so both methods log a warning on every call. That warning goes away once one
+  has been
+
 # v0.3.7
 
 - **The `exp_rel_*` ceiling is a 16-bit Timer 1 overflow, and is now derived rather

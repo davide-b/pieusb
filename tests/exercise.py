@@ -416,6 +416,17 @@ def save_png(r: ScanResult, prefix: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def advance_slide(scanner: Scanner) -> int:
+    print("\nAdvancing the slide transport...")
+    try:
+        scanner.advance()
+    except PieusbError as e:
+        print(f"Could not advance: {type(e).__name__}: {e}")
+        return 1
+    print("Advanced.")
+    return 0
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -438,6 +449,12 @@ def parse_args(argv=None):
                    help='scan frame in native-resolution units (see --list)')
     g.add_argument('-o', '--option', action='append', default=[], metavar='NAME=VALUE',
                    help='set any other option from the table; repeatable')
+
+    g = p.add_argument_group('slide transport (DigitDia 4000/6000 only)')
+    g.add_argument('--advance', action='store_true',
+                   help='advance to the next slide once the scan has completed')
+    g.add_argument('--advance-only', action='store_true',
+                   help='advance to the next slide and exit, without scanning anything')
 
     g = p.add_argument_group('output')
     g.add_argument('--output', default='scan', metavar='PREFIX',
@@ -501,6 +518,9 @@ def main(argv=None) -> int:
         return 1
 
     with Scanner(devices[args.device]) as scanner:
+        if args.advance_only:
+            return advance_slide(scanner)
+
         try:
             apply_options(scanner, args)
         except (TypeError, ValueError) as e:
@@ -562,7 +582,16 @@ def main(argv=None) -> int:
 
         # wait() returned True, so the worker is done and on_complete has run.
         # Leaving this scope closes the device.
-        return report_result(box[0], args)
+        result = box[0]
+        status = report_result(result, args)
+
+        if args.advance:
+            if result.cancelled or result.error is not None:
+                print("\nNot advancing: the scan did not complete.")
+            elif advance_slide(scanner) != 0:
+                return 1
+
+        return status
 
 
 if __name__ == '__main__':

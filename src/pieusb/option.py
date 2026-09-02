@@ -232,9 +232,6 @@ class OptionsTable:
             log.warning(f"option 'sharpen' has no effect in '{mode}' mode (one-pass colour only)")
         if self['fast_infrared'].value and mode != 'rgbi':
             log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
-        if self['advance'].value:
-            log.warning("option 'advance' is not implemented yet and will be ignored: "
-                        "slide-transport commands are not sent")
 
         # exp_rel_* is the exposure control and is meant to be moved. Warned about
         # rather than refused: the real ceiling depends on the exposure time the
@@ -345,15 +342,6 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         type=bool,
         unit=Unit.NONE,
         validate=lambda v: type(v) is bool,
-        default=False
-    )))
-
-    # Advance slide after scan
-    out.append(Parameter(Option(
-        name='advance',
-        type=bool,
-        unit=Unit.NONE,
-        validate=lambda v: not v or inq.slide_transport,
         default=False
     )))
 

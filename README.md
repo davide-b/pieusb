@@ -100,12 +100,52 @@ determines whether a pass pays for its own calibration, never whether the image
 gets corrected. Since the cache lives on the `Scanner`, a fresh one starts cold:
 a loop that opens a `Scanner` per frame is correct but calibrates every time.
 
+### Slide transport
+
+The DigitDia 4000 and DigitDia 6000 feed slides from a magazine. Moving the
+transport is a call of its own rather than something `scan()` does for you, so
+the loop above becomes:
+
+```python
+with Scanner(pieusb.get_devices()[0]) as scanner:
+    scanner.resolution = 5000
+    scanner.reuse_calibration = True
+
+    for _ in range(50):
+        scanner.scan(on_update, on_complete)
+        scanner.wait()
+        scanner.advance()
+```
+
+`advance()` blocks until the transport is idle again, and refuses to run while a
+scan is in progress -- the scan worker owns the device -- so call it once
+`wait()` has returned. It raises on a scanner that has no transport rather than
+silently doing nothing, so `inquiry.slide_transport` is what to branch on if the
+same code drives both kinds of scanner.
+
+Keeping the frame in the gate is a matter of not calling `advance()`:
+scan it twice at different exposures, or discard a pass and repeat it, then move
+on when you are done with it.
+
+Nothing in the protocol describes magazine state, so `advance()` cannot tell you
+the magazine has run out. Count frames yourself.
+
+`init_transport()` prepares the transport and is there for priming it before the
+first scan, or for recovering after the magazine has been handled by hand. Every
+scan already does this for itself.
+
 ## Status of verification
 
 ### Verified on hardware
 
 - ProScan 10T
 - RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**
+
+### Not verified on hardware
+
+- Slide transport (`advance()`, `init_transport()`), on either DigitDia. The
+  commands follow the SANE `pieusb` backend, but no scanner with a transport has
+  been on the bench here.
 
 # WARNING
 
