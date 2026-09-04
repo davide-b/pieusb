@@ -1,4 +1,6 @@
 from pieusb.types import (
+    Capabilities,
+    ExposureControl,
     InquiryResponse,
     Filter,
     ColorFormat,
@@ -26,6 +28,21 @@ MODEL_NAMES = {
     0x002f: 'DigitDia 4000',
     0x0048: 'RPS 10M (aka Pacific Image PrimeFilm XAs)',
 }
+
+# Per-model knowledge, in the spirit of SANE's pieusb.conf flags. A model absent
+# here gets the conservative Capabilities() defaults.
+DEVICE_CAPABILITIES = {
+    0x002c: Capabilities(              # ProScan 4000
+        film_transport=True,
+        focus=True,
+        exposure_control=ExposureControl.ABSOLUTE,
+    ),
+    0x002f: Capabilities(film_transport=True),   # DigitDia 4000
+    0x003a: Capabilities(film_transport=True),   # DigitDia 6000
+}
+
+def capabilities_for(model_nr: int) -> Capabilities:
+    return DEVICE_CAPABILITIES.get(model_nr, Capabilities())
 
 def parse_filters(byte: int) -> tuple[Filter, ...]:
     out = []

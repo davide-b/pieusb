@@ -79,6 +79,11 @@ def describe(index: int, info: DeviceInfo) -> None:
     print(f"     slide transport   : {inq.slide_transport}")
     print(f"     exposure range    : {inq.minimum_exposure} .. {inq.maximum_exposure}")
     print(f"     production        : {inq.production} {inq.timestamp}")
+    cap = info.capabilities
+    print(f"     model number      : 0x{inq.model:04x}")
+    print(f"     film transport    : {cap.film_transport}")
+    print(f"     focus             : {cap.focus}")
+    print(f"     exposure control  : {cap.exposure_control}")
 
 
 

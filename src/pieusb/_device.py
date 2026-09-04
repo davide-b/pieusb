@@ -4,7 +4,13 @@ from pieusb.usb_utils import find_device
 from pieusb.transport import UASDevice, SCSI_INQUIRY
 from pieusb.scanner import Scanner
 
-from pieusb.inquiry import KNOWN_PIDS, PIE_VENDOR_ID, InquiryResponse, parse_inquiry
+from pieusb.inquiry import (
+    KNOWN_PIDS,
+    PIE_VENDOR_ID,
+    InquiryResponse,
+    capabilities_for,
+    parse_inquiry,
+)
 from pieusb.types import DeviceInfo
 
 log = logging.getLogger(__name__)
@@ -47,7 +53,8 @@ def get_devices() -> list[DeviceInfo]:
             dev=dev,
             vendor=r.vendor,
             model=r.model_str,
-            inquiry=r
+            inquiry=r,
+            capabilities=capabilities_for(r.model),
         ))
 
     if not devices and first_error is not None:

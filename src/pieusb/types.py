@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import usb.core
 import numpy
@@ -32,6 +32,26 @@ class OptionalDevices(StrEnum):
     DEV_TP1 = "TransModule1"
     DEV_TP = "TransModule"
     DEV_ADF = "ADF"
+
+class ExposureControl(StrEnum):
+    '''Which field actually changes a scan's exposure on a given model.
+
+    RELATIVE is exp_rel_*, sent by SCSI_EXPOSURE. ABSOLUTE is exp_time_*, carried
+    by SET GAIN OFFSET. A model honours one and ignores the other.
+    '''
+    RELATIVE = 'Relative'
+    ABSOLUTE = 'Absolute'
+
+@dataclass(frozen=True)
+class Capabilities:
+    '''Per-model facts INQUIRY does not report, keyed on model number in
+    inquiry.DEVICE_CAPABILITIES.'''
+    # Whether the hardware has a film transport. Scanner does not drive the
+    # ProScan 4000's; InquiryResponse.slide_transport is that gate.
+    film_transport: bool = False
+    # Whether SCSI_SLIDE action 0x10 moves a focus motor.
+    focus: bool = False
+    exposure_control: ExposureControl = ExposureControl.RELATIVE
 
 @dataclass(frozen=True)
 class InquiryResponse:
@@ -76,6 +96,7 @@ class DeviceInfo:
     vendor: str
     model: str
     inquiry: InquiryResponse
+    capabilities: Capabilities = field(default_factory=Capabilities)
 
 class ScanPhase(StrEnum):
     # Never emitted. Kept so consumers matching on it still compile.

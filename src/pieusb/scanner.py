@@ -771,9 +771,9 @@ class Scanner:
                   f"({raw_bytes_per_line} bytes/line incl. 2-byte tag)...")
         emit(UpdateData(phase=ScanPhase.SCANNING, progress=0.0))
 
-        # Planes arrive as sequential blocks -- all R lines, then all G -- but the
-        # 255-line read cap does not align to those boundaries, so a single read can
-        # straddle a channel transition. Rows are placed by their own tag.
+        # Lines arrive one per channel in rotation, not as per-plane blocks, and
+        # neither the first nor the last read need start or end on a cycle
+        # boundary. Every row is placed by its own tag.
         planes = numpy.zeros((n_planes, height, width), dtype=sample_dtype)
         rows_seen = [0, 0, 0, 0]
         unknown_tags: dict[bytes, int] = {}

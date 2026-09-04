@@ -74,6 +74,15 @@ BULK_TIMEOUT_MS = 30_000
 BULK_CHUNK = 0x4000
 COMMAND_TIMEOUT_S = 60
 
+# Pause between the IEEE1284 command byte and the first parallel-control write.
+# The vendor driver waits 20 ms here, measured steady across the whole capture
+# corpus; untested on a ProScan 10T.
+IEEE_SETTLE_S = 0.003
+
+# Pause before re-issuing a command the device answered STATUS_AGAIN. Both the
+# vendor driver and SANE re-issue at about 0.5 s.
+RETRY_S = 1.0
+
 class UASDevice:
     def __init__(self, dev: usb.core.Device) -> None:
         self.dev = dev
@@ -145,7 +154,7 @@ class UASDevice:
         for b in WAKEUP_SEQUENCE:
             self._ctrl_out_byte(PORT_PAR_DATA, b)
         self._ctrl_out_byte(PORT_PAR_DATA, command_byte)
-        time.sleep(0.003)
+        time.sleep(IEEE_SETTLE_S)
         self._ctrl_out_byte(PORT_PAR_CTRL, C1284_NINIT | C1284_NSTROBE)
         self._ctrl_out_byte(PORT_PAR_CTRL, C1284_NINIT)
         self._ctrl_out_byte(PORT_PAR_DATA, 0xFF)
@@ -254,7 +263,7 @@ class UASDevice:
             if status == STATUS_BUSY:
                 status = self._ctrl_in_byte(PORT_SCSI_STATUS)
                 if status == STATUS_AGAIN:
-                    time.sleep(1.0)
+                    time.sleep(RETRY_S)
                 continue
             if status in (STATUS_FAIL, STATUS_ERROR):
                 self.reset()
@@ -265,4 +274,6 @@ class UASDevice:
 
     def get_sense(self):
         raw = self.command(SCSI_REQUEST_SENSE, in_size=14)
-        return {"sense_key": raw[2], "sense_code": raw[12], "sense_qualifier": raw[13]}
+        # The top nibble of byte 2 carries FILEMARK/EOM/ILI, not the sense key.
+        return {"sense_key": raw[2] & 0x0F, "sense_code": raw[12],
+                "sense_qualifier": raw[13]}
