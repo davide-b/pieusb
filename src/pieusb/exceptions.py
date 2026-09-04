@@ -19,6 +19,7 @@ C backend splits it the same way: `sanei_pieusb_command()` returns a status and
 
 # SCSI sense keys we distinguish (SPC-3 table 27)
 SENSE_KEY_NOT_READY = 0x02
+SENSE_KEY_ILLEGAL_REQUEST = 0x05
 SENSE_KEY_UNIT_ATTENTION = 0x06
 
 class PieusbError(Exception):
@@ -73,6 +74,18 @@ class CheckCondition(PieusbError):
     @property
     def warming_up(self) -> bool:
         return self.not_ready and self.sense_code == 0x04 and self.sense_qualifier == 0x01
+
+    @property
+    def parameter_list_length_error(self) -> bool:
+        '''The device rejected the length of a command's parameter list.
+
+        ILLEGAL REQUEST with ASC 0x1A (SPC-3): the payload's size is wrong for
+        this device, whatever the bytes in it say. Models disagree about the
+        length of some fixed-layout lists, so this is the signal to try another
+        one rather than a reason to stop.
+        '''
+        return (self.sense_key == SENSE_KEY_ILLEGAL_REQUEST
+                and self.sense_code == 0x1a)
 
     @property
     def must_calibrate(self) -> bool:

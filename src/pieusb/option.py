@@ -19,7 +19,7 @@ from pieusb.transport import (
     SCSI_SCAN_FRAME,
     SCSI_WRITE_GAIN_OFFSET
 )
-from pieusb.exceptions import ParamError
+from pieusb.exceptions import CheckCondition, ParamError
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +120,14 @@ ADDITIONAL_ENTRIES = 0
 # 'doubleTimes', byte 17. Undocumented beyond the name; no driver sends anything
 # but SANE's DEFAULT_DOUBLE_TIMES (pieusb_specific.h:109).
 DOUBLE_TIMES = 0
+
+# SET GAIN OFFSET parameter list lengths, longest first. The list's last field is
+# gain_i at byte 22, so 23 bytes carries all of them; SANE sends 29 by writing out
+# its whole padded struct (pieusb_scancmd.c:1082), and the ProScan 4000 rejects
+# that with ILLEGAL REQUEST / parameter list length error while its own driver
+# sends 23 (captures/ProScan4000.pcapng, transaction 72). Tried in this order so a
+# scanner that takes the padded form keeps getting it.
+GAIN_OFFSET_LENGTHS = (29, 23)
 
 class Unit(Enum):
     MM = 0
@@ -549,6 +557,28 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
 
     return OptionsTable(out, inq)
 
+def write_gain_offset(dev: UASDevice, payload: bytes) -> int:
+    """SET GAIN OFFSET at a length this device accepts, returning that length.
+
+    Every candidate in GAIN_OFFSET_LENGTHS is a prefix of the longest one, so a
+    shorter list drops trailing padding rather than a field. A rejection that is
+    not about the length propagates from the first attempt.
+    """
+    for length in GAIN_OFFSET_LENGTHS:
+        try:
+            dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload[:length],
+                        cdb_length=length)
+        except CheckCondition as e:
+            if not e.parameter_list_length_error or length == GAIN_OFFSET_LENGTHS[-1]:
+                raise
+            log.info(f"SET GAIN OFFSET: the scanner refused a {length}-byte "
+                     f"parameter list ({e}); trying a shorter one")
+            continue
+        if length != GAIN_OFFSET_LENGTHS[0]:
+            log.info(f"SET GAIN OFFSET: this scanner takes a {length}-byte "
+                     f"parameter list")
+        return length
+
 def set_options(dev: UASDevice, options: OptionsTable, *,
                 skip_shading_analysis: bool = False) -> None:
     """Send every option to the device, in the order the scan sequence needs.
@@ -601,7 +631,7 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
         options['gain_i'].value,
         0, 0, 0, 0, 0, 0
     )
-    dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload, cdb_length=29)
+    write_gain_offset(dev, payload)
 
     # MODE SELECT, a fixed 16-byte payload per sanei_pieusb_cmd_set_mode()
     # (pieusb_scancmd.c:731-800). Bytes 0, 7, 10, 11 and 15 are unused.

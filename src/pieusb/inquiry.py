@@ -12,8 +12,12 @@ from pieusb.types import (
 import struct
 
 PIE_VENDOR_ID = 0x05E3
-KNOWN_PIDS = [0x0142, 0x0144, 0x0145]
+
+KNOWN_PIDS = [0x0142, 0x0143, 0x0144, 0x0145]
+
+# Model number, INQUIRY offset 116.
 MODEL_NAMES = {
+    0x002c: 'ProScan 4000',
     0x003a: 'DigitDia 6000 Multiple Slide Scanner',
     0x0030: 'CrystalScan 7200',
     0x0036: 'ProScan 7200',
@@ -119,7 +123,8 @@ def parse_inquiry(raw: bytes) -> InquiryResponse:
     if model_nr in MODEL_NAMES:
         model_str = MODEL_NAMES[model_nr]
     else:
-        model_str = 'Unknown'
+        # model_str reaches the user via DeviceInfo.model; keep the number visible.
+        model_str = f'Unknown (model 0x{model_nr:04x})'
     return InquiryResponse(
         vendor=txt(raw[8:16]),
         product=txt(raw[16:32]),
