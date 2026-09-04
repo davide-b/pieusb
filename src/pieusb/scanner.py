@@ -211,6 +211,7 @@ class Scanner:
         if not par.opt.validate(value):
             raise ValueError(f"Invalid value provided to option '{par.opt.name}'")
         par.value = value
+        par.assigned = True
 
     def __getattr__(self, name):
         """Read an option's value. Only called when normal lookup already failed.
@@ -682,23 +683,36 @@ class Scanner:
             yield
             return
 
+        values = {}
+        kept = []
+
+        def seed(name, value):
+            # An option the caller assigned is theirs, not the device's;
+            # seeding over it would make gain and exposure unsettable.
+            par = self.params[name]
+            if not par.assigned:
+                values[name] = value
+            else:
+                kept.append(f"{name}={par.value}")
+
         factors = [self.params[f'exp_scale_{s}'].value for s in ('r', 'g', 'b')]
         exposure = scale_exposure_times(base[:3], factors)
-        values = {f'exp_time_{s}': exposure[c]
-                  for c, s in enumerate(('r', 'g', 'b'))}
+        for c, suffix in enumerate(('r', 'g', 'b')):
+            seed(f'exp_time_{suffix}', exposure[c])
         if base[3] > 0:
-            values['exp_time_i'] = base[3]
+            seed('exp_time_i', base[3])
         for c, suffix in enumerate(CHANNEL_SUFFIX):
             if reported["gain"][c]:
-                values[f'gain_{suffix}'] = reported["gain"][c]
+                seed(f'gain_{suffix}', reported["gain"][c])
             if reported["offset"][c]:
-                values[f'offset_{suffix}'] = reported["offset"][c]
+                seed(f'offset_{suffix}', reported["offset"][c])
         if reported["light"]:
-            values['light'] = reported["light"]
+            seed('light', reported["light"])
 
         log.info(f"[exposure] device calibration {base[:3]} x {factors} -> "
                  f"{exposure}, gain {reported['gain']}, offset {reported['offset']}, "
-                 f"light {reported['light']}")
+                 f"light {reported['light']}"
+                 + (f"; keeping {', '.join(kept)}" if kept else ""))
         with self._overridden_options(**values):
             yield
 
@@ -714,8 +728,15 @@ class Scanner:
         Measured on a PIE ProScan 10T against a colour negative: this puts all
         three channels within 1% of each other at ~88% of full scale, where
         untouched they sit at 4.39 : 1.93 : 1.00 with red at 34%. The per-pixel
-        level does not depend on resolution, so metering at preview resolution
-        carries over to the real scan.
+        level does not depend on resolution there, so metering at preview
+        resolution carries over to the real scan.
+
+        On a ProScan 4000 the absolute level does not follow: a 2.0x exposure
+        measured 1.16x, metering at 300 dpi for a 900 dpi scan. Either exp_time is
+        sub-linear there or the level tracks resolution; see PLAN-proscan4000.md
+        T27. Its ratio behaviour is untested -- the one run was black-and-white
+        film, already balanced to 1.02 : 0.96 : 1.00 by the device's own
+        calibration before metering saw it.
 
         The ceiling per channel comes from the device: exp_rel scales the exposure
         time the scanner reports for itself into a 16-bit Timer 1 count, and past

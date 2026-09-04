@@ -140,10 +140,10 @@ def show_options(scanner: Scanner) -> None:
     print("\nOption table:")
     for par in scanner.params.table:
         unit = '' if par.opt.unit is Unit.NONE else f" {par.opt.unit.name.lower()}"
-        changed = '*' if par.value != par.opt.default else ' '
+        changed = '*' if par.assigned else ' '
         print(f"  {changed} {par.opt.name:<14} = {par.value!r:<8}{unit:<14}"
               f"(default {par.opt.default!r})")
-    print("  (* = changed from the default)")
+    print("  (* = set explicitly; unmarked options may be seeded from the device)")
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,10 @@ class Parameter:
         self.opt = opt
         assert opt.validate(opt.default)
         self.value = opt.default
+        # Set by Scanner.__setattr__, so "the caller chose this" is distinct from
+        # "this differs from the default". Assigning the default value is still a
+        # choice, and a device that seeds its own values has to respect it.
+        self.assigned = False
 
 class OptionsTable:
     def __init__(self, params: list[Parameter], inq: InquiryResponse) -> None:
@@ -622,7 +626,16 @@ def write_gain_offset(dev: UASDevice, payload: bytes) -> int:
     Every candidate in GAIN_OFFSET_LENGTHS is a prefix of the longest one, so a
     shorter list drops trailing padding rather than a field. A rejection that is
     not about the length propagates from the first attempt.
+
+    The accepted length is remembered on the device: probing costs a rejected
+    command and a REQUEST SENSE, and a scan sends this on every pass.
     """
+    if dev.gain_offset_length is not None:
+        dev.command(SCSI_WRITE_GAIN_OFFSET,
+                    out_data=payload[:dev.gain_offset_length],
+                    cdb_length=dev.gain_offset_length)
+        return dev.gain_offset_length
+
     for length in GAIN_OFFSET_LENGTHS:
         try:
             dev.command(SCSI_WRITE_GAIN_OFFSET, out_data=payload[:length],
@@ -636,6 +649,7 @@ def write_gain_offset(dev: UASDevice, payload: bytes) -> int:
         if length != GAIN_OFFSET_LENGTHS[0]:
             log.info(f"SET GAIN OFFSET: this scanner takes a {length}-byte "
                      f"parameter list")
+        dev.gain_offset_length = length
         return length
 
 def set_options(dev: UASDevice, options: OptionsTable, *,

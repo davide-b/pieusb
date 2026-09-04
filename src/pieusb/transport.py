@@ -99,6 +99,9 @@ class UASDevice:
         self.dev = dev
         self.intf_number: int | None = None
         self.ep_in: usb.core.Endpoint | None = None
+        # SET GAIN OFFSET parameter-list length this device accepts, once known.
+        # See option.write_gain_offset().
+        self.gain_offset_length: int | None = None
 
     def __enter__(self) -> "UASDevice":
         self.open()
