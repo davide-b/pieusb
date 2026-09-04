@@ -199,6 +199,24 @@ def apply_options(scanner: Scanner, args) -> None:
         setattr(scanner, name, coerce(name, raw, par.opt.type))
 
 
+def report_transport_state(scanner: Scanner) -> int:
+    """Print READ STATE and the focus range, or say why there is none."""
+    state = scanner.transport_state()
+    if state is None:
+        print(f"\n{scanner.info.model} reports no film transport.")
+        return 0
+    print("\nTransport state (READ STATE):")
+    print(f"  raw           : {state.raw.hex(' ')}")
+    print(f"  frame         : {state.frame}")
+    print(f"  focus         : {state.focus}")
+    print(f"  focus maximum : {state.focus_max}   <- depends on the loaded carrier")
+    print(f"  flags         : 0x{state.flags:02x}")
+    print(f"  at limit      : {state.at_limit}")
+    limits = scanner.focus_range()
+    print(f"  focus range   : {limits if limits else 'no focus control'}")
+    return 0
+
+
 def report_frame(scanner: Scanner) -> None:
     '''Print the frame in both unit systems before anything is sent.
 
@@ -467,6 +485,12 @@ def parse_args(argv=None):
     g.add_argument('--png', action='store_true',
                    help='also write an 8-bit PNG preview, if Pillow is installed')
 
+    g = p.add_argument_group('focus (models with a focus motor)')
+    g.add_argument('--transport-state', action='store_true',
+                   help='print READ STATE: frame, focus, focus range, flags')
+    g.add_argument('--focus', type=int, metavar='N',
+                   help='move the focus motor to N and stop')
+
     g = p.add_argument_group('diagnostics')
     g.add_argument('--gain-offset', action='store_true',
                    help="read and print the scanner's own exposure/gain/offset/light and "
@@ -525,6 +549,18 @@ def main(argv=None) -> int:
     with Scanner(devices[args.device]) as scanner:
         if args.advance_only:
             return advance_slide(scanner)
+
+        if args.transport_state:
+            return report_transport_state(scanner)
+
+        if args.focus is not None:
+            try:
+                scanner.set_focus(args.focus)
+            except (PieusbError, ValueError) as e:
+                print(f"Could not set the focus: {type(e).__name__}: {e}")
+                return 1
+            print(f"Focus moved to {args.focus}.")
+            return report_transport_state(scanner)
 
         try:
             apply_options(scanner, args)

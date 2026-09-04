@@ -10,6 +10,7 @@ from pieusb.inquiry import (
     InquiryResponse,
     Filter
 )
+from pieusb.types import Capabilities
 from pieusb.transport import (
     UASDevice,
     SCSI_WRITE,
@@ -105,6 +106,13 @@ def max_relative_exposure(exposure_time: int) -> int:
 # for OptionsTable.validate(), which has no device reading to work from.
 OBSERVED_EXPOSURE_TIME = 4100
 MAX_RELATIVE_EXPOSURE = max_relative_exposure(OBSERVED_EXPOSURE_TIME)
+
+# SCSI_SLIDE's focus byte. 1 is the near end of the range on every model that has
+# a focus motor; the far end is holder-dependent and only the device knows it, so
+# Scanner clamps against READ STATE rather than validating here.
+DEFAULT_FOCUS = 1
+FOCUS_MIN = 1
+FOCUS_MAX_FIELD = 0xFF
 
 # Light level used when the device reports none of its own. SANE's DEFAULT_LIGHT
 # (pieusb_specific.h:107) and the value the firmware settles at once warm.
@@ -264,8 +272,10 @@ class OptionsTable:
                 f"the device clamps there, so this scales nothing"
             )
 
-def generate_options(inq: InquiryResponse) -> OptionsTable:
+def generate_options(inq: InquiryResponse,
+                     capabilities: Capabilities | None = None) -> OptionsTable:
     out: list[Parameter] = []
+    capabilities = capabilities or Capabilities()
 
     modes = []
     if Filter.GREEN in inq.filters:
@@ -531,6 +541,18 @@ def generate_options(inq: InquiryResponse) -> OptionsTable:
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
         default=0
     )))
+
+    # Focus position for SCSI_SLIDE action 0x10, on models whose slide command
+    # carries one. Absent otherwise, so it cannot be set on a scanner that would
+    # read the byte as something else.
+    if capabilities.focus:
+        out.append(Parameter(Option(
+            name='focus',
+            type=int,
+            unit=Unit.NONE,
+            validate=lambda v: FOCUS_MIN <= v <= FOCUS_MAX_FIELD,
+            default=DEFAULT_FOCUS
+        )))
 
     # Lamp level, byte 15 of SET GAIN OFFSET.
     #

@@ -1,6 +1,8 @@
 from pieusb.option import (
     generate_options,
     set_options,
+    DEFAULT_FOCUS,
+    FOCUS_MIN,
     DEFAULT_RELATIVE_EXPOSURE,
     MAX_RELATIVE_EXPOSURE,
     MODE_PLANES,
@@ -21,6 +23,7 @@ from pieusb.types import (
 from pieusb.transport import (
     UASDevice,
     SCSI_READ,
+    SCSI_READ_STATE,
     SCSI_WRITE,
     SCSI_SCAN,
     SCSI_TEST_UNIT_READY,
@@ -90,12 +93,30 @@ START_SCAN_RETRY_S = 5
 # the next chunk boundary, so the bound is one outstanding command.
 CLOSE_WAIT_S = 90
 
+# READ STATE reply length. The smallest that covers every field TransportState
+# decodes; SANE asks 12 and CyberView 11, and the device pads either way.
+READ_STATE_SIZE = 8
+
 # REMOVE BEFORE RELEASE, together with the two log.warning calls that use it,
 # once a scanner with a slide transport has run these commands.
 UNVERIFIED_TRANSPORT = (
     "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
     "run these commands, and they move hardware"
 )
+
+@dataclass(frozen=True)
+class TransportState:
+    '''READ STATE, decoded. Only meaningful on a model with a film transport.
+
+    `focus_max` is holder-dependent -- 80 with a slide carrier, 30 with a
+    filmstrip carrier on a ProScan 4000 -- so it is read, never assumed.
+    '''
+    frame: int
+    focus: int
+    focus_max: int
+    flags: int
+    at_limit: bool
+    raw: bytes
 
 @dataclass(frozen=True)
 class _ShadingReference:
@@ -130,7 +151,7 @@ class Scanner:
         # Whether SLIDE INIT has been sent since this Scanner was opened.
         self._transport_initialized: bool = False
         self.info = info
-        self.params = generate_options(info.inquiry)
+        self.params = generate_options(info.inquiry, info.capabilities)
         self.dev.open()
 
     def __enter__(self) -> "Scanner":
@@ -226,12 +247,74 @@ class Scanner:
             raise WarmingUp(f"scanner still warming up after {timeout_s}s")
         raise DeviceNotReady(f"scanner did not become ready within {timeout_s}s ({reason})")
 
-    def _slide(self, action: int) -> None:
-        """Issue one slide-transport command, returning once the mechanism is idle."""
-        self.dev.command(SCSI_SLIDE, out_data=bytes([action, 0x01, 0x00, 0x00]))
+    def _slide(self, action: int, value: int = 0x01) -> None:
+        """Issue one slide-transport command, returning once the mechanism is idle.
+
+        `value` is the action's parameter byte: a focus position for SLIDE_INIT,
+        a frame count for SLIDE_NEXT.
+        """
+        self.dev.command(SCSI_SLIDE, out_data=bytes([action, value, 0x00, 0x00]))
         if action == SLIDE_INIT:
             self._transport_initialized = True
         self.wait_ready()
+
+    def transport_state(self) -> TransportState | None:
+        """READ STATE, decoded, or None on a scanner without a film transport."""
+        if not self.info.capabilities.film_transport:
+            return None
+        raw = self.dev.command(SCSI_READ_STATE, in_size=READ_STATE_SIZE,
+                               cdb_length=READ_STATE_SIZE)
+        return TransportState(
+            frame=raw[2],
+            focus=raw[3],
+            focus_max=raw[4],
+            flags=raw[6],
+            at_limit=bool(raw[7]),
+            raw=bytes(raw),
+        )
+
+    def focus_range(self) -> tuple[int, int] | None:
+        """The focus positions this scanner accepts, or None if it has no focus.
+
+        The upper bound depends on the carrier currently loaded, so it is read
+        from the device on every call.
+        """
+        if not self.info.capabilities.focus:
+            return None
+        state = self.transport_state()
+        if state is None or state.focus_max < FOCUS_MIN:
+            return None
+        return (FOCUS_MIN, state.focus_max)
+
+    def set_focus(self, value: int) -> None:
+        """Move the focus motor, blocking until it is idle.
+
+        Raises PieusbError on a scanner without focus, ScanInProgress while a scan
+        is running, and ValueError outside the range the device reports.
+        """
+        if not self.info.capabilities.focus:
+            raise PieusbError(f"{self.info.model} has no focus control")
+        if self.scan_in_progress:
+            raise ScanInProgress("cannot move the focus while a scan is running")
+        limits = self.focus_range()
+        if limits is not None and not (limits[0] <= value <= limits[1]):
+            raise ValueError(
+                f"focus {value} is outside the {limits[0]}..{limits[1]} this "
+                f"scanner reports"
+            )
+        self._slide(SLIDE_INIT, value)
+
+    def _focus_for_scan(self) -> int:
+        """The focus byte for this pass's SLIDE INIT."""
+        if not self.info.capabilities.focus:
+            return DEFAULT_FOCUS
+        wanted = self.params['focus'].value
+        limits = self.focus_range()
+        if limits is not None and wanted > limits[1]:
+            log.warning(f"[scan] focus {wanted} exceeds the {limits[1]} this "
+                        f"carrier allows; using {limits[1]}")
+            return limits[1]
+        return wanted
 
     def _require_slide_transport(self) -> None:
         """Raise unless the caller may drive the slide transport right now."""
@@ -249,7 +332,7 @@ class Scanner:
         """
         self._require_slide_transport()
         log.warning(UNVERIFIED_TRANSPORT)
-        self._slide(SLIDE_INIT)
+        self._slide(SLIDE_INIT, self._focus_for_scan())
 
     def advance(self) -> None:
         """Advance the slide transport by one slide, blocking until it is idle.
@@ -267,7 +350,7 @@ class Scanner:
         self._require_slide_transport()
         log.warning(UNVERIFIED_TRANSPORT)
         if not self._transport_initialized:
-            self._slide(SLIDE_INIT)
+            self._slide(SLIDE_INIT, self._focus_for_scan())
         self._slide(SLIDE_NEXT)
 
     def _start_scan(self) -> None:
@@ -676,7 +759,7 @@ class Scanner:
         # the SANE backend's ordering (pieusb.c:1062-1072).
         if self.info.inquiry.slide_transport:
             log.debug("[scan] initialising the slide transport...")
-            self._slide(SLIDE_INIT)
+            self._slide(SLIDE_INIT, self._focus_for_scan())
 
         log.debug("[scan] starting scan...")
         for attempt in range(START_SCAN_ATTEMPTS):
