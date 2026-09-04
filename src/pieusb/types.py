@@ -94,6 +94,8 @@ class InquiryResponse:
     timestamp: str
     signature: str
     slide_transport: bool
+    # Second vendor block, offset 96. Distinct from `revision`.
+    firmware_version: str = ''
 
 @dataclass(frozen=True)
 class DeviceInfo:

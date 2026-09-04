@@ -167,14 +167,17 @@ def parse_inquiry(raw: bytes) -> InquiryResponse:
         calibration_equation=raw[103],
         maximum_exposure=struct.unpack_from("<H", raw, 104)[0],
         minimum_exposure=struct.unpack_from("<H", raw, 106)[0],
+        # Transparency window corners, in native-resolution units
+        # (pieusb_scancmd.h:108-111).
         x0=struct.unpack_from("<H", raw, 108)[0],
-        x1=struct.unpack_from("<H", raw, 110)[0],
-        y0=struct.unpack_from("<H", raw, 112)[0],
+        y0=struct.unpack_from("<H", raw, 110)[0],
+        x1=struct.unpack_from("<H", raw, 112)[0],
         y1=struct.unpack_from("<H", raw, 114)[0],
         model=model_nr,
         model_str=model_str,
         production=txt(raw[120:124]),
         timestamp=txt(raw[124:144]),
         signature=txt(raw[144:184]),
+        firmware_version=txt(raw[96:100]),
         slide_transport=capabilities_for(model_nr).film_transport
     )

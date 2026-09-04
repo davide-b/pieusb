@@ -76,7 +76,11 @@ STATUS_AGAIN = 0x08
 STATUS_FAIL = 0x88
 STATUS_ERROR = 0xFF
 
-CTRL_TIMEOUT_MS = 5_000
+# The device backpressures by NAKing the control pipe, not only through the BUSY
+# status byte. Measured holds: 0.07 s on GET PARAMETERS, 1.3-1.5 s on TEST UNIT
+# READY, and once 30.25 s on READ STATE. A timeout here abandons a half-written
+# CDB, which wedges the bridge until it is power-cycled.
+CTRL_TIMEOUT_MS = 40_000
 BULK_TIMEOUT_MS = 30_000
 BULK_CHUNK = 0x4000
 COMMAND_TIMEOUT_S = 60
@@ -170,13 +174,41 @@ class UASDevice:
     def reset(self):
         self.ieee_command(IEEE1284_RESET)
 
+    def _recover(self) -> None:
+        """Leave the bridge idle after a transaction was abandoned part-way.
+
+        Without this the device is still waiting for the rest of a CDB, and every
+        command after it desynchronises until the scanner is power-cycled.
+        """
+        log.warning("[recover] transaction aborted part-way; sending IEEE1284 RESET")
+        try:
+            self.reset()
+        except usb.core.USBError as e:
+            log.warning(f"[recover] IEEE1284 RESET also failed: {e}")
+
+    def _configuration(self):
+        """The active configuration, setting one only if the device has none.
+
+        SET_CONFIGURATION resets interfaces, endpoint halts and data toggles. On a
+        device the kernel already configured it is at best redundant, and it
+        desynchronises the USB side from the IEEE1284 state machine behind it.
+        """
+        try:
+            cfg = self.dev.get_active_configuration()
+        except usb.core.USBError as e:
+            log.debug(f"[open] no active configuration ({e}); setting one")
+            cfg = None
+        if cfg is None:
+            self.dev.set_configuration()
+            cfg = self.dev.get_active_configuration()
+        else:
+            log.debug(f"[open] already configured "
+                      f"(bConfigurationValue {cfg.bConfigurationValue})")
+        return cfg
+
     def open(self) -> tuple[int, usb.core.Endpoint]:
-        log.debug("[open] set_configuration()...")
-        self.dev.set_configuration()
-        log.debug("[open] set_configuration() ok")
-    
-        log.debug("[open] get_active_configuration()...")
-        cfg = self.dev.get_active_configuration()
+        log.debug("[open] resolving configuration...")
+        cfg = self._configuration()
         intf = cfg[(0, 0)]
         self.intf_number = intf.bInterfaceNumber
         log.debug(f"[open] interface number = {self.intf_number}")
@@ -208,26 +240,34 @@ class UASDevice:
         log.debug("[close] done")
 
     def scsi_transaction(self, opcode, cdb_length, out_data, in_size):
+        log.debug(f"      [txn 0x{opcode:02x}] IEEE1284 SCSI")
         self.ieee_command(IEEE1284_SCSI)
 
         cdb = bytearray(SCSI_COMMAND_LEN)
         cdb[0] = opcode & 0xFF
         cdb[3] = (cdb_length >> 8) & 0xFF
         cdb[4] = cdb_length & 0xFF
+        log.debug(f"      [txn 0x{opcode:02x}] cdb {bytes(cdb).hex(' ')}")
         for b in cdb:
             self._ctrl_out_byte(PORT_SCSI_CMD, b)
 
         status = self._ctrl_in_byte(PORT_SCSI_STATUS)
+        log.debug(f"      [txn 0x{opcode:02x}] status 0x{status:02x}")
         result = b""
 
         if status == STATUS_OK and len(out_data) > 0:
+            log.debug(f"      [txn 0x{opcode:02x}] writing {len(out_data)} payload bytes")
             for b in out_data:
                 self._ctrl_out_byte(PORT_SCSI_CMD, b)
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)
+            log.debug(f"      [txn 0x{opcode:02x}] status 0x{status:02x}")
         elif status == STATUS_READ:
+            log.debug(f"      [txn 0x{opcode:02x}] announcing {in_size} bytes")
             self._bulk_size(in_size)
             result = self._bulk_in(in_size)
+            log.debug(f"      [txn 0x{opcode:02x}] read {len(result)} bytes")
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)
+            log.debug(f"      [txn 0x{opcode:02x}] status 0x{status:02x}")
 
         return status, result
 
@@ -248,7 +288,13 @@ class UASDevice:
         while time.time() < deadline:
             log.debug(f"    [cmd 0x{opcode:02x}] status=0x{status:02x}")
             if status == STATUS_AGAIN:
-                status, result = self.scsi_transaction(opcode, cdb_length, out_data, in_size)
+                try:
+                    status, result = self.scsi_transaction(opcode, cdb_length, out_data, in_size)
+                except usb.core.USBError as e:
+                    self._recover()
+                    raise TransportError(
+                        f"cmd 0x{opcode:02x} was abandoned part-way: {e}"
+                    ) from e
                 log.debug(f"    [cmd 0x{opcode:02x}]   -> new status=0x{status:02x}, {len(result)} bytes")
                 continue
             if status == STATUS_OK:
