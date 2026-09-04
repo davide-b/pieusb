@@ -103,13 +103,11 @@ CLOSE_WAIT_S = 90
 # decodes; SANE asks 12 and CyberView 11, and the device pads either way.
 READ_STATE_SIZE = 8
 
-# READ STATE byte 6. Bit 0 is attested across every capture; the rest are read
-# off one filmstrip walk through six frames, so treat them as provisional and
-# prefer TransportState.flags if they disagree with a device in hand.
+# READ STATE byte 6. These two hold across every state observed so far, carriers
+# and ejects included. Bits 3, 4 and 5 also move with the frame index but not
+# monotonically, and nothing yet explains them; read TransportState.flags for those.
 STATE_MEDIUM_PRESENT = 0x01
-STATE_CAN_ADVANCE = 0x08
-STATE_CAN_REWIND = 0x10
-STATE_AT_LAST_FRAME = 0x20
+STATE_FILMSTRIP_CARRIER = 0x04
 
 # SCSI_SLIDE offset steps are 1/240 inch.
 OFFSET_STEPS_PER_INCH = 240
@@ -133,13 +131,10 @@ class TransportState:
     focus: int
     focus_max: int
     flags: int
-    at_limit: bool
     raw: bytes
 
     medium_present = property(lambda s: bool(s.flags & STATE_MEDIUM_PRESENT))
-    can_advance = property(lambda s: bool(s.flags & STATE_CAN_ADVANCE))
-    can_rewind = property(lambda s: bool(s.flags & STATE_CAN_REWIND))
-    at_last_frame = property(lambda s: bool(s.flags & STATE_AT_LAST_FRAME))
+    filmstrip_carrier = property(lambda s: bool(s.flags & STATE_FILMSTRIP_CARRIER))
 
 @dataclass(frozen=True)
 class _ShadingReference:
@@ -284,7 +279,11 @@ class Scanner:
         self.wait_ready()
 
     def transport_state(self) -> TransportState | None:
-        """READ STATE, decoded, or None on a scanner without a film transport."""
+        """READ STATE, decoded, or None on a scanner without a film transport.
+
+        Raises CheckCondition if the device is not ready -- a warming lamp
+        answers this command with NOT READY rather than reporting state.
+        """
         if not self.info.capabilities.film_transport:
             return None
         raw = self.dev.command(SCSI_READ_STATE, in_size=READ_STATE_SIZE,
@@ -294,7 +293,6 @@ class Scanner:
             focus=raw[3],
             focus_max=raw[4],
             flags=raw[6],
-            at_limit=bool(raw[7]),
             raw=bytes(raw),
         )
 
@@ -370,8 +368,7 @@ class Scanner:
         device -- and PieusbError on a scanner without a slide transport. Nothing
         in the protocol describes magazine state, so this cannot report an
         exhausted magazine: the device either fails the command in its own terms
-        or the advance appears to succeed. `TransportState.can_advance` is the
-        closest thing to a warning.
+        or the advance appears to succeed.
         """
         self._require_slide_transport()
         self._step_frames(SLIDE_NEXT, frames)

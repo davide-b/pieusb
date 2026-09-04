@@ -207,7 +207,13 @@ def apply_options(scanner: Scanner, args) -> None:
 
 def report_transport_state(scanner: Scanner) -> int:
     """Print READ STATE and the focus range, or say why there is none."""
-    state = scanner.transport_state()
+    try:
+        state = scanner.transport_state()
+    except PieusbError as e:
+        print(f"\nCould not read the transport state: {type(e).__name__}: {e}")
+        print("  (a warming-up scanner answers this with NOT READY; try again in "
+              "a minute)")
+        return 1
     if state is None:
         print(f"\n{scanner.info.model} reports no film transport.")
         return 0
@@ -216,8 +222,9 @@ def report_transport_state(scanner: Scanner) -> int:
     print(f"  frame         : {state.frame}")
     print(f"  focus         : {state.focus}")
     print(f"  focus maximum : {state.focus_max}   <- depends on the loaded carrier")
-    print(f"  flags         : 0x{state.flags:02x}")
-    print(f"  at limit      : {state.at_limit}")
+    print(f"  medium present: {state.medium_present}")
+    print(f"  carrier       : {'filmstrip' if state.filmstrip_carrier else 'slide'}")
+    print(f"  flags         : 0x{state.flags:02x}   <- bits 3-5 unexplained")
     limits = scanner.focus_range()
     print(f"  focus range   : {limits if limits else 'no focus control'}")
     return 0
