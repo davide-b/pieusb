@@ -1,7 +1,11 @@
 from pieusb.option import (
     generate_options,
+    scale_exposure_times,
     set_options,
+    DEFAULT_EXPOSURE_SCALE,
     DEFAULT_FOCUS,
+    EXPOSURE_SCALE_MAX,
+    EXPOSURE_SCALE_MIN,
     FOCUS_MIN,
     DEFAULT_RELATIVE_EXPOSURE,
     MAX_RELATIVE_EXPOSURE,
@@ -17,6 +21,7 @@ from pieusb.postprocess import (
 from pieusb.types import (
     DeviceInfo,
     EjectDirection,
+    ExposureControl,
     UpdateData,
     ScanResult,
     ScanPhase
@@ -73,10 +78,10 @@ CHANNEL_NAMES = ('R', 'G', 'B', 'I')
 # Channel index -> the suffix its gain_*/exp_time_*/offset_* options carry.
 CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
 
-# The options auto_exp derives and therefore restores afterwards. Only the relative
-# exposures: they are the only exposure control this hardware honours (see the
-# exp_rel_* options).
+# The options auto_exp derives, and therefore restores afterwards, per exposure
+# control. See Scanner._metered_options().
 METERED_OPTIONS = ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
+METERED_OPTIONS_ABSOLUTE = ('exp_scale_r', 'exp_scale_g', 'exp_scale_b')
 
 # Where auto_exp aims the metered channel, as a fraction of full scale. Below 1.0
 # to leave room for specular highlights and for the shading correction's per-column
@@ -650,6 +655,53 @@ class Scanner:
             for name, value in saved.items():
                 self.params[name].value = value
 
+    def _metered_options(self) -> tuple[str, ...]:
+        """The options auto_exp writes on this model."""
+        if self.info.capabilities.exposure_control is ExposureControl.ABSOLUTE:
+            return METERED_OPTIONS_ABSOLUTE
+        return METERED_OPTIONS
+
+    @contextmanager
+    def _absolute_exposure(self):
+        """Seed exp_time_* and friends from the device, for the duration.
+
+        A no-op unless exp_time_* is the live exposure control. Where it is, the
+        device's own calibration is the baseline and exp_scale_* multiplies it,
+        which is what both ProScan 4000 drivers do. Nothing is seeded if the
+        scanner has not measured its calibration yet.
+        """
+        if self.info.capabilities.exposure_control is not ExposureControl.ABSOLUTE:
+            yield
+            return
+
+        reported = self._get_gain_offset()
+        base = reported["exposure_time"]
+        if not all(base[c] > 0 for c in range(3)):
+            log.warning(f"[exposure] the scanner reports no exposure time of its own "
+                        f"({base}); scanning with the options as set")
+            yield
+            return
+
+        factors = [self.params[f'exp_scale_{s}'].value for s in ('r', 'g', 'b')]
+        exposure = scale_exposure_times(base[:3], factors)
+        values = {f'exp_time_{s}': exposure[c]
+                  for c, s in enumerate(('r', 'g', 'b'))}
+        if base[3] > 0:
+            values['exp_time_i'] = base[3]
+        for c, suffix in enumerate(CHANNEL_SUFFIX):
+            if reported["gain"][c]:
+                values[f'gain_{suffix}'] = reported["gain"][c]
+            if reported["offset"][c]:
+                values[f'offset_{suffix}'] = reported["offset"][c]
+        if reported["light"]:
+            values['light'] = reported["light"]
+
+        log.info(f"[exposure] device calibration {base[:3]} x {factors} -> "
+                 f"{exposure}, gain {reported['gain']}, offset {reported['offset']}, "
+                 f"light {reported['light']}")
+        with self._overridden_options(**values):
+            yield
+
     def _meter_exposure(self, started: float) -> ScanResult | None:
         """Run a metering pass and set exp_rel_* per channel from what it measured.
 
@@ -683,20 +735,49 @@ class Scanner:
             preview_resolution = fallback
         log.info(f"[autoexp] metering pass at {preview_resolution} dpi")
 
+        absolute = (self.info.capabilities.exposure_control
+                    is ExposureControl.ABSOLUTE)
+        baseline = ({name: DEFAULT_EXPOSURE_SCALE for name in METERED_OPTIONS_ABSOLUTE}
+                    if absolute
+                    else {name: DEFAULT_RELATIVE_EXPOSURE for name in METERED_OPTIONS})
+
         with self._overridden_options(
             resolution=preview_resolution,
             sharpen=False,
             fast_infrared=False,
-            exp_rel_r=DEFAULT_RELATIVE_EXPOSURE,
-            exp_rel_g=DEFAULT_RELATIVE_EXPOSURE,
-            exp_rel_b=DEFAULT_RELATIVE_EXPOSURE,
-        ):
+            **baseline,
+        ), self._absolute_exposure():
             preview = self._scan_pass(started, self._emit_metering)
 
         if preview.cancelled:
             return preview
         if preview.rgb is None:
             raise PieusbError("metering pass returned no image data")
+
+        full_scale_dtype = numpy.iinfo(preview.rgb.dtype).max
+        if absolute:
+            target_absolute = METERING_TARGET * full_scale_dtype
+            for c, suffix in enumerate(('r', 'g', 'b')):
+                name = f'exp_scale_{suffix}'
+                measured = float(numpy.percentile(preview.rgb[:, :, c],
+                                                  METERING_PERCENTILE))
+                if measured <= 0:
+                    log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} metered 0 at the "
+                                f"{METERING_PERCENTILE}th percentile; leaving {name} at "
+                                f"{self.params[name].value}")
+                    continue
+                wanted = self.params[name].value * target_absolute / measured
+                value = min(max(wanted, EXPOSURE_SCALE_MIN), EXPOSURE_SCALE_MAX)
+                log.info(f"[autoexp] {CHANNEL_NAMES[c]}: metered {measured:.0f}/"
+                         f"{full_scale_dtype} "
+                         f"({measured / full_scale_dtype * 100:.1f}%), {name} -> "
+                         f"{value:.3f}")
+                if wanted > EXPOSURE_SCALE_MAX:
+                    log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} wants {name}="
+                                f"{wanted:.3f}, above the {EXPOSURE_SCALE_MAX} this "
+                                f"option allows; using {EXPOSURE_SCALE_MAX}")
+                self.params[name].value = value
+            return None
 
         # The device's own exposure time is the multiplicand that decides where
         # exp_rel overflows Timer 1. A scanner that has not finished warming up
@@ -755,13 +836,15 @@ class Scanner:
         it, one pass with the options exactly as set.
         """
         if self.params['auto_exp'].value:
-            with self._saved_options(*METERED_OPTIONS):
+            with self._saved_options(*self._metered_options()):
                 cancelled = self._meter_exposure(started)
                 if cancelled is not None:
                     return cancelled
-                return self._scan_pass(started, self._emit)
+                with self._absolute_exposure():
+                    return self._scan_pass(started, self._emit)
 
-        return self._scan_pass(started, self._emit)
+        with self._absolute_exposure():
+            return self._scan_pass(started, self._emit)
 
     def _scan_pass(self, started: float, emit: Callable[[UpdateData], None]) -> ScanResult:
         """One pass over the medium, from configuration to a finished ScanResult.

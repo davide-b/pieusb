@@ -13,18 +13,26 @@ nothing here is a unit test.
     python tests/exercise.py --mode rgbi --resolution 2000 --frame-mm 0 0 36 24
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
 
-auto_exp meters a preview pass and sets exp_rel_* per channel from it -- the only
-exposure control this hardware honours. It costs one extra pass:
+Which field carries the exposure depends on the model, and `--list` reports it:
+
+  exposure control Relative  (ProScan 10T, RPS 10M)
+      exp_rel_* is the live control; exp_time_*, gain_* and light have no
+      measurable effect. 247/563/1086 balances a colour negative on a 10T, all
+      three channels at ~88% of full scale:
+
+          python tests/exercise.py -o exp_rel_r=247 -o exp_rel_g=563 \
+              -o exp_rel_b=1086 --output manual
+
+  exposure control Absolute  (ProScan 4000)
+      each pass adopts the exposure, gain, offset and lamp level the device
+      reports for itself, and exp_scale_* multiplies the exposure per channel:
+
+          python tests/exercise.py -o exp_scale_r=2.0 --output brighter
+
+auto_exp meters a preview pass and sets whichever of the two the model honours.
+It costs one extra pass:
 
     python tests/exercise.py -o auto_exp=true --output auto
-
-Or set the relative exposures by hand. 247/563/1086 balances a colour negative on a
-ProScan 10T, all three channels at ~88% of full scale:
-
-    python tests/exercise.py -o exp_rel_r=247 -o exp_rel_g=563 -o exp_rel_b=1086 \
-        --output manual
-
-gain_*, exp_time_* and light have no measurable effect on that unit at any value.
 
 Every scan logs the exposure, gain, offset and light it sent, at INFO.
 

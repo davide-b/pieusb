@@ -10,7 +10,7 @@ from pieusb.inquiry import (
     InquiryResponse,
     Filter
 )
-from pieusb.types import Capabilities
+from pieusb.types import Capabilities, ExposureControl
 from pieusb.transport import (
     UASDevice,
     SCSI_WRITE,
@@ -111,6 +111,26 @@ MAX_RELATIVE_EXPOSURE = max_relative_exposure(OBSERVED_EXPOSURE_TIME)
 # (pieusb_specific.h:105) and the floor both ProScan 4000 drivers clamp to.
 DEFAULT_EXPOSURE_TIME = 2937
 EXPOSURE_TIME_MAX = 0xFFFF
+
+# exp_scale_*, the per-channel multiplier on the device's own exposure time.
+# Bounds are the range VueScan's own gain sliders offer.
+DEFAULT_EXPOSURE_SCALE = 1.0
+EXPOSURE_SCALE_MIN = 0.001
+EXPOSURE_SCALE_MAX = 200.0
+
+
+def scale_exposure_times(base, factors):
+    '''Apply per-channel factors to absolute exposure times.
+
+    A channel over EXPOSURE_TIME_MAX pulls every channel down by the same factor,
+    so their ratios survive; each result is then floored at DEFAULT_EXPOSURE_TIME.
+    Both ProScan 4000 drivers behave this way.
+    '''
+    wanted = [b * f for b, f in zip(base, factors)]
+    peak = max(wanted, default=0)
+    if peak > EXPOSURE_TIME_MAX:
+        wanted = [w * EXPOSURE_TIME_MAX / peak for w in wanted]
+    return tuple(max(int(w), DEFAULT_EXPOSURE_TIME) for w in wanted)
 
 # SCSI_SLIDE's focus byte. 1 is the near end of the range on every model that has
 # a focus motor; the far end is holder-dependent and only the device knows it, so
@@ -545,6 +565,19 @@ def generate_options(inq: InquiryResponse,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
         default=0
     )))
+
+    # Per-channel multiplier on the exposure time the device reports for itself.
+    # Present only where exp_time_* is the live exposure control; where exp_rel_*
+    # is, it would do nothing.
+    if capabilities.exposure_control is ExposureControl.ABSOLUTE:
+        for filt in ('r', 'g', 'b'):
+            out.append(Parameter(Option(
+                name=f'exp_scale_{filt}',
+                type=float,
+                unit=Unit.NONE,
+                validate=lambda v: EXPOSURE_SCALE_MIN <= v <= EXPOSURE_SCALE_MAX,
+                default=DEFAULT_EXPOSURE_SCALE
+            )))
 
     # Focus position for SCSI_SLIDE action 0x10, on models whose slide command
     # carries one. Absent otherwise, so it cannot be set on a scanner that would
