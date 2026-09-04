@@ -176,5 +176,5 @@ def parse_inquiry(raw: bytes) -> InquiryResponse:
         production=txt(raw[120:124]),
         timestamp=txt(raw[124:144]),
         signature=txt(raw[144:184]),
-        slide_transport=model_nr == 0x3a or model_nr == 0x2f
+        slide_transport=capabilities_for(model_nr).film_transport
     )

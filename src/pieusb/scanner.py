@@ -16,6 +16,7 @@ from pieusb.postprocess import (
 )
 from pieusb.types import (
     DeviceInfo,
+    EjectDirection,
     UpdateData,
     ScanResult,
     ScanPhase
@@ -32,8 +33,13 @@ from pieusb.transport import (
     SCSI_PARAM,
     SCSI_COPY,
     SCSI_SLIDE,
+    SLIDE_EJECT_DOWN,
+    SLIDE_EJECT_UP,
     SLIDE_INIT,
-    SLIDE_NEXT
+    SLIDE_NEXT,
+    SLIDE_OFFSET_BACK,
+    SLIDE_OFFSET_FORWARD,
+    SLIDE_PREV
 )
 from pieusb.exceptions import (
     CheckCondition,
@@ -97,6 +103,18 @@ CLOSE_WAIT_S = 90
 # decodes; SANE asks 12 and CyberView 11, and the device pads either way.
 READ_STATE_SIZE = 8
 
+# READ STATE byte 6. Bit 0 is attested across every capture; the rest are read
+# off one filmstrip walk through six frames, so treat them as provisional and
+# prefer TransportState.flags if they disagree with a device in hand.
+STATE_MEDIUM_PRESENT = 0x01
+STATE_CAN_ADVANCE = 0x08
+STATE_CAN_REWIND = 0x10
+STATE_AT_LAST_FRAME = 0x20
+
+# SCSI_SLIDE offset steps are 1/240 inch.
+OFFSET_STEPS_PER_INCH = 240
+OFFSET_STEPS_PER_MM = OFFSET_STEPS_PER_INCH / 25.4
+
 # REMOVE BEFORE RELEASE, together with the two log.warning calls that use it,
 # once a scanner with a slide transport has run these commands.
 UNVERIFIED_TRANSPORT = (
@@ -117,6 +135,11 @@ class TransportState:
     flags: int
     at_limit: bool
     raw: bytes
+
+    medium_present = property(lambda s: bool(s.flags & STATE_MEDIUM_PRESENT))
+    can_advance = property(lambda s: bool(s.flags & STATE_CAN_ADVANCE))
+    can_rewind = property(lambda s: bool(s.flags & STATE_CAN_REWIND))
+    at_last_frame = property(lambda s: bool(s.flags & STATE_AT_LAST_FRAME))
 
 @dataclass(frozen=True)
 class _ShadingReference:
@@ -247,13 +270,15 @@ class Scanner:
             raise WarmingUp(f"scanner still warming up after {timeout_s}s")
         raise DeviceNotReady(f"scanner did not become ready within {timeout_s}s ({reason})")
 
-    def _slide(self, action: int, value: int = 0x01) -> None:
+    def _slide(self, action: int, value: int = 0x01, byte3: int = 0x00) -> None:
         """Issue one slide-transport command, returning once the mechanism is idle.
 
-        `value` is the action's parameter byte: a focus position for SLIDE_INIT,
-        a frame count for SLIDE_NEXT.
+        `value` is the action's parameter byte: a focus position for SLIDE_INIT, a
+        frame count for SLIDE_NEXT and SLIDE_PREV, a step count for the offsets.
+        `byte3` has no known meaning; both vendors leave it 0 except on SLIDE_PREV,
+        where the one captured payload sets it to 1.
         """
-        self.dev.command(SCSI_SLIDE, out_data=bytes([action, value, 0x00, 0x00]))
+        self.dev.command(SCSI_SLIDE, out_data=bytes([action, value, 0x00, byte3]))
         if action == SLIDE_INIT:
             self._transport_initialized = True
         self.wait_ready()
@@ -318,7 +343,7 @@ class Scanner:
 
     def _require_slide_transport(self) -> None:
         """Raise unless the caller may drive the slide transport right now."""
-        if not self.info.inquiry.slide_transport:
+        if not self.info.capabilities.film_transport:
             raise PieusbError(f"{self.info.model} has no slide transport")
         if self.scan_in_progress:
             raise ScanInProgress("cannot drive the slide transport while a scan is running")
@@ -334,8 +359,8 @@ class Scanner:
         log.warning(UNVERIFIED_TRANSPORT)
         self._slide(SLIDE_INIT, self._focus_for_scan())
 
-    def advance(self) -> None:
-        """Advance the slide transport by one slide, blocking until it is idle.
+    def advance(self, frames: int = 1) -> None:
+        """Advance the medium by `frames`, blocking until the transport is idle.
 
         scan() never moves the medium; the caller decides when it does. A batch can
         therefore keep one frame in the gate for as many passes as it wants, and
@@ -345,13 +370,55 @@ class Scanner:
         device -- and PieusbError on a scanner without a slide transport. Nothing
         in the protocol describes magazine state, so this cannot report an
         exhausted magazine: the device either fails the command in its own terms
-        or the advance appears to succeed.
+        or the advance appears to succeed. `TransportState.can_advance` is the
+        closest thing to a warning.
         """
         self._require_slide_transport()
+        self._step_frames(SLIDE_NEXT, frames)
+
+    def rewind(self, frames: int = 1) -> None:
+        """Move the medium back by `frames`, blocking until the transport is idle."""
+        self._require_slide_transport()
+        self._step_frames(SLIDE_PREV, frames)
+
+    def _step_frames(self, action: int, frames: int) -> None:
+        if not 1 <= frames <= 0xFF:
+            raise ValueError(f"frames must be 1..255, got {frames}")
         log.warning(UNVERIFIED_TRANSPORT)
         if not self._transport_initialized:
             self._slide(SLIDE_INIT, self._focus_for_scan())
-        self._slide(SLIDE_NEXT)
+        self._slide(action, frames, byte3=0x01 if action == SLIDE_PREV else 0x00)
+
+    def offset_frame(self, mm: float) -> None:
+        """Shift the medium off its detected frame position by `mm`.
+
+        For a filmstrip whose frame boundaries the scanner reads differently from
+        where the images actually are. The step is 1/240 inch and the move is
+        relative, so undo it with the opposite sign once the frame is scanned --
+        both vendor applications bracket a scan that way rather than tracking an
+        absolute position.
+
+        Which way a positive `mm` moves the film is not established; it is the
+        direction the vendor applications use for a positive offset in their own
+        interface.
+        """
+        self._require_slide_transport()
+        steps = int(abs(mm) * OFFSET_STEPS_PER_MM)
+        if not 1 <= steps <= 0xFF:
+            raise ValueError(
+                f"{mm} mm is {steps} steps of 1/{OFFSET_STEPS_PER_INCH} inch; "
+                f"the field carries 1..255"
+            )
+        log.warning(UNVERIFIED_TRANSPORT)
+        self._slide(SLIDE_OFFSET_FORWARD if mm > 0 else SLIDE_OFFSET_BACK, steps)
+
+    def eject(self, direction: EjectDirection = EjectDirection.UP) -> None:
+        """Eject the medium, blocking until the transport is idle."""
+        self._require_slide_transport()
+        log.warning(UNVERIFIED_TRANSPORT)
+        action = (SLIDE_EJECT_UP if direction is EjectDirection.UP
+                  else SLIDE_EJECT_DOWN)
+        self._slide(action, 0x00)
 
     def _start_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=1)
@@ -757,7 +824,7 @@ class Scanner:
 
         # Sent before every START SCAN on a transport-equipped scanner, matching
         # the SANE backend's ordering (pieusb.c:1062-1072).
-        if self.info.inquiry.slide_transport:
+        if self.info.capabilities.film_transport:
             log.debug("[scan] initialising the slide transport...")
             self._slide(SLIDE_INIT, self._focus_for_scan())
 

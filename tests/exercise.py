@@ -53,7 +53,13 @@ import pieusb
 from pieusb.exceptions import DeviceNotReady, ParamError, PieusbError, WarmingUp
 from pieusb.option import Unit
 from pieusb.scanner import Scanner
-from pieusb.types import DeviceInfo, ScanPhase, ScanResult, UpdateData
+from pieusb.types import (
+    DeviceInfo,
+    EjectDirection,
+    ScanPhase,
+    ScanResult,
+    UpdateData,
+)
 
 MM_PER_INCH = 25.4
 
@@ -439,15 +445,21 @@ def save_png(r: ScanResult, prefix: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def advance_slide(scanner: Scanner) -> int:
-    print("\nAdvancing the slide transport...")
+def move_transport(scanner: Scanner, what: str, action) -> int:
+    """Run one transport move and report the state it left behind."""
+    print(f"\n{what}...")
     try:
-        scanner.advance()
-    except PieusbError as e:
-        print(f"Could not advance: {type(e).__name__}: {e}")
+        action()
+    except (PieusbError, ValueError) as e:
+        print(f"Could not {what.lower()}: {type(e).__name__}: {e}")
         return 1
-    print("Advanced.")
-    return 0
+    print("Done.")
+    return report_transport_state(scanner)
+
+
+def advance_slide(scanner: Scanner, frames: int = 1) -> int:
+    return move_transport(scanner, f"Advancing {frames} frame(s)",
+                          lambda: scanner.advance(frames))
 
 
 def parse_args(argv=None):
@@ -473,11 +485,19 @@ def parse_args(argv=None):
     g.add_argument('-o', '--option', action='append', default=[], metavar='NAME=VALUE',
                    help='set any other option from the table; repeatable')
 
-    g = p.add_argument_group('slide transport (DigitDia 4000/6000 only)')
+    g = p.add_argument_group('slide transport (models with a film transport)')
     g.add_argument('--advance', action='store_true',
                    help='advance to the next slide once the scan has completed')
     g.add_argument('--advance-only', action='store_true',
                    help='advance to the next slide and exit, without scanning anything')
+    g.add_argument('--frames', type=int, default=1, metavar='N',
+                   help='how many frames --advance-only or --rewind moves (default 1)')
+    g.add_argument('--rewind', action='store_true',
+                   help='move back --frames frames and exit')
+    g.add_argument('--eject', choices=('up', 'down'),
+                   help='eject the medium and exit')
+    g.add_argument('--offset-mm', type=float, metavar='MM',
+                   help='shift the medium off its detected frame position and exit')
 
     g = p.add_argument_group('output')
     g.add_argument('--output', default='scan', metavar='PREFIX',
@@ -548,7 +568,21 @@ def main(argv=None) -> int:
 
     with Scanner(devices[args.device]) as scanner:
         if args.advance_only:
-            return advance_slide(scanner)
+            return advance_slide(scanner, args.frames)
+
+        if args.rewind:
+            return move_transport(scanner, f"Rewinding {args.frames} frame(s)",
+                                  lambda: scanner.rewind(args.frames))
+
+        if args.eject is not None:
+            return move_transport(scanner, f"Ejecting {args.eject}",
+                                  lambda: scanner.eject(EjectDirection.UP
+                                                        if args.eject == 'up'
+                                                        else EjectDirection.DOWN))
+
+        if args.offset_mm is not None:
+            return move_transport(scanner, f"Offsetting by {args.offset_mm} mm",
+                                  lambda: scanner.offset_frame(args.offset_mm))
 
         if args.transport_state:
             return report_transport_state(scanner)

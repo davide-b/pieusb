@@ -33,6 +33,11 @@ class OptionalDevices(StrEnum):
     DEV_TP = "TransModule"
     DEV_ADF = "ADF"
 
+class EjectDirection(StrEnum):
+    '''Which way SCSI_SLIDE ejects the medium.'''
+    UP = 'Up'
+    DOWN = 'Down'
+
 class ExposureControl(StrEnum):
     '''Which field actually changes a scan's exposure on a given model.
 

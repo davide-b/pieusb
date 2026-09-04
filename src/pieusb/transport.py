@@ -45,8 +45,15 @@ SCSI_WRITE_GAIN_OFFSET = 0xDC
 SCSI_READ_STATE = 0xDD
 SCSI_SLIDE = 0xD1
 
-# SCSI_SLIDE actions, carried in the first byte of its payload
+# SCSI_SLIDE actions, carried in the first byte of its payload. The second byte
+# is the action's parameter: a step count for the offsets, a frame count for
+# NEXT/PREV, a focus position for INIT.
+SLIDE_OFFSET_FORWARD = 0x00
+SLIDE_OFFSET_BACK = 0x01
+SLIDE_EJECT_DOWN = 0x02
+SLIDE_EJECT_UP = 0x03
 SLIDE_NEXT = 0x04
+SLIDE_PREV = 0x05
 SLIDE_INIT = 0x10
 
 # "Virtual" sub-commands written via SCSI_WRITE (little-endian 16-bit code
