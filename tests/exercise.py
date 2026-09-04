@@ -445,6 +445,19 @@ def save_png(r: ScanResult, prefix: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def dump_inquiry(info: DeviceInfo) -> int:
+    """Print the raw INQUIRY reply, for building a byte-exact test fixture."""
+    from pieusb.transport import SCSI_INQUIRY, UASDevice
+    with UASDevice(info.dev) as dev:
+        header = dev.command(SCSI_INQUIRY, in_size=5, cdb_length=5)
+        total = header[4] + 4
+        raw = dev.command(SCSI_INQUIRY, in_size=total, cdb_length=total)
+    print(f"\nINQUIRY, {len(raw)} bytes (additional_length {header[4]}):")
+    for offset in range(0, len(raw), 16):
+        print(f"  {offset:3d}: {raw[offset:offset + 16].hex(' ')}")
+    return 0
+
+
 def move_transport(scanner: Scanner, what: str, action) -> int:
     """Run one transport move and report the state it left behind."""
     print(f"\n{what}...")
@@ -467,6 +480,8 @@ def parse_args(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument('--inquiry-hex', action='store_true',
+                   help='dump the raw INQUIRY reply as hex and exit')
     p.add_argument('--list', action='store_true',
                    help='enumerate scanners, print their INQUIRY, and exit')
     p.add_argument('--device', type=int, default=0, metavar='N',
@@ -561,6 +576,12 @@ def main(argv=None) -> int:
 
     if args.list:
         return 0
+
+    if args.inquiry_hex:
+        if not 0 <= args.device < len(devices):
+            print(f"--device {args.device} out of range (0..{len(devices) - 1})")
+            return 1
+        return dump_inquiry(devices[args.device])
 
     if not 0 <= args.device < len(devices):
         print(f"--device {args.device} out of range (0..{len(devices) - 1})")

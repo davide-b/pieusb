@@ -107,6 +107,11 @@ def max_relative_exposure(exposure_time: int) -> int:
 OBSERVED_EXPOSURE_TIME = 4100
 MAX_RELATIVE_EXPOSURE = max_relative_exposure(OBSERVED_EXPOSURE_TIME)
 
+# exp_time_*, in Timer 1 counts. 2937 is SANE's DEFAULT_EXPOSURE
+# (pieusb_specific.h:105) and the floor both ProScan 4000 drivers clamp to.
+DEFAULT_EXPOSURE_TIME = 2937
+EXPOSURE_TIME_MAX = 0xFFFF
+
 # SCSI_SLIDE's focus byte. 1 is the near end of the range on every model that has
 # a focus motor; the far end is holder-dependent and only the device knows it, so
 # Scanner clamps against READ STATE rather than validating here.
@@ -414,22 +419,21 @@ def generate_options(inq: InquiryResponse,
     # unknown, so all of them are still sent, and exp_time_*'s documented meaning
     # is recorded below for the ones where it may work.
     #
-    # Nominally the firmware optimises exp_time_* during warm-up until R and B
-    # reach >=90% of full scale and G >=80% (pieusb_scancmd.h:188-197), then resets
-    # them to 0x0B79 = 2937, SANE's DEFAULT_EXPOSURE (pieusb_specific.h:105). This
-    # unit reports a flat 4100 for all four channels and ignores what it is sent.
+    # The firmware optimises exp_time_* during warm-up until R and B reach >=90%
+    # of full scale and G >=80% (pieusb_scancmd.h:188-197), then reports what it
+    # settled on through GET GAIN OFFSET. A ProScan 10T reports a flat 4100 and
+    # ignores what it is sent; a ProScan 4000 reports 10286/7345/4405 and honours
+    # it.
     #
-    # The advertised maximum is multiplied by 4 because it does not otherwise
-    # contain 2937 -- the device's own default is out of its own reported range.
-    # SANE applies the same factor (pieusb_specific.c:391).
-    DEFAULT_EXPOSURE_TIME = 2937
-    exposure_time_max = inq.maximum_exposure * 4
+    # INQUIRY's maximum_exposure is not a bound. Both models advertise 2500, the
+    # 4000's own calibration exceeds even four times that, and its drivers write
+    # up to 65535. The 16-bit wire field is the only real limit.
     for filt in ('r', 'g', 'b', 'i'):
         out.append(Parameter(Option(
             name=f'exp_time_{filt}',
             type=int,
             unit=Unit.TIMER_COUNTS,
-            validate=lambda v: inq.minimum_exposure <= v <= exposure_time_max,
+            validate=lambda v: inq.minimum_exposure <= v <= EXPOSURE_TIME_MAX,
             default=DEFAULT_EXPOSURE_TIME
         )))
 
