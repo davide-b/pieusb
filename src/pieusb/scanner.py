@@ -581,7 +581,8 @@ class Scanner:
         self._emit(replace(update, phase=ScanPhase.METERING))
 
     def _result(self, rgb=None, ir=None, *, started: float, width: int = 0, height: int = 0,
-                shading_corrected: bool = False, cancelled: bool = False,
+                shading_corrected: bool = False, shading_acquired: bool = False,
+                cancelled: bool = False,
                 error: Exception | None = None) -> ScanResult:
         """Build a ScanResult, filling in the settings the scan actually ran with."""
         return ScanResult(
@@ -593,6 +594,11 @@ class Scanner:
             color_depth=self.params['color_depth'].value,
             resolution=self.params['resolution'].value,
             shading_corrected=shading_corrected,
+            shading_acquired=shading_acquired,
+            # Read here rather than passed in: _result is called from inside the
+            # _absolute_exposure() context, so these are the seeded values.
+            exposure=tuple(self.params[f'exp_time_{s}'].value for s in CHANNEL_SUFFIX),
+            gain=tuple(self.params[f'gain_{s}'].value for s in CHANNEL_SUFFIX),
             cancelled=cancelled,
             error=error,
             duration_s=time.monotonic() - started,
@@ -731,12 +737,12 @@ class Scanner:
         level does not depend on resolution there, so metering at preview
         resolution carries over to the real scan.
 
-        On a ProScan 4000 the absolute level does not follow: a 2.0x exposure
-        measured 1.16x, metering at 300 dpi for a 900 dpi scan. Either exp_time is
-        sub-linear there or the level tracks resolution; see PLAN-proscan4000.md
-        T27. Its ratio behaviour is untested -- the one run was black-and-white
-        film, already balanced to 1.02 : 0.96 : 1.00 by the device's own
-        calibration before metering saw it.
+        On a ProScan 4000 metering is not trustworthy yet, and the reason is not
+        the metering: exp_time only reaches the sensor on a pass that skips the
+        device's own shading analysis, and every pass this runs has it running.
+        Both passes therefore meter an exposure the device chose for itself. That
+        is what makes it read 1.16x for a 2.0x request. See PLAN-proscan4000.md
+        7d, and T34 for the test that settles it.
 
         The ceiling per channel comes from the device: exp_rel scales the exposure
         time the scanner reports for itself into a 16-bit Timer 1 count, and past
@@ -1117,6 +1123,7 @@ class Scanner:
             width=width,
             height=usable_height,
             shading_corrected=shading_corrected,
+            shading_acquired=acquire,
         )
 
     def scan(self, on_update: Callable[[UpdateData], None], on_complete: Callable[[ScanResult], None]) -> None:

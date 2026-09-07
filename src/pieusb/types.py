@@ -137,6 +137,17 @@ class ScanResult:
 
     `width`/`height` come from the device's own GET PARAMETERS mid-scan, not from
     the requested frame, and can differ from what the options asked for.
+
+    `shading_acquired` says whether the device ran its own shading analysis for
+    this pass. It matters beyond the reference: on a model whose exposure control
+    is ABSOLUTE, a pass that analyses also re-derives its own exposure and
+    overrides `exp_time_*`, so only a pass with this False can honour one.
+
+    `exposure` and `gain` are the per-filter values the pass actually sent, R G B
+    I. Unlike the other settings here they are not simply what the caller asked
+    for: on an ABSOLUTE model they are seeded from the device's own calibration
+    and scaled by `exp_scale_*`, so this is the only record of what a given pass
+    ran with.
     '''
     rgb: numpy.ndarray | None
     ir: numpy.ndarray | None = None
@@ -146,6 +157,9 @@ class ScanResult:
     color_depth: int = 0
     resolution: int = 0
     shading_corrected: bool = False
+    shading_acquired: bool = False
+    exposure: tuple[int, int, int, int] = (0, 0, 0, 0)
+    gain: tuple[int, int, int, int] = (0, 0, 0, 0)
     cancelled: bool = False
     error: Exception | None = None
     duration_s: float = 0.0

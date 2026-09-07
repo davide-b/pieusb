@@ -29,6 +29,18 @@ Which field carries the exposure depends on the model, and `--list` reports it:
 
           python tests/exercise.py -o exp_scale_r=2.0 --output brighter
 
+      But a pass on which the device runs its own shading analysis re-derives its
+      own exposure and overrides exp_time_*, so the scale only reaches the sensor
+      once a shading reference is cached and reuse_calibration asks to skip the
+      analysis. That takes two passes on one open Scanner, which is --repeat:
+
+          python tests/exercise.py --repeat 2 -o reuse_calibration=true \
+              -o exp_scale_r=2 -o exp_scale_g=2 -o exp_scale_b=2
+
+      Pass 1 calibrates and ignores the scale; pass 2 skips and should honour it.
+      Each pass says which regime it ran under, and the run ends with the level
+      ratio between them.
+
 auto_exp meters a preview pass and sets whichever of the two the model honours.
 It costs one extra pass:
 
@@ -134,6 +146,15 @@ def report_gain_offset(scanner: Scanner) -> None:
         print(f"   <- lamp level; scan manually with -o light={s['light']} to match it")
     print("  (the lamp decrements from 7 as it warms and settles at 4; "
           "pieusb_scancmd.h:208-213)")
+
+
+def report_calibration(scanner: Scanner) -> None:
+    """report_gain_offset, tolerating a scanner that will not answer yet."""
+    try:
+        report_gain_offset(scanner)
+    except PieusbError as e:
+        print(f"\nCould not read the scanner's calibration: {type(e).__name__}: {e}")
+        print("  (a warming-up scanner may refuse this read; try again in a minute)")
 
 
 def show_options(scanner: Scanner) -> None:
@@ -324,7 +345,7 @@ def summarize_plane(name: str, plane: numpy.ndarray) -> None:
           f"zero={zero * 100 / total:5.2f}%  saturated={sat * 100 / total:5.2f}%")
 
 
-def report_result(r: ScanResult, args) -> int:
+def report_result(r: ScanResult, args, prefix: Path) -> int:
     print()
     if r.error is not None:
         print(f"FAILED after {r.duration_s:.1f}s: {type(r.error).__name__}: {r.error}")
@@ -337,6 +358,16 @@ def report_result(r: ScanResult, args) -> int:
     print(f"OK in {r.duration_s:.1f}s: {r.width} x {r.height}, mode {r.mode}, "
           f"{r.color_depth}-bit, {r.resolution} dpi, "
           f"shading {'corrected' if r.shading_corrected else 'NOT corrected'}")
+    # Which of the two exposure regimes this pass ran under. A pass that analyses
+    # re-derives its own exposure on an absolute-exposure model, so exp_time_*
+    # only reaches the sensor on a pass that skipped.
+    if r.shading_acquired:
+        print("  shading analysis: RUN by the device -- it chose its own exposure, "
+              "so exp_time_* did not reach the sensor")
+    else:
+        print("  shading analysis: SKIPPED -- exp_time_* was in force this pass")
+    print(f"  sent exposure   : {r.exposure} timer counts (R, G, B, I)")
+    print(f"  sent gain       : {r.gain}")
     print(f"  rgb {r.rgb.shape} {r.rgb.dtype}"
           + (f", ir {r.ir.shape} {r.ir.dtype}" if r.ir is not None else ", no ir plane"))
 
@@ -348,7 +379,6 @@ def report_result(r: ScanResult, args) -> int:
     if r.rgb.max() == 0:
         print("  WARNING: the image is entirely black -- check lamp, exposure and gain")
 
-    prefix = Path(args.output)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     rgb_path = prefix.with_name(prefix.name + '_rgb.npy')
     numpy.save(rgb_path, r.rgb)
@@ -456,6 +486,83 @@ def save_png(r: ScanResult, prefix: Path) -> None:
     print(f"  saved {png_path}{note}")
 
 
+def run_one_pass(scanner: Scanner, args, prefix: Path) -> tuple[int, ScanResult | None]:
+    """Run a single scan on an already-configured Scanner and report it."""
+    box: list[ScanResult] = []
+    try:
+        scanner.scan(Progress(), box.append)
+    except PieusbError as e:
+        print(f"Could not start the scan: {type(e).__name__}: {e}")
+        return 1, None
+
+    # Short waits in a loop keep Ctrl-C responsive; join() does not deliver
+    # KeyboardInterrupt.
+    try:
+        while not scanner.wait(0.2):
+            pass
+    except KeyboardInterrupt:
+        print("\nCancelling -- the worker stops at the next chunk boundary...")
+        scanner.cancel()
+        scanner.wait()
+
+    # wait() returned True, so the worker is done and on_complete has run.
+    result = box[0]
+    return report_result(result, args, prefix), result
+
+
+def compare_passes(results: list[ScanResult], scales: tuple | None = None) -> None:
+    """Level of every pass against the first, per channel.
+
+    This is what a `--repeat 2 -o reuse_calibration=true` run is for. Both passes
+    send the same exposure; only the second has the shading analysis skipped, so
+    on a ProScan 4000 only the second can have had that exposure reach the sensor
+    -- the first ran at whatever the device's own analysis chose. So the number to
+    check pass 2's level ratio against is exp_scale_*, not the exposure ratio
+    between the passes, which is 1 by construction.
+    """
+    print("\n" + "=" * 72)
+    print("Pass comparison (mean level per channel, and its ratio to pass 1)")
+    print("=" * 72)
+    base = None
+    for i, r in enumerate(results, 1):
+        if r.rgb is None:
+            print(f"  pass {i}: no image")
+            continue
+        means = [float(r.rgb[:, :, c].mean()) for c in range(3)]
+        if r.ir is not None:
+            means.append(float(r.ir.mean()))
+        # A clipped channel cannot report a level ratio: its mean is held down by
+        # the ceiling, so an exposure that took effect still reads as less than it
+        # asked for. Worth saying loudly, since it is the one way these ratios lie.
+        full = numpy.iinfo(r.rgb.dtype).max
+        clipped = [float((r.rgb[:, :, c] == full).mean()) * 100 for c in range(3)]
+        if r.ir is not None:
+            clipped.append(float((r.ir == full).mean()) * 100)
+        if base is None:
+            base = means
+            base_exp = r.exposure
+        cells = "  ".join(
+            f"{n}={m:8.1f} ({'x%.3f' % (m / b) if b else '  -  '})"
+            for n, m, b in zip("RGBI", means, base))
+        print(f"  pass {i}: {r.duration_s:6.1f}s  "
+              f"shading {'analysed' if r.shading_acquired else 'SKIPPED ':8}  {cells}")
+        # The exposure each pass asked for, next to the level it got. Equal
+        # exposures with unequal levels is the whole question.
+        exp = "  ".join(
+            f"{n}={e:6d} ({'x%.3f' % (e / b) if b else '  -  '})"
+            for n, e, b in zip("RGBI"[:len(means)], r.exposure, base_exp))
+        print(f"          {'':>29}exp {exp}")
+        if max(clipped) > 0.5:
+            print(f"          {'':>29}"
+                  f"WARNING clipped {' '.join('%s=%.1f%%' % (n, c) for n, c in zip('RGBI', clipped))}"
+                  f" -- these level ratios understate the exposure")
+    print("=" * 72)
+    if scales:
+        print(f"exp_scale_r/g/b asked for: {scales}")
+        print("With reuse_calibration and >1 pass, that is what pass 2's level ratio "
+              "should be.\nA ratio near x1 means exp_time_* did not reach the sensor.")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -534,6 +641,12 @@ def parse_args(argv=None):
                    help='write PREFIX_rgb.npy / PREFIX_ir.npy (default: scan)')
     g.add_argument('--png', action='store_true',
                    help='also write an 8-bit PNG preview, if Pillow is installed')
+    g.add_argument('--repeat', type=int, default=1, metavar='N',
+                   help='run N scans on one open Scanner, writing PREFIX_passN_*, and '
+                        'compare their levels. With -o reuse_calibration=true only the '
+                        'first pass lets the device run its shading analysis, so passes '
+                        '2..N are the ones whose exp_time_* reaches the sensor '
+                        '(default: 1)')
 
     g = p.add_argument_group('focus (models with a focus motor)')
     g.add_argument('--transport-state', action='store_true',
@@ -639,15 +752,6 @@ def main(argv=None) -> int:
             return 1
 
         show_options(scanner)
-
-        if args.gain_offset:
-            try:
-                report_gain_offset(scanner)
-            except PieusbError as e:
-                print(f"\nCould not read the scanner's calibration: "
-                      f"{type(e).__name__}: {e}")
-                print("  (a warming-up scanner may refuse this read; try again in a minute)")
-
         report_frame(scanner)
 
         try:
@@ -658,9 +762,16 @@ def main(argv=None) -> int:
             print(f"\nInvalid option combination: {e}")
             return 1
 
+        if args.gain_offset:
+            report_calibration(scanner)
+
         if args.dry_run:
             print("\n--dry-run: options are valid, stopping without scanning.")
             return 0
+
+        if args.repeat < 1:
+            print(f"--repeat {args.repeat}: nothing to do")
+            return 1
 
         print(f"\nWaiting for the scanner to be ready (up to {args.warmup_timeout:.0f}s)...")
         try:
@@ -672,30 +783,38 @@ def main(argv=None) -> int:
             print(f"Not ready: {e}")
             return 1
 
-        box: list[ScanResult] = []
+        # Every pass shares one Scanner, which is what makes reuse_calibration
+        # mean anything: the shading reference it reuses is per-Scanner, so a
+        # second pass run from a second process would calibrate again.
+        results: list[ScanResult] = []
+        status = 0
+        for n in range(1, args.repeat + 1):
+            prefix = Path(args.output)
+            if args.repeat > 1:
+                prefix = prefix.with_name(f"{prefix.name}_pass{n}")
+                print(f"\n--- pass {n} of {args.repeat} " + "-" * 40)
+                # The device re-reports its calibration after a pass that
+                # analysed, so printing it per pass shows whether it moved.
+                if args.gain_offset and n > 1:
+                    report_calibration(scanner)
+            print("Scanning. Ctrl-C cancels.\n")
+            status, result = run_one_pass(scanner, args, prefix)
+            if result is None:
+                return status
+            results.append(result)
+            if result.cancelled or result.error is not None:
+                break
 
-        print("Scanning. Ctrl-C cancels.\n")
-        try:
-            scanner.scan(Progress(), box.append)
-        except PieusbError as e:
-            print(f"Could not start the scan: {type(e).__name__}: {e}")
-            return 1
+        if len(results) > 1:
+            # exp_scale_* exists only where exp_time is the live control.
+            names = {par.opt.name for par in scanner.params.table}
+            scales = (tuple(scanner.params[f'exp_scale_{c}'].value
+                            for c in ('r', 'g', 'b'))
+                      if 'exp_scale_r' in names else None)
+            compare_passes(results, scales)
 
-        # Short waits in a loop keep Ctrl-C responsive; join() does not deliver
-        # KeyboardInterrupt.
-        try:
-            while not scanner.wait(0.2):
-                pass
-        except KeyboardInterrupt:
-            print("\nCancelling -- the worker stops at the next chunk boundary...")
-            scanner.cancel()
-            scanner.wait()
-
-        # wait() returned True, so the worker is done and on_complete has run.
         # Leaving this scope closes the device.
-        result = box[0]
-        status = report_result(result, args)
-
+        result = results[-1]
         if args.advance:
             if result.cancelled or result.error is not None:
                 print("\nNot advancing: the scan did not complete.")
