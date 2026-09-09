@@ -15,6 +15,7 @@ You need to add a udev rule
 ```shell
 sudo tee /etc/udev/rules.d/60-pieusb.rules >/dev/null <<'EOF'
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0142", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0143", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0144", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0145", TAG+="uaccess"
 EOF
@@ -24,6 +25,7 @@ If you only care about operating one scanner, you can skip the lines with irrele
 
 | Model | `ATTR{idProduct}` |
 |---|---|
+| ProScan 4000 | 0143 |
 | DigitDia 6000 Multiple Slide Scanner | 0142 |
 | CrystalScan 7200 | 0145 |
 | ProScan 7200 | 0145 |
