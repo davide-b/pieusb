@@ -2,6 +2,10 @@
 
 Python package to enable interfacing with USB-connected Reflecta (a.k.a. PacificImage) film and dia scanners.
 
+# Testers wanted!
+
+![Discord Banner 2](https://discord.com/api/guilds/1545399511654998109/widget.png?style=banner2)
+
 ## Prerequisites
 
 ### Windows
