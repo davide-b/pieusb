@@ -115,11 +115,14 @@ MAX_RELATIVE_EXPOSURE = max_relative_exposure(OBSERVED_EXPOSURE_TIME)
 DEFAULT_EXPOSURE_TIME = 2937
 EXPOSURE_TIME_MAX = 0xFFFF
 
-# exp_scale_*, the per-channel multiplier on the device's own exposure time.
-# Bounds are the range VueScan's own gain sliders offer.
-DEFAULT_EXPOSURE_SCALE = 1.0
-EXPOSURE_SCALE_MIN = 0.001
-EXPOSURE_SCALE_MAX = 200.0
+# 'exposure' and 'exposure_r/g/b': a multiplier on the exposure the scanner
+# calibrated for itself, 1.0 being that exposure. Bounds are the range VueScan's
+# own gain sliders offer; each model narrows them further, see
+# OptionsTable.validate() and Scanner._exposure().
+DEFAULT_EXPOSURE_FACTOR = 1.0
+EXPOSURE_FACTOR_MIN = 0.001
+EXPOSURE_FACTOR_MAX = 200.0
+EXPOSURE_FACTOR_OPTIONS = ('exposure_r', 'exposure_g', 'exposure_b')
 
 
 def scale_exposure_times(base, factors):
@@ -185,6 +188,10 @@ class Option(Generic[T]):
     unit: Unit
     validate: Callable[[T], bool]
     default: T
+    # A device field exposed for debugging, which the library otherwise derives
+    # from a generic option -- the exposure ones from 'exposure'. Settable, and a
+    # value the caller sets wins over the derived one.
+    advanced: bool = False
 
 class Parameter:
     def __init__(self, opt: Option):
@@ -197,10 +204,17 @@ class Parameter:
         self.assigned = False
 
 class OptionsTable:
-    def __init__(self, params: list[Parameter], inq: InquiryResponse) -> None:
+    def __init__(self, params: list[Parameter], inq: InquiryResponse,
+                 capabilities: Capabilities | None = None) -> None:
         self.table = params
         # Kept so validate() can re-check the frame against the reported bed.
         self.inq = inq
+        self.capabilities = capabilities or Capabilities()
+
+    def exposure_factors(self) -> tuple[float, float, float]:
+        """'exposure' times each of 'exposure_r/g/b': what R, G and B ask for."""
+        master = self['exposure'].value
+        return tuple(master * self[name].value for name in EXPOSURE_FACTOR_OPTIONS)
 
     def __getitem__(self, key) -> Parameter:
         try:
@@ -281,9 +295,22 @@ class OptionsTable:
         if self['fast_infrared'].value and mode != 'rgbi':
             log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
 
-        # exp_rel_* is the exposure control and is meant to be moved. Warned about
-        # rather than refused: the real ceiling depends on the exposure time the
-        # device reports, which only Scanner gets to read.
+        # The generic exposure against what a relative model can do. Warned about
+        # rather than refused, and clamped at scan time: the real ceiling depends
+        # on the exposure time the device reports, which only Scanner reads.
+        if self.capabilities.exposure_control is ExposureControl.RELATIVE:
+            ceiling = MAX_RELATIVE_EXPOSURE / DEFAULT_RELATIVE_EXPOSURE
+            for c, factor in zip('RGB', self.exposure_factors()):
+                if factor < 1.0:
+                    log.warning(f"exposure {factor:g} on {c}: this scanner can only "
+                                f"lengthen its exposure, so it scans at 1.0")
+                elif factor > ceiling:
+                    log.warning(f"exposure {factor:g} on {c}: above the ~{ceiling:.1f} "
+                                f"this scanner reaches; it will be clamped")
+
+        # exp_rel_* set directly, for debugging. Warned about rather than refused:
+        # the real ceiling depends on the exposure time the device reports, which
+        # only Scanner gets to read.
         high = [
             f'{n}={self[n].value}' for n in ('exp_rel_r', 'exp_rel_g', 'exp_rel_b')
             if self[n].value > MAX_RELATIVE_EXPOSURE
@@ -379,14 +406,10 @@ def generate_options(inq: InquiryResponse,
         default=False
     )))
 
-    # Meter a preview pass and set exp_rel_* per channel from it, instead of
-    # scanning with whatever they hold. Costs one extra pass at the device's preview
-    # resolution; see Scanner._meter_exposure.
-    #
-    # Nothing else is derived, because nothing else has an effect: exp_rel_* is the
-    # only exposure control this hardware honours (see the exposure section below).
-    # In particular this does NOT adopt the device's own gain/exposure calibration
-    # the way the C's SCAN_CALIBRATION_AUTO does -- those values are inert here.
+    # Meter a preview pass and set exposure_r/g/b from it, instead of scanning with
+    # whatever they hold. 'exposure' still applies on top, as compensation. Costs
+    # one extra pass at the device's preview resolution; see
+    # Scanner._meter_exposure.
     out.append(Parameter(Option(
         name='auto_exp',
         type=bool,
@@ -394,6 +417,25 @@ def generate_options(inq: InquiryResponse,
         validate=lambda v: type(v) is bool,
         default=False
     )))
+
+    # THE exposure control, the same on every model: a multiplier on the exposure
+    # the scanner calibrated for itself, so 1.0 is that exposure and 2.0 twice it.
+    # 'exposure' scales the whole image; 'exposure_r/g/b' scale one channel on top
+    # of it, which is what balances a colour negative's orange mask. The infrared
+    # plane keeps the device's own exposure.
+    #
+    # Scanner translates it into whichever device field the model honours (see
+    # Capabilities.exposure_control and Scanner._exposure()), and runs an extra
+    # calibration pass where the model needs one for the exposure to take effect.
+    # How far it reaches depends on the model: a relative one cannot go below 1.0.
+    for name in ('exposure',) + EXPOSURE_FACTOR_OPTIONS:
+        out.append(Parameter(Option(
+            name=name,
+            type=float,
+            unit=Unit.NONE,
+            validate=lambda v: EXPOSURE_FACTOR_MIN <= v <= EXPOSURE_FACTOR_MAX,
+            default=DEFAULT_EXPOSURE_FACTOR
+        )))
 
     # X coordinate of the top-left corner
     out.append(Parameter(Option(
@@ -431,7 +473,10 @@ def generate_options(inq: InquiryResponse,
         default=inq.max_scan_h
     )))
 
-    # --- Exposure -------------------------------------------------------------
+    # --- Device exposure fields (advanced) -----------------------------------
+    #
+    # What 'exposure' is translated into. Settable for debugging; a value set
+    # here wins over the one 'exposure' would derive.
     #
     # Two independent controls, sent by different commands:
     #
@@ -461,15 +506,17 @@ def generate_options(inq: InquiryResponse,
             type=int,
             unit=Unit.TIMER_COUNTS,
             validate=lambda v: inq.minimum_exposure <= v <= EXPOSURE_TIME_MAX,
-            default=DEFAULT_EXPOSURE_TIME
+            default=DEFAULT_EXPOSURE_TIME,
+            advanced=True
         )))
 
     # RELATIVE percentage, a 16-bit field per filter sent by SCSI_EXPOSURE
     # (pieusb_scancmd.c:521-544). Infrared has no entry: the C struct holds three
     # colours.
     #
-    # THIS IS THE EXPOSURE CONTROL, at least on a ProScan 10T, and it is per
-    # channel. Measured against a colour negative at 300 dpi, 16-bit:
+    # The field 'exposure' drives on a relative model such as the ProScan 10T, at
+    # 100 x the factor, per channel. Measured against a colour negative at 300 dpi,
+    # 16-bit:
     #
     #   exp_rel   50    100    200    250    400    800   1086   1500   1598
     #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x10.5  x14.7  clips
@@ -496,7 +543,8 @@ def generate_options(inq: InquiryResponse,
             type=int,
             unit=Unit.PERCENT,
             validate=lambda v: 0 <= v <= 0xFFFF,
-            default=DEFAULT_RELATIVE_EXPOSURE
+            default=DEFAULT_RELATIVE_EXPOSURE,
+            advanced=True
         )))
 
     # SANE gain default 19
@@ -506,7 +554,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        default=19
+        default=19,
+        advanced=True
     )))
     
     # Gain for green channel
@@ -515,7 +564,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        default=19
+        default=19,
+        advanced=True
     )))
     
     # Gain for blue channel
@@ -524,7 +574,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        default=19
+        default=19,
+        advanced=True
     )))
     
     # Gain for infrared channel
@@ -533,7 +584,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 64, # From firmware disassembly
-        default=19
+        default=19,
+        advanced=True
     )))
 
     # SANE offset default 0
@@ -543,7 +595,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        default=0
+        default=0,
+        advanced=True
     )))
 
     # Offset for the green channel
@@ -552,7 +605,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        default=0
+        default=0,
+        advanced=True
     )))
     
     # Offset for the blue channel
@@ -561,7 +615,8 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        default=0
+        default=0,
+        advanced=True
     )))
     
     # Offset for the infrared channel
@@ -570,21 +625,9 @@ def generate_options(inq: InquiryResponse,
         type=int,
         unit=Unit.NONE,
         validate=lambda v: v >= 0 and v < 255, # From firmware disassembly
-        default=0
+        default=0,
+        advanced=True
     )))
-
-    # Per-channel multiplier on the exposure time the device reports for itself.
-    # Present only where exp_time_* is the live exposure control; where exp_rel_*
-    # is, it would do nothing.
-    if capabilities.exposure_control is ExposureControl.ABSOLUTE:
-        for filt in ('r', 'g', 'b'):
-            out.append(Parameter(Option(
-                name=f'exp_scale_{filt}',
-                type=float,
-                unit=Unit.NONE,
-                validate=lambda v: EXPOSURE_SCALE_MIN <= v <= EXPOSURE_SCALE_MAX,
-                default=DEFAULT_EXPOSURE_SCALE
-            )))
 
     # Focus position for SCSI_SLIDE action 0x10, on models whose slide command
     # carries one. Absent otherwise, so it cannot be set on a scanner that would
@@ -612,16 +655,17 @@ def generate_options(inq: InquiryResponse,
     #
     # No measurable effect on a ProScan 10T: 4, 5, 6 and 7 produce the same image to
     # within 0.1%. Sent anyway, since 0 is outside the band and no other model has
-    # been tested. Use exp_rel_* to change exposure.
+    # been tested. Use 'exposure' to change exposure.
     out.append(Parameter(Option(
         name='light',
         type=int,
         unit=Unit.MICROSECONDS,
         validate=lambda v: 0 <= v <= 0xFF,
-        default=DEFAULT_LIGHT
+        default=DEFAULT_LIGHT,
+        advanced=True
     )))
 
-    return OptionsTable(out, inq)
+    return OptionsTable(out, inq, capabilities)
 
 def write_gain_offset(dev: UASDevice, payload: bytes) -> int:
     """SET GAIN OFFSET at a length this device accepts, returning that length.

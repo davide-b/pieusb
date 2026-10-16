@@ -106,6 +106,25 @@ determines whether a pass pays for its own calibration, never whether the image
 gets corrected. Since the cache lives on the `Scanner`, a fresh one starts cold:
 a loop that opens a `Scanner` per frame is correct but calibrates every time.
 
+### Exposure
+
+```python
+scanner.exposure = 1.5        # 1.0 is the exposure the scanner calibrated for itself
+scanner.exposure_b = 2.0      # per channel, on top of `exposure`
+scanner.auto_exp = True       # or meter it; `exposure` then acts as compensation
+```
+
+The same options on every scanner. Models differ in which device setting
+actually changes the exposure, and some need an extra calibration pass before
+it takes effect; the library handles both, so a scan may take one pass more than
+you asked for. `result.exposure_factor` reports what reached the sensor, per
+channel. Some scanners can only lengthen their exposure -- the ProScan 10T
+among them -- so values below 1.0 are clamped there, with a warning.
+
+The device settings behind it (`exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`,
+`light`) are marked `advanced` in the option table. They can be set for
+debugging, and a value set there overrides what `exposure` would derive.
+
 ### Slide transport
 
 The DigitDia 4000 and DigitDia 6000 feed slides from a magazine. Moving the

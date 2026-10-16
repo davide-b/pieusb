@@ -1,25 +1,95 @@
 # unreleased
 
-- **Slide transport, for the DigitDia 4000 and 6000.** `Scanner.advance()` moves
-  the magazine on by one slide and `Scanner.init_transport()` prepares the
-  transport; both are SCSI `0xD1` with the action in the first payload byte, and
-  both block until the mechanism is idle. Each scan pass sends SLIDE INIT before
-  START SCAN, matching the SANE backend's ordering (`pieusb.c:1062-1072`); the
-  DigitDia 4000 needs nothing else, since the `cmd_17` its sibling wants is the
-  one thing that model does not support
-- Advancing is a method rather than the `advance` option that used to be listed
-  and ignored. The medium moves when the caller says so, which keeps a frame in
-  the gate for as many passes as it wants, drops the interaction where an
-  `auto_exp` metering pass had to suppress the advance, and lets a failed advance
-  be raised at the caller instead of warned about mid-scan with an image already
-  in hand. `advance()` raises `ScanInProgress` while a scan is running, since the
-  scan worker owns the device
-- Nothing in the protocol describes magazine state, so an exhausted magazine is
-  not reported. Neither `READ STATE` nor the sense data the backend decodes
-  mentions it
-- Unverified on hardware: no scanner with a slide transport has been tested here,
-  so both methods log a warning on every call. That warning goes away once one
-  has been
+## Models
+- **ProScan 4000 detected and named** (product `0x0143`, model `0x002c`). An
+  unrecognised model now reports its number, as `Unknown (model 0x00ff)`
+- **Per-model capabilities**, `DeviceInfo.capabilities` (`types.Capabilities`):
+  `film_transport`, `focus` and `exposure_control`, looked up by model number in
+  `inquiry.DEVICE_CAPABILITIES`. A model not in the table gets conservative
+  defaults, so the ProScan 10T and RPS 10M behave as before
+- `get_devices()` skips a scanner it cannot identify instead of failing the whole
+  enumeration. If none can be identified it raises the first error
+
+## Film transport and focus
+- **Transport control** on models with a film transport (ProScan 4000, DigitDia
+  4000/6000): `Scanner.advance(frames)`, `rewind(frames)`, `eject(direction)`,
+  `offset_frame(mm)` and `init_transport()`. Each blocks until the mechanism is
+  idle and raises `ScanInProgress` during a scan. The medium moves only when one
+  of these is called; the ignored `advance` option is gone. Unverified on
+  hardware, so each call logs a warning. Magazine state is not in the protocol,
+  so an empty magazine is not reported
+- `Scanner.transport_state()` decodes READ STATE: frame, focus, focus range,
+  `medium_present`, `filmstrip_carrier` and the raw `flags`
+- **Focus** on models with a focus motor: a `focus` option sent before every
+  scan, `Scanner.set_focus()`, and `Scanner.focus_range()`, which reads the
+  range from the device because it depends on the carrier (1..80 slide, 1..30
+  filmstrip). A focus outside the range is clamped with a warning
+- **`Scanner.autofocus()`, experimental**: runs the device's focus sweep, picks
+  the sharpest position and sets `focus` to it. Returns an `AutofocusResult` with
+  every position's score. Unconfirmed on hardware
+
+## Exposure
+- **One exposure control on every model**: `exposure` for the whole image and
+  `exposure_r/g/b` per channel on top, as multipliers on the exposure the
+  scanner calibrated for itself. The library translates it into whichever device
+  field the model honours -- `exp_rel_*` on a ProScan 10T, the device's own
+  `exp_time_*` scaled on a ProScan 4000 -- and clamps it to what the model can
+  do: a relative model cannot go below 1.0. `ScanResult.exposure_factor` reports
+  what reached the sensor. `auto_exp` meters into `exposure_r/g/b`, with
+  `exposure` as compensation on top
+- **The library decides when a scan needs an extra pass.** On a ProScan 4000 a
+  pass that runs the device's shading analysis uses the device's own exposure,
+  so any other exposure needs a pass that skips it, and so a shading reference
+  taken beforehand. A scan with a custom exposure runs a short calibration pass
+  first when none is cached, `auto_exp`'s metering pass doubles as one, and a
+  pass whose skip the device refuses is run once more. At the scanner's own
+  exposure, and on relative models, a scan is still one pass
+- On a ProScan 4000 each pass adopts the gain, offset and lamp level the device
+  reports for itself, as both vendor drivers do, instead of option defaults that
+  made scans come out dark
+- The device fields -- `exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`, `light`
+  -- stay settable for debugging, marked `Option.advanced`. A value set there
+  wins over the one `exposure` would derive, and the device's own values never
+  overwrite it
+- The `exp_time_*` ceiling is 65535, the wire field's limit. It used to be four
+  times INQUIRY's `maximum_exposure`, which refused a ProScan 4000 its own
+  calibration
+- `ScanResult.shading_acquired`, `.exposure` and `.gain` record whether a pass
+  ran the device's shading analysis and what exposure and gain it actually sent
+
+## Fixes
+- **An abandoned transaction no longer wedges the scanner until a power cycle.**
+  The control timeout is 40 s (a ProScan 4000 was measured holding for 30 s),
+  and a USB error mid-transaction resets the IEEE1284 link before raising
+  `TransportError`
+- SET GAIN OFFSET falls back from 29 to 23 bytes when the scanner rejects the
+  longer form, as a ProScan 4000 does. The accepted length is remembered per
+  device
+- SET_CONFIGURATION is sent only when the device has no active configuration
+- The REQUEST SENSE key is masked to its low nibble, so the flag bits in the top
+  nibble no longer break sense matching
+- INQUIRY's transparency corners are read in the right order. New
+  `InquiryResponse.firmware_version`
+
+## Tools and tests
+- Offline test suites, `tests/test_wire_format.py` and `tests/test_identity.py`:
+  checked against a SANE log from a ProScan 10T and the ProScan 4000 captures,
+  plus golden masters of what `set_options()` sends
+- `wireshark/pieusb.lua`, a Wireshark dissector for this protocol.
+  `-Y pieusb.summary` reduces a capture to one line per command
+- `captures/tools/capdiff.py` diffs the command streams of several captures to
+  find the command a setting changes
+- `exercise.py`:
+  - new flags: `--repeat`, `--pass-option`, `--assume`, `--autofocus`,
+    `--inquiry-hex`, and the transport and focus flags `--advance-only`,
+    `--rewind`, `--eject`, `--offset-mm`, `--frames`, `--transport-state`,
+    `--focus`
+  - each pass reports the exposure that reached the sensor and a per-channel
+    sharpness. `--repeat` ends with a level comparison between passes, next to
+    their exposures
+  - `--list` shows the model number and capabilities. The option table marks
+    options set explicitly with `*`, and device fields with `[advanced]`
+- DEBUG logging for each phase of a SCSI transaction
 
 # v0.3.7
 

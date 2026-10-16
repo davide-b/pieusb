@@ -13,49 +13,33 @@ nothing here is a unit test.
     python tests/exercise.py --mode rgbi --resolution 2000 --frame-mm 0 0 36 24
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
 
-Which field carries the exposure depends on the model, and `--list` reports it:
+Exposure is 'exposure' (whole image) and 'exposure_r/g/b' (per channel, on top),
+as multipliers on the exposure the scanner calibrated for itself. The same on
+every model; the library routes it to whichever device field the model honours
+(`--list` reports which) and adds a calibration pass where one is needed:
 
-  exposure control Relative  (ProScan 10T; RPS 10M by default, unverified)
-      exp_rel_* is the live control; exp_time_*, gain_* and light have no
-      measurable effect. 247/563/1086 balances a colour negative on a 10T, all
-      three channels at ~88% of full scale:
+    python tests/exercise.py -o exposure=2.0 --output brighter
+    python tests/exercise.py -o exposure_r=2.47 -o exposure_g=5.63 \
+        -o exposure_b=10.86 --output negative
 
-          python tests/exercise.py -o exp_rel_r=247 -o exp_rel_g=563 \
-              -o exp_rel_b=1086 --output manual
-
-  exposure control Absolute  (ProScan 4000)
-      each pass adopts the exposure, gain, offset and lamp level the device
-      reports for itself, and exp_scale_* multiplies the exposure per channel:
-
-          python tests/exercise.py -o exp_scale_r=2.0 --output brighter
-
-      But a pass on which the device runs its own shading analysis re-derives its
-      own exposure and overrides exp_time_*, so the scale only reaches the sensor
-      once a shading reference is cached and reuse_calibration asks to skip the
-      analysis. That takes two passes on one open Scanner, which is --repeat:
-
-          python tests/exercise.py --repeat 2 -o reuse_calibration=true \
-              -o exp_scale_r=2 -o exp_scale_g=2 -o exp_scale_b=2
-
-      Pass 1 calibrates and ignores the scale; pass 2 skips and should honour it.
-      Each pass says which regime it ran under, and the run ends with the level
-      ratio between them.
+Each pass reports the exposure that reached the sensor. The device fields behind
+it -- exp_rel_*, exp_time_*, gain_*, offset_*, light, marked 'advanced' in the
+option table -- can still be set with -o for debugging, and win when they are.
 
 --pass-option N:NAME=VALUE changes an option before pass N (it stays changed for
 the passes after it), so a setting can be compared against a baseline pass on the
 same open Scanner and shading reference:
 
-    python tests/exercise.py --repeat 3 -o reuse_calibration=true \
-        --pass-option 3:exp_rel_r=200 --pass-option 3:exp_rel_g=200
+    python tests/exercise.py --repeat 2 --pass-option 2:exposure=2
 
 --assume overrides the capabilities pieusb holds for the model, for this run
 only, to trial a code path on hardware the capability table does not enable yet:
 
     python tests/exercise.py --assume film_transport,focus --transport-state
-    python tests/exercise.py --assume absolute --repeat 2 -o reuse_calibration=true
+    python tests/exercise.py --assume absolute --repeat 2 --pass-option 2:exposure=2
 
-auto_exp meters a preview pass and sets whichever of the two the model honours.
-It costs one extra pass:
+auto_exp meters a preview pass and sets exposure_r/g/b from it; 'exposure' still
+applies on top. It costs one extra pass:
 
     python tests/exercise.py -o auto_exp=true --output auto
 
@@ -177,9 +161,11 @@ def show_options(scanner: Scanner) -> None:
     for par in scanner.params.table:
         unit = '' if par.opt.unit is Unit.NONE else f" {par.opt.unit.name.lower()}"
         changed = '*' if par.assigned else ' '
+        advanced = '  [advanced]' if par.opt.advanced else ''
         print(f"  {changed} {par.opt.name:<14} = {par.value!r:<8}{unit:<14}"
-              f"(default {par.opt.default!r})")
-    print("  (* = set explicitly; unmarked options may be seeded from the device)")
+              f"(default {par.opt.default!r}){advanced}")
+    print("  (* = set explicitly. [advanced] = a device field derived from 'exposure';\n"
+          "   set it only to debug, and it then overrides 'exposure')")
 
 
 # ---------------------------------------------------------------------------
@@ -440,16 +426,15 @@ def report_result(r: ScanResult, args, prefix: Path) -> int:
     print(f"OK in {r.duration_s:.1f}s: {r.width} x {r.height}, mode {r.mode}, "
           f"{r.color_depth}-bit, {r.resolution} dpi, "
           f"shading {'corrected' if r.shading_corrected else 'NOT corrected'}")
-    # Which of the two exposure regimes this pass ran under. A pass that analyses
-    # re-derives its own exposure on an absolute-exposure model, so exp_time_*
-    # only reaches the sensor on a pass that skipped.
-    if r.shading_acquired:
-        print("  shading analysis: RUN by the device -- it chose its own exposure, "
-              "so exp_time_* did not reach the sensor")
+    print(f"  shading analysis: {'run by the device' if r.shading_acquired else 'skipped'}")
+    if r.exposure_factor is None:
+        print("  exposure        : unknown -- the scanner reported no calibration")
     else:
-        print("  shading analysis: SKIPPED -- exp_time_* was in force this pass")
-    print(f"  sent exposure   : {r.exposure} timer counts (R, G, B, I)")
-    print(f"  sent gain       : {r.gain}")
+        print(f"  exposure        : " + "  ".join(
+            f"{n}=x{f:.3f}" for n, f in zip("RGB", r.exposure_factor))
+            + "   (reached the sensor)")
+    print(f"  device fields   : exp_time {r.exposure} timer counts (R, G, B, I), "
+          f"gain {r.gain}")
     print(f"  rgb {r.rgb.shape} {r.rgb.dtype}"
           + (f", ir {r.ir.shape} {r.ir.dtype}" if r.ir is not None else ", no ir plane"))
 
@@ -597,16 +582,10 @@ def planes_of(r: ScanResult) -> list:
     return [r.rgb[:, :, c] for c in range(3)] + ([r.ir] if r.ir is not None else [])
 
 
-def compare_passes(results: list[ScanResult], scales: tuple | None = None,
-                   per_pass: bool = False) -> None:
-    """Level of every pass against the first, per channel.
-
-    This is what a `--repeat 2 -o reuse_calibration=true` run is for. Both passes
-    send the same exposure; only the second has the shading analysis skipped, so
-    on a ProScan 4000 only the second can have had that exposure reach the sensor
-    -- the first ran at whatever the device's own analysis chose. So the number to
-    check pass 2's level ratio against is exp_scale_*, not the exposure ratio
-    between the passes, which is 1 by construction.
+def compare_passes(results: list[ScanResult]) -> None:
+    """Level of every pass against the first, per channel, next to the exposure
+    each pass reports reaching the sensor. A level ratio that does not track the
+    exposure ratio means the exposure did not do what it reports.
 
     Where a pass clipped, a second ratio is reported over the pixels that are
     below full scale in *every* pass. Those pixels are in the linear range for all
@@ -641,8 +620,9 @@ def compare_passes(results: list[ScanResult], scales: tuple | None = None,
         clipped = [float((x == full).mean()) * 100 for x in pl]
         lin = ([float(x[m].mean()) if m.any() else 0.0 for x, m in zip(pl, linear)]
                if linear else None)
+        factors = r.exposure_factor or (0.0, 0.0, 0.0)
         if base is None:
-            base, base_lin, base_exp = means, lin, r.exposure
+            base, base_lin, base_exp = means, lin, factors
         names = "RGBI"[:len(means)]
 
         cells = "  ".join(
@@ -650,12 +630,12 @@ def compare_passes(results: list[ScanResult], scales: tuple | None = None,
             for n, m, b in zip(names, means, base))
         print(f"  pass {i}: {r.duration_s:6.1f}s  "
               f"shading {'analysed' if r.shading_acquired else 'SKIPPED ':8}  {cells}")
-        # The exposure each pass asked for, next to the level it got. Equal
-        # exposures with unequal levels is the whole question.
+        # The exposure each pass reports, next to the level it got. The level
+        # ratio should follow the exposure ratio.
         exp = "  ".join(
-            f"{n}={e:6d} ({'x%.3f' % (e / b) if b else '  -  '})"
-            for n, e, b in zip(names, r.exposure, base_exp))
-        print(f"          {'':>29}exp {exp}")
+            f"{n}={e:8.3f} ({'x%.3f' % (e / b) if b else '  -  '})"
+            for n, e, b in zip("RGB", factors, base_exp))
+        print(f"          {'':>29}exposure {exp}")
         if max(clipped) > 0.01:
             print(f"          {'':>29}clipped "
                   + " ".join('%s=%.1f%%' % (n, c) for n, c in zip(names, clipped)))
@@ -671,14 +651,6 @@ def compare_passes(results: list[ScanResult], scales: tuple | None = None,
                 f"{n}={m:8.1f} ({'x%.3f' % (m / b) if b else '  -  '})"
                 for n, m, b in zip("RGBI", lin, base_lin)))
     print("=" * 72)
-    if per_pass:
-        print("Options changed between passes (--pass-option): compare each pass "
-              "with the one before its change, not only with pass 1.")
-        return
-    if scales:
-        print(f"exp_scale_r/g/b asked for: {scales}")
-        print("With reuse_calibration and >1 pass, that is what pass 2's level ratio "
-              "should be.\nA ratio near x1 means exp_time_* did not reach the sensor.")
 
 
 # ---------------------------------------------------------------------------
@@ -790,9 +762,7 @@ def parse_args(argv=None):
                    help='also write an 8-bit PNG preview, if Pillow is installed')
     g.add_argument('--repeat', type=int, default=1, metavar='N',
                    help='run N scans on one open Scanner, writing PREFIX_passN_*, and '
-                        'compare their levels. With -o reuse_calibration=true only the '
-                        'first pass lets the device run its shading analysis, so passes '
-                        '2..N are the ones whose exp_time_* reaches the sensor '
+                        'compare their levels against the exposure each reports '
                         '(default: 1)')
     g.add_argument('--pass-option', action='append', default=[], metavar='N:NAME=VALUE',
                    help='set an option before pass N of --repeat; it stays set for the '
@@ -980,12 +950,7 @@ def main(argv=None) -> int:
                 break
 
         if len(results) > 1:
-            # exp_scale_* exists only where exp_time is the live control.
-            names = {par.opt.name for par in scanner.params.table}
-            scales = (tuple(scanner.params[f'exp_scale_{c}'].value
-                            for c in ('r', 'g', 'b'))
-                      if 'exp_scale_r' in names else None)
-            compare_passes(results, scales, per_pass=bool(pass_options))
+            compare_passes(results)
 
         # Leaving this scope closes the device.
         result = results[-1]
