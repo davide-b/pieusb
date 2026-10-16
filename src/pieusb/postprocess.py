@@ -137,3 +137,21 @@ def apply_shading_correction(
                 f"detail is lost and will show as vertical banding; reduce exposure"
             )
     return image_planes
+
+
+def line_sharpness(rgb: numpy.ndarray) -> numpy.ndarray:
+    '''Sharpness of each line of an (lines, width, channels) image.
+
+    Per channel, the mean absolute difference between neighbouring pixels along
+    the line, relative to that line's mean level so a brighter channel does not
+    outweigh a dimmer one; summed over the channels. Higher is sharper.
+    '''
+    a = rgb.astype(numpy.float32)
+    if a.ndim == 2:
+        a = a[:, :, numpy.newaxis]
+    if a.shape[1] < 2:
+        return numpy.zeros(a.shape[0])
+    grad = numpy.abs(numpy.diff(a, axis=1)).mean(axis=1)
+    level = a.mean(axis=1)
+    rel = numpy.divide(grad, level, out=numpy.zeros_like(grad), where=level > 0)
+    return rel.sum(axis=1)

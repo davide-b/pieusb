@@ -710,6 +710,30 @@ def move_transport(scanner: Scanner, what: str, action) -> int:
     return report_transport_state(scanner)
 
 
+def run_autofocus(scanner: Scanner, prefix: Path) -> int:
+    """Run the focus sweep, print every position's score, save the sweep."""
+    print("\nAutofocus sweep...")
+    started = time.monotonic()
+    try:
+        af = scanner.autofocus()
+    except PieusbError as e:
+        print(f"Autofocus failed: {type(e).__name__}: {e}")
+        return 1
+    print(f"Done in {time.monotonic() - started:.1f}s: {af.lines.shape[0]} lines, "
+          f"{af.lines.shape[1]} px wide")
+    top = max(af.scores) or 1.0
+    for pos, score in zip(af.positions, af.scores):
+        bar = '#' * round(30 * score / top)
+        mark = '  <- chosen' if pos == af.focus else ''
+        print(f"  focus {pos:3d}  {score:8.4f}  {bar}{mark}")
+    print(f"Focus set to {af.focus} for the scan that follows.")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    path = prefix.with_name(prefix.name + '_af_lines.npy')
+    numpy.save(path, af.lines)
+    print(f"  saved {path}")
+    return 0
+
+
 def advance_slide(scanner: Scanner, frames: int = 1) -> int:
     return move_transport(scanner, f"Advancing {frames} frame(s)",
                           lambda: scanner.advance(frames))
@@ -779,6 +803,10 @@ def parse_args(argv=None):
                    help='print READ STATE: frame, focus, focus range, flags')
     g.add_argument('--focus', type=int, metavar='N',
                    help='move the focus motor to N and stop')
+    g.add_argument('--autofocus', action='store_true',
+                   help='run the focus sweep before scanning, print the score of every '
+                        'focus position, save the sweep as PREFIX_af_lines.npy, and scan '
+                        'at the sharpest one. Experimental')
 
     g = p.add_argument_group('diagnostics')
     g.add_argument('--gain-offset', action='store_true',
@@ -921,6 +949,9 @@ def main(argv=None) -> int:
             return 1
         except DeviceNotReady as e:
             print(f"Not ready: {e}")
+            return 1
+
+        if args.autofocus and run_autofocus(scanner, Path(args.output)) != 0:
             return 1
 
         # Every pass shares one Scanner, which is what makes reuse_calibration

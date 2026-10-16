@@ -60,6 +60,9 @@ UNSUPPORTED_MODES = ('gray',)
 # advertise 1/4/10/12 too; only these map onto a numpy dtype.
 SUPPORTED_COLOR_DEPTHS = (8, 16)
 
+# MODE SELECT byte 10 on the vendor's autofocus pass, and 0 on every other pass.
+MODE_AUTOFOCUS = 0x08
+
 # 'colorDepth' bitmask, pieusb_specific.h:64-70
 COLOR_DEPTHS = {1: 0x01, 4: 0x02, 8: 0x04, 10: 0x08, 12: 0x10, 16: 0x20}
 
@@ -653,12 +656,14 @@ def write_gain_offset(dev: UASDevice, payload: bytes) -> int:
         return length
 
 def set_options(dev: UASDevice, options: OptionsTable, *,
-                skip_shading_analysis: bool = False) -> None:
+                skip_shading_analysis: bool = False,
+                autofocus: bool = False) -> None:
     """Send every option to the device, in the order the scan sequence needs.
 
     `skip_shading_analysis` is a parameter rather than an option because whether a
     pass can skip acquiring a shading reference depends on what the Scanner has
-    cached, not on 'reuse_calibration' alone.
+    cached, not on 'reuse_calibration' alone. `autofocus` marks the pass as the
+    vendor's focus sweep (Scanner.autofocus()).
     """
     # Highlight and shadow, hard-coded to 100 in SANE (pieusb.c:884-887).
     for filt, value in ((0x02, 100), (0x04, 100), (0x08, 100)):
@@ -707,7 +712,7 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     write_gain_offset(dev, payload)
 
     # MODE SELECT, a fixed 16-byte payload per sanei_pieusb_cmd_set_mode()
-    # (pieusb_scancmd.c:731-800). Bytes 0, 7, 10, 11 and 15 are unused.
+    # (pieusb_scancmd.c:731-800). Bytes 0, 7, 11 and 15 are unused.
     passes, color_format = MODE_SETTINGS[options['mode'].value]
 
     # Quality bitmask, byte 9 (pieusb_scancmd.c:790-794)
@@ -728,6 +733,8 @@ def set_options(dev: UASDevice, options: OptionsTable, *,
     payload[6] = color_format
     payload[8] = 0x01 # byteOrder: Intel, only bit 0 is used
     payload[9] = quality
+    if autofocus:
+        payload[10] = MODE_AUTOFOCUS
     payload[12] = 0x00 # halftonePattern; the C backend only ever sends 0
     payload[13] = LINE_THRESHOLD
     payload[14] = 0x10 # Unexplained; sent unconditionally by the C backend

@@ -16,9 +16,11 @@ from pieusb.option import (
 from pieusb.postprocess import (
     apply_shading_correction,
     build_width_to_loc,
-    calculate_shading
+    calculate_shading,
+    line_sharpness
 )
 from pieusb.types import (
+    AutofocusResult,
     DeviceInfo,
     EjectDirection,
     ExposureControl,
@@ -96,6 +98,10 @@ METERING_PERCENTILE = 99
 # unusable. Matches the 'resolution' option default.
 PREVIEW_RESOLUTION_FALLBACK = 300
 
+# The autofocus pass's resolution: what CyberView uses on the RPS 10M (5000) and
+# on the ProScan 4000, whose maximum is 3600.
+AUTOFOCUS_RESOLUTION = 5000
+
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
 START_SCAN_ATTEMPTS = 30
 START_SCAN_RETRY_S = 5
@@ -124,6 +130,22 @@ UNVERIFIED_TRANSPORT = (
     "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
     "run these commands, and they move hardware"
 )
+
+def autofocus_positions(lines: int, focus_min: int, focus_max: int) -> list[int]:
+    """The focus position each line of an autofocus pass was taken at.
+
+    One line per position when the counts agree. When they do not the mapping is
+    unknown, so the lines are spread evenly over the range and a warning says so.
+    """
+    span = focus_max - focus_min + 1
+    if lines == span:
+        return list(range(focus_min, focus_max + 1))
+    log.warning(f"[autofocus] the pass returned {lines} lines for {span} focus "
+                f"positions; spreading them evenly over {focus_min}..{focus_max}")
+    if lines == 1:
+        return [focus_min]
+    return [focus_min + round(i * (span - 1) / (lines - 1)) for i in range(lines)]
+
 
 @dataclass(frozen=True)
 class TransportState:
@@ -422,6 +444,66 @@ class Scanner:
         action = (SLIDE_EJECT_UP if direction is EjectDirection.UP
                   else SLIDE_EJECT_DOWN)
         self._slide(action, 0x00)
+
+    def autofocus(self) -> AutofocusResult:
+        """Run the device's focus sweep, then adopt the sharpest position as 'focus'.
+
+        This is the vendor's autofocus pass: MODE SELECT byte 10 set, the focus
+        parked at its minimum, and a pass that returns one line per focus position
+        -- 30 lines with a filmstrip carrier on an RPS 10M, whose focus range is
+        30. The host scores each line's sharpness and picks the best.
+
+        The sweep covers the lower half of the current frame, full width, which on
+        the default frame is the region CyberView sweeps. It runs with the
+        device's own shading analysis and leaves every option but 'focus' as it
+        found it, the cached shading reference included.
+
+        Experimental: that line i was taken at focus minimum + i, and that
+        line_sharpness() ranks them as the vendor does, are inferred from captures
+        and unconfirmed on hardware.
+
+        Raises PieusbError on a scanner without focus or that reports no focus
+        range, and ScanInProgress while a scan is running.
+        """
+        if not self.info.capabilities.focus:
+            raise PieusbError(f"{self.info.model} has no focus control")
+        if self.scan_in_progress:
+            raise ScanInProgress("cannot autofocus while a scan is running")
+        limits = self.focus_range()
+        if limits is None:
+            raise PieusbError("the scanner reports no focus range")
+
+        tl_y, br_y = self.params['tl_y'].value, self.params['br_y'].value
+        cached = self._shading
+        try:
+            with self._overridden_options(
+                resolution=min(AUTOFOCUS_RESOLUTION, self.info.inquiry.max_resolution_x),
+                mode='rgb',
+                color_depth=8,
+                sharpen=False,
+                fast_infrared=False,
+                reuse_calibration=False,
+                tl_y=(tl_y + br_y) // 2,
+                focus=limits[0],
+                **{name: DEFAULT_RELATIVE_EXPOSURE for name in METERED_OPTIONS},
+            ):
+                sweep = self._scan_pass(time.monotonic(), lambda update: None,
+                                        autofocus=True)
+        finally:
+            self._shading = cached
+        if sweep.rgb is None:
+            raise PieusbError("the autofocus pass returned no image data")
+
+        positions = autofocus_positions(sweep.rgb.shape[0], *limits)
+        scores = line_sharpness(sweep.rgb)
+        best = positions[int(numpy.argmax(scores))]
+        self.params['focus'].value = best
+        self.params['focus'].assigned = True
+        log.info(f"[autofocus] {len(positions)} lines over focus {limits[0]}..{limits[1]}; "
+                 f"sharpest at {best}")
+        return AutofocusResult(focus=best, positions=tuple(positions),
+                               scores=tuple(float(v) for v in scores),
+                               lines=sweep.rgb)
 
     def _start_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=1)
@@ -737,12 +819,16 @@ class Scanner:
         level does not depend on resolution there, so metering at preview
         resolution carries over to the real scan.
 
-        On a ProScan 4000 metering is not trustworthy yet, and the reason is not
-        the metering: exp_time only reaches the sensor on a pass that skips the
+        On a ProScan 4000 metering is not trustworthy, and the reason is not the
+        metering: exp_time reaches the sensor only on a pass that skips the
         device's own shading analysis, and every pass this runs has it running.
-        Both passes therefore meter an exposure the device chose for itself. That
-        is what makes it read 1.16x for a 2.0x request. See PLAN-proscan4000.md
-        7d, and T34 for the test that settles it.
+        Both passes therefore meter an exposure the device chose for itself, which
+        is what makes it read 1.16x for a 2.0x request. Where the analysis is
+        skipped the control is proportional -- a 2.0x exposure measured 1.99x,
+        against 1.00x for the same change with the analysis running -- over a fixed
+        ~300-count pedestal that does not scale, so the ratio arithmetic below
+        undershoots by a few tenths of a percent. See PLAN-proscan4000.md 7d and
+        T34/T35.
 
         The ceiling per channel comes from the device: exp_rel scales the exposure
         time the scanner reports for itself into a 16-bit Timer 1 count, and past
@@ -873,7 +959,8 @@ class Scanner:
         with self._absolute_exposure():
             return self._scan_pass(started, self._emit)
 
-    def _scan_pass(self, started: float, emit: Callable[[UpdateData], None]) -> ScanResult:
+    def _scan_pass(self, started: float, emit: Callable[[UpdateData], None],
+                   autofocus: bool = False) -> ScanResult:
         """One pass over the medium, from configuration to a finished ScanResult.
 
         Shared by the real scan and the metering pass, which differ only in the
@@ -926,12 +1013,13 @@ class Scanner:
                  tuple(self.params[f'offset_{s}'].value for s in CHANNEL_SUFFIX),
                  self.params['light'].value)
         # The quality bit only asks. The scanner answers below.
-        set_options(self.dev, self.params, skip_shading_analysis=not acquire)
+        set_options(self.dev, self.params, skip_shading_analysis=not acquire,
+                    autofocus=autofocus)
         self.wait_ready()
 
-        # Sent before every START SCAN on a transport-equipped scanner, matching
-        # the SANE backend's ordering (pieusb.c:1062-1072).
-        if self.info.capabilities.film_transport:
+        # Sent before every START SCAN on a transport- or focus-equipped scanner,
+        # matching the SANE backend's ordering (pieusb.c:1062-1072).
+        if self.info.capabilities.film_transport or self.info.capabilities.focus:
             log.debug("[scan] initialising the slide transport...")
             self._slide(SLIDE_INIT, self._focus_for_scan())
 

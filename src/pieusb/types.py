@@ -128,6 +128,20 @@ class UpdateData:
     progress: float = 0.0
 
 @dataclass(frozen=True)
+class AutofocusResult:
+    '''What Scanner.autofocus() measured.
+
+    `scores[i]` is the sharpness of the line the device took at focus
+    `positions[i]`, and `focus` is the position with the highest score, which the
+    Scanner has adopted as its 'focus' option. `lines` is the sweep itself,
+    (lines, width, 3), shading-corrected.
+    '''
+    focus: int
+    positions: tuple[int, ...]
+    scores: tuple[float, ...]
+    lines: numpy.ndarray
+
+@dataclass(frozen=True)
 class ScanResult:
     '''What a finished scan reports, delivered exactly once per scan().
 
