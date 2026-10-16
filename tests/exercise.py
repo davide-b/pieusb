@@ -15,7 +15,7 @@ nothing here is a unit test.
 
 Which field carries the exposure depends on the model, and `--list` reports it:
 
-  exposure control Relative  (ProScan 10T, RPS 10M)
+  exposure control Relative  (ProScan 10T; RPS 10M by default, unverified)
       exp_rel_* is the live control; exp_time_*, gain_* and light have no
       measurable effect. 247/563/1086 balances a colour negative on a 10T, all
       three channels at ~88% of full scale:
@@ -41,6 +41,19 @@ Which field carries the exposure depends on the model, and `--list` reports it:
       Each pass says which regime it ran under, and the run ends with the level
       ratio between them.
 
+--pass-option N:NAME=VALUE changes an option before pass N (it stays changed for
+the passes after it), so a setting can be compared against a baseline pass on the
+same open Scanner and shading reference:
+
+    python tests/exercise.py --repeat 3 -o reuse_calibration=true \
+        --pass-option 3:exp_rel_r=200 --pass-option 3:exp_rel_g=200
+
+--assume overrides the capabilities pieusb holds for the model, for this run
+only, to trial a code path on hardware the capability table does not enable yet:
+
+    python tests/exercise.py --assume film_transport,focus --transport-state
+    python tests/exercise.py --assume absolute --repeat 2 -o reuse_calibration=true
+
 auto_exp meters a preview pass and sets whichever of the two the model honours.
 It costs one extra pass:
 
@@ -58,6 +71,7 @@ Pixels are exactly as scanned: a negative stays a negative. --png also writes an
 '''
 
 import argparse
+import dataclasses
 import logging
 import struct
 import sys
@@ -76,6 +90,7 @@ from pieusb.scanner import Scanner
 from pieusb.types import (
     DeviceInfo,
     EjectDirection,
+    ExposureControl,
     ScanPhase,
     ScanResult,
     UpdateData,
@@ -220,18 +235,66 @@ def apply_options(scanner: Scanner, args) -> None:
     elif args.frame is not None:
         set_frame(scanner, *args.frame)
 
-    # -o NAME=VALUE for everything else, typed from the option table itself.
     for assignment in args.option:
-        name, sep, raw = assignment.partition('=')
-        if not sep:
-            raise SystemExit(f"--option expects NAME=VALUE, got {assignment!r}")
-        name = name.strip()
-        try:
-            par = scanner.params[name]
-        except KeyError:
-            names = ', '.join(p.opt.name for p in scanner.params.table)
-            raise SystemExit(f"no such option {name!r}. Available: {names}")
-        setattr(scanner, name, coerce(name, raw, par.opt.type))
+        assign_option(scanner, assignment)
+
+
+def assign_option(scanner: Scanner, assignment: str) -> None:
+    '''Apply one NAME=VALUE, typed from the option table itself.'''
+    name, sep, raw = assignment.partition('=')
+    if not sep:
+        raise SystemExit(f"expected NAME=VALUE, got {assignment!r}")
+    name = name.strip()
+    try:
+        par = scanner.params[name]
+    except KeyError:
+        names = ', '.join(p.opt.name for p in scanner.params.table)
+        raise SystemExit(f"no such option {name!r}. Available: {names}")
+    setattr(scanner, name, coerce(name, raw, par.opt.type))
+
+
+def parse_pass_options(specs: list[str], repeat: int) -> dict[int, list[str]]:
+    '''--pass-option N:NAME=VALUE, grouped by pass number.'''
+    out: dict[int, list[str]] = {}
+    for spec in specs:
+        n, sep, assignment = spec.partition(':')
+        if not sep or not n.strip().isdigit():
+            raise SystemExit(f"--pass-option expects N:NAME=VALUE, got {spec!r}")
+        n = int(n)
+        if not 1 <= n <= repeat:
+            raise SystemExit(f"--pass-option {spec!r}: pass {n} is outside 1..{repeat} "
+                             f"(--repeat {repeat})")
+        out.setdefault(n, []).append(assignment)
+    return out
+
+
+ASSUMABLE = ('film_transport', 'focus', 'absolute', 'relative')
+
+
+def assume_capabilities(info: DeviceInfo, spec: str) -> DeviceInfo:
+    '''Override the model's capabilities for this run, from --assume.'''
+    names = [s.strip() for s in spec.split(',') if s.strip()]
+    unknown = [n for n in names if n not in ASSUMABLE]
+    if unknown:
+        raise SystemExit(f"--assume: unknown {', '.join(unknown)}; "
+                         f"choose from {', '.join(ASSUMABLE)}")
+    if 'absolute' in names and 'relative' in names:
+        raise SystemExit("--assume: absolute and relative are exclusive")
+    changes = {}
+    if 'film_transport' in names:
+        changes['film_transport'] = True
+    if 'focus' in names:
+        changes['focus'] = True
+    if 'absolute' in names:
+        changes['exposure_control'] = ExposureControl.ABSOLUTE
+    if 'relative' in names:
+        changes['exposure_control'] = ExposureControl.RELATIVE
+    cap = dataclasses.replace(info.capabilities, **changes)
+    print(f"\n*** --assume: capabilities overridden for this run ***")
+    print(f"     film transport    : {cap.film_transport}")
+    print(f"     focus             : {cap.focus}")
+    print(f"     exposure control  : {cap.exposure_control}")
+    return dataclasses.replace(info, capabilities=cap)
 
 
 def report_transport_state(scanner: Scanner) -> int:
@@ -342,7 +405,26 @@ def summarize_plane(name: str, plane: numpy.ndarray) -> None:
     total = plane.size
     print(f"    {name}: min={plane.min():>6} max={plane.max():>6} "
           f"mean={plane.mean():>9.1f}  "
-          f"zero={zero * 100 / total:5.2f}%  saturated={sat * 100 / total:5.2f}%")
+          f"zero={zero * 100 / total:5.2f}%  saturated={sat * 100 / total:5.2f}%  "
+          f"sharpness={sharpness(plane):7.4f}")
+
+
+SHARPNESS_WINDOW = 1024
+
+
+def sharpness(plane: numpy.ndarray) -> float:
+    '''Mean absolute gradient over the centre window, as a fraction of the mean
+    level, so passes at different exposures stay comparable. Only meaningful
+    between passes over the same frame.'''
+    h, w = plane.shape
+    y0, x0 = max(0, (h - SHARPNESS_WINDOW) // 2), max(0, (w - SHARPNESS_WINDOW) // 2)
+    win = plane[y0:y0 + SHARPNESS_WINDOW, x0:x0 + SHARPNESS_WINDOW].astype(numpy.float32)
+    level = float(win.mean())
+    if level == 0 or min(win.shape) < 2:
+        return 0.0
+    grad = (float(numpy.abs(numpy.diff(win, axis=0)).mean())
+            + float(numpy.abs(numpy.diff(win, axis=1)).mean()))
+    return grad / level
 
 
 def report_result(r: ScanResult, args, prefix: Path) -> int:
@@ -510,7 +592,13 @@ def run_one_pass(scanner: Scanner, args, prefix: Path) -> tuple[int, ScanResult 
     return report_result(result, args, prefix), result
 
 
-def compare_passes(results: list[ScanResult], scales: tuple | None = None) -> None:
+def planes_of(r: ScanResult) -> list:
+    """The scan's channels as 2-D arrays, R G B and I if there is one."""
+    return [r.rgb[:, :, c] for c in range(3)] + ([r.ir] if r.ir is not None else [])
+
+
+def compare_passes(results: list[ScanResult], scales: tuple | None = None,
+                   per_pass: bool = False) -> None:
     """Level of every pass against the first, per channel.
 
     This is what a `--repeat 2 -o reuse_calibration=true` run is for. Both passes
@@ -519,44 +607,74 @@ def compare_passes(results: list[ScanResult], scales: tuple | None = None) -> No
     -- the first ran at whatever the device's own analysis chose. So the number to
     check pass 2's level ratio against is exp_scale_*, not the exposure ratio
     between the passes, which is 1 by construction.
+
+    Where a pass clipped, a second ratio is reported over the pixels that are
+    below full scale in *every* pass. Those pixels are in the linear range for all
+    of them, so that ratio is the honest one: a bright area no exposure could hold
+    -- an uncovered corner of the lamp, say -- otherwise caps the brighter pass's
+    mean and hides most of the change. On the run that first measured this, a
+    strip of uncovered lamp down one edge held 4.6% of the frame at full scale and
+    dragged a x1.97 exposure down to a reported x1.82.
     """
+    usable = [r for r in results if r.rgb is not None]
     print("\n" + "=" * 72)
     print("Pass comparison (mean level per channel, and its ratio to pass 1)")
     print("=" * 72)
-    base = None
+
+    # Pixels below full scale in every pass, per channel. Only computable when the
+    # passes agree on shape, which they do unless the device resized mid-run.
+    full = numpy.iinfo(usable[0].rgb.dtype).max if usable else 0
+    shapes = {tuple(pl.shape for pl in planes_of(r)) for r in usable}
+    linear = None
+    if len(usable) > 1 and len(shapes) == 1:
+        stacks = [planes_of(r) for r in usable]
+        linear = [numpy.logical_and.reduce([s[c] < full for s in stacks])
+                  for c in range(len(stacks[0]))]
+
+    base = base_lin = base_exp = None
     for i, r in enumerate(results, 1):
         if r.rgb is None:
             print(f"  pass {i}: no image")
             continue
-        means = [float(r.rgb[:, :, c].mean()) for c in range(3)]
-        if r.ir is not None:
-            means.append(float(r.ir.mean()))
-        # A clipped channel cannot report a level ratio: its mean is held down by
-        # the ceiling, so an exposure that took effect still reads as less than it
-        # asked for. Worth saying loudly, since it is the one way these ratios lie.
-        full = numpy.iinfo(r.rgb.dtype).max
-        clipped = [float((r.rgb[:, :, c] == full).mean()) * 100 for c in range(3)]
-        if r.ir is not None:
-            clipped.append(float((r.ir == full).mean()) * 100)
+        pl = planes_of(r)
+        means = [float(x.mean()) for x in pl]
+        clipped = [float((x == full).mean()) * 100 for x in pl]
+        lin = ([float(x[m].mean()) if m.any() else 0.0 for x, m in zip(pl, linear)]
+               if linear else None)
         if base is None:
-            base = means
-            base_exp = r.exposure
+            base, base_lin, base_exp = means, lin, r.exposure
+        names = "RGBI"[:len(means)]
+
         cells = "  ".join(
             f"{n}={m:8.1f} ({'x%.3f' % (m / b) if b else '  -  '})"
-            for n, m, b in zip("RGBI", means, base))
+            for n, m, b in zip(names, means, base))
         print(f"  pass {i}: {r.duration_s:6.1f}s  "
               f"shading {'analysed' if r.shading_acquired else 'SKIPPED ':8}  {cells}")
         # The exposure each pass asked for, next to the level it got. Equal
         # exposures with unequal levels is the whole question.
         exp = "  ".join(
             f"{n}={e:6d} ({'x%.3f' % (e / b) if b else '  -  '})"
-            for n, e, b in zip("RGBI"[:len(means)], r.exposure, base_exp))
+            for n, e, b in zip(names, r.exposure, base_exp))
         print(f"          {'':>29}exp {exp}")
-        if max(clipped) > 0.5:
-            print(f"          {'':>29}"
-                  f"WARNING clipped {' '.join('%s=%.1f%%' % (n, c) for n, c in zip('RGBI', clipped))}"
-                  f" -- these level ratios understate the exposure")
+        if max(clipped) > 0.01:
+            print(f"          {'':>29}clipped "
+                  + " ".join('%s=%.1f%%' % (n, c) for n, c in zip(names, clipped)))
+    if linear and any((~m).any() for m in linear):
+        kept = 100 * float(numpy.mean([m.mean() for m in linear]))
+        print(f"\n  Ratios over the {kept:.1f}% of pixels below full scale in every "
+              f"pass -- the honest ones:")
+        for i, r in enumerate(results, 1):
+            if r.rgb is None:
+                continue
+            lin = [float(x[m].mean()) for x, m in zip(planes_of(r), linear)]
+            print(f"  pass {i}: " + "  ".join(
+                f"{n}={m:8.1f} ({'x%.3f' % (m / b) if b else '  -  '})"
+                for n, m, b in zip("RGBI", lin, base_lin)))
     print("=" * 72)
+    if per_pass:
+        print("Options changed between passes (--pass-option): compare each pass "
+              "with the one before its change, not only with pass 1.")
+        return
     if scales:
         print(f"exp_scale_r/g/b asked for: {scales}")
         print("With reuse_calibration and >1 pass, that is what pass 2's level ratio "
@@ -610,6 +728,11 @@ def parse_args(argv=None):
                    help='which enumerated device to use (default: 0)')
     p.add_argument('--dry-run', action='store_true',
                    help='resolve and validate the options, print them, and stop before scanning')
+    p.add_argument('--assume', metavar='CAP[,CAP...]',
+                   help='override the model\'s capabilities for this run: any of '
+                        f'{", ".join(ASSUMABLE)}. For trialling hardware the capability '
+                        'table does not enable yet; transport and focus commands move '
+                        'hardware')
 
     g = p.add_argument_group('scan settings (unset options keep the device default)')
     g.add_argument('--mode', choices=('gray', 'rgb', 'rgbi'))
@@ -647,6 +770,9 @@ def parse_args(argv=None):
                         'first pass lets the device run its shading analysis, so passes '
                         '2..N are the ones whose exp_time_* reaches the sensor '
                         '(default: 1)')
+    g.add_argument('--pass-option', action='append', default=[], metavar='N:NAME=VALUE',
+                   help='set an option before pass N of --repeat; it stays set for the '
+                        'passes after N. Repeatable')
 
     g = p.add_argument_group('focus (models with a focus motor)')
     g.add_argument('--transport-state', action='store_true',
@@ -715,7 +841,13 @@ def main(argv=None) -> int:
         print(f"--device {args.device} out of range (0..{len(devices) - 1})")
         return 1
 
-    with Scanner(devices[args.device]) as scanner:
+    pass_options = parse_pass_options(args.pass_option, args.repeat)
+
+    info = devices[args.device]
+    if args.assume:
+        info = assume_capabilities(info, args.assume)
+
+    with Scanner(info) as scanner:
         if args.advance_only:
             return advance_slide(scanner, args.frames)
 
@@ -750,6 +882,14 @@ def main(argv=None) -> int:
         except (TypeError, ValueError) as e:
             print(f"Bad option: {e}")
             return 1
+
+        # A typo in a late pass would otherwise surface only after the earlier scans.
+        for n, assignments in sorted(pass_options.items()):
+            for assignment in assignments:
+                name = assignment.partition('=')[0].strip()
+                if name not in {p.opt.name for p in scanner.params.table}:
+                    print(f"--pass-option {n}:{assignment}: no such option {name!r}")
+                    return 1
 
         show_options(scanner)
         report_frame(scanner)
@@ -797,6 +937,9 @@ def main(argv=None) -> int:
                 # analysed, so printing it per pass shows whether it moved.
                 if args.gain_offset and n > 1:
                     report_calibration(scanner)
+            for assignment in pass_options.get(n, []):
+                assign_option(scanner, assignment)
+                print(f"pass {n}: {assignment}")
             print("Scanning. Ctrl-C cancels.\n")
             status, result = run_one_pass(scanner, args, prefix)
             if result is None:
@@ -811,7 +954,7 @@ def main(argv=None) -> int:
             scales = (tuple(scanner.params[f'exp_scale_{c}'].value
                             for c in ('r', 'g', 'b'))
                       if 'exp_scale_r' in names else None)
-            compare_passes(results, scales)
+            compare_passes(results, scales, per_pass=bool(pass_options))
 
         # Leaving this scope closes the device.
         result = results[-1]
