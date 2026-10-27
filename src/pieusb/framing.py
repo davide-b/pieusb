@@ -229,3 +229,92 @@ def find_bands(rgb: numpy.ndarray, px_per_mm: float,
                           clipped_stop=clipped_stop, edge_start=edge_start,
                           edge_stop=edge_stop, confidence=confidence))
     return bands
+
+
+# The picture width of a 35 mm frame along the film. Cameras vary by a few
+# tenths: 35.6 mm measured on a ProScan 4000 strip, from both gaps at 600 dpi.
+FRAME_MM = 36.0
+# A stretch of picture narrower than this fraction of a frame is a sliver of
+# the neighbouring frame, not the frame being placed.
+FRAME_MIN_FRACTION = 0.5
+
+
+@dataclass(frozen=True)
+class FramePosition:
+    '''Where a frame lies in a scan, in image columns.
+
+    `start` and `stop` may lie outside the image: an edge that was not seen is
+    placed one frame width from the edge that was. `measured_start` and
+    `measured_stop` say which edges a band showed; with neither, the frame is
+    assumed centred on what is visible and `confidence` is 0. `confidence` is
+    otherwise the step strength of the measured edges, from Band.
+
+    `shift_mm` is how far the image content must move towards +x to centre the
+    frame in the window. `overhang_mm` is how much of the frame lies past each
+    edge of the image now, (left, right), 0 where it is inside.
+    '''
+    start: float
+    stop: float
+    measured_start: bool
+    measured_stop: bool
+    confidence: float
+    shift_mm: float
+    overhang_mm: tuple[float, float]
+    width_mm: float
+
+    @property
+    def measured(self) -> bool:
+        return self.measured_start or self.measured_stop
+
+
+def locate_frame(bands: list[Band], width_px: int, px_per_mm: float,
+                 frame_mm: float = FRAME_MM) -> FramePosition | None:
+    '''The frame a scan mostly shows, from find_bands' result.
+
+    The frame is the widest stretch of picture between bands. Each side of it
+    that a band bounds is a measured edge: a gap, clear film or a blank stretch
+    all end the picture. A side that runs into the image edge was not seen and
+    is placed `frame_mm` from the other. Returns None when no stretch of picture
+    is half a frame wide: a blank frame, or film past the strip's end.
+    '''
+    frame_px = frame_mm * px_per_mm
+    picture = []
+    left: Band | None = None
+    x = 0
+    for band in sorted(bands, key=lambda b: b.start):
+        if band.start > x:
+            picture.append((x, band.start, left, band))
+        x = max(x, band.stop)
+        left = band
+    if x < width_px:
+        picture.append((x, width_px, left, None))
+    picture = [p for p in picture if p[1] - p[0] >= FRAME_MIN_FRACTION * frame_px]
+    if not picture:
+        return None
+    start, stop, left, right = max(picture, key=lambda p: p[1] - p[0])
+
+    edges = []
+    measured_start = left is not None and start > 0
+    measured_stop = right is not None and stop < width_px
+    if measured_start:
+        edges.append(left.edge_stop or 0.0)
+    if measured_stop:
+        edges.append(right.edge_start or 0.0)
+    if measured_start and not measured_stop:
+        stop = start + frame_px
+    elif measured_stop and not measured_start:
+        start = stop - frame_px
+    elif not measured_start and not measured_stop:
+        centre = (start + stop) / 2
+        start, stop = centre - frame_px / 2, centre + frame_px / 2
+
+    shift_px = width_px / 2 - (start + stop) / 2
+    return FramePosition(
+        start=float(start), stop=float(stop),
+        measured_start=measured_start, measured_stop=measured_stop,
+        confidence=float(numpy.mean(edges)) if edges else 0.0,
+        shift_mm=shift_px / px_per_mm,
+        overhang_mm=(max(0.0, -start) / px_per_mm,
+                     max(0.0, stop - width_px) / px_per_mm),
+        width_mm=(stop - start) / px_per_mm,
+    )

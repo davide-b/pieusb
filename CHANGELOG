@@ -35,6 +35,17 @@
   the sharpest manual focus on a ProScan 4000 and within the sharpest range on
   an RPS 10M; untested with a slide carrier
 
+- `pieusb.framing.find_bands()`: the uniform vertical bands in a filmstrip scan,
+  each a gap between frames, a blank stretch (leader, unexposed frame) or clear
+  film past the strip's end, with its columns, whether the image edge cuts it,
+  how sharply it steps to the picture on each side, and a confidence. Bright
+  gaps (negatives) and dark ones (slides) both; checked against scans from a
+  ProScan 4000 and an RPS 10M. Pure numpy, no device access
+- `pieusb.framing.locate_frame()`: from those bands, where the frame lies in the
+  scan, which of its edges were measured and which placed one frame width from
+  the other, how far the content must move to centre it, and how much of it
+  lies outside the window
+
 ## Exposure
 - **One exposure control on every model**: `exposure` for the whole image and
   `exposure_r/g/b` per channel on top, as multipliers on the exposure the
@@ -131,6 +142,12 @@
   entry to one folder, and stops at the first failed motor command. An unknown
   model gets motors only through `--allow`. `tests/test_hwsuite.py` runs it
   against simulated scanners
+- hwsuite stages `stepsize` (what an offset step moves, measured in the image,
+  with direction and return error) and `framing` (roll scanning's positioning
+  loop over the whole strip: preview, `pieusb.framing` locates the frame, one
+  offset centres it, a check preview measures the result; the offset scale is
+  learnt from every correction and the frame width from frames showing both
+  gaps). `tests/test_hwsuite.py` runs them against a simulated filmstrip
 - `inquiry.MODEL_MOTORS`: the motors each model physically has, separate from
   what `DEVICE_CAPABILITIES` lets the library drive
 - DEBUG logging for each phase of a SCSI transaction, with every payload and

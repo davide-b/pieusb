@@ -488,9 +488,10 @@ class Scanner:
         both vendor applications bracket a scan that way rather than tracking an
         absolute position.
 
-        Which way a positive `mm` moves the film is not established; it is the
-        direction the vendor applications use for a positive offset in their own
-        interface.
+        On a ProScan 4000 a positive `mm` moves the image content towards +x,
+        the way NEXT moves the film, and a step moves it about 0.115 mm rather
+        than the nominal 0.106 (tests/hwsuite.py's stepsize stage measures it).
+        Other models are unmeasured.
         """
         self._require_slide_transport()
         steps = int(abs(mm) * OFFSET_STEPS_PER_MM)

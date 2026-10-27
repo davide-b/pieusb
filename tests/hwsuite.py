@@ -46,9 +46,15 @@ Transport stages, in an order that needs no reloading:
     redetect     NEXT after deliberately shifting the film each way: does NEXT
                  find the frame, or move a fixed distance? Then PREV and the
                  shift undone, so later stages start where this one did
+    stepsize     offsets of 32, 64 and 128 steps, each out and back, the image
+                 shift measured: millimetres per step, direction and return error
     rewind       PREV back to frame 0, then a scan to compare with the start
     walk         every frame to the end: home and both centring offsets
     recovery     PREV from the end, and a scan
+    framing      back to frame 0, then every frame to the end as roll scanning
+                 would: a preview, the frame located (pieusb.framing), one offset
+                 to centre it and a check preview of where it landed. Preview
+                 timings at a few resolutions on the first frame
 
 A stage that runs out of film is recorded as partial and the suite goes on.
 '''
@@ -73,10 +79,11 @@ from exercise import log
 import numpy
 
 import pieusb
+from pieusb.framing import FRAME_MM, FramePosition, find_bands, locate_frame
 from pieusb.exceptions import DeviceNotReady, PieusbError, WarmingUp
 from pieusb.inquiry import MODEL_MOTORS
 from pieusb.option import EXPOSURE_TIME_MAX
-from pieusb.scanner import OFFSET_STEPS_PER_MM, Scanner
+from pieusb.scanner import MM_PER_INCH, OFFSET_STEPS_PER_MM, Scanner
 from pieusb.transport import SLIDE_PREV
 from pieusb.types import ExposureControl
 
@@ -107,11 +114,13 @@ STAGES = (
     Stage('exposure', Risk.SCAN),
     Stage('autofocus', Risk.FOCUS),
     Stage('offsets', Risk.TRANSPORT, needs_medium=True),
+    Stage('stepsize', Risk.TRANSPORT, needs_medium=True),
     Stage('stepping', Risk.TRANSPORT, needs_medium=True),
     Stage('redetect', Risk.TRANSPORT, needs_medium=True),
     Stage('rewind', Risk.TRANSPORT, needs_medium=True),
     Stage('walk', Risk.TRANSPORT, needs_medium=True),
     Stage('recovery', Risk.TRANSPORT, needs_medium=True),
+    Stage('framing', Risk.TRANSPORT, needs_medium=True),
 )
 STAGE_NAMES = tuple(s.name for s in STAGES)
 
@@ -130,6 +139,19 @@ REDETECT_OFFSET_MM = 3.0
 CENTRING_STEPS = 70
 CENTRING_WINDOW_MM = 36.5
 MAX_WALK_FRAMES = 60
+# Offsets the stepsize stage measures, in steps; the field carries 1..255. The
+# largest must move the image less than half the window, or phase correlation
+# wraps: 128 steps is about 15 mm against a 36.5 mm window.
+STEP_SIZES = (32, 64, 128)
+# The framing stage leaves a frame alone closer to centre than this: one step is
+# about 0.11 mm, and an out-and-back move returns only to 0.3-1 mm.
+FRAMING_MIN_SHIFT_MM = 0.25
+# A correction at least this long is measured well enough to refine the offset
+# scale: 0.5 mm is 6 px at 300 dpi.
+FRAMING_SCALE_MIN_MM = 0.5
+# Preview resolutions timed on the first frame, and whether each finds the same
+# frame; the loop itself previews at PREVIEW_DPI.
+PREVIEW_TIMING_DPI = (100, 150, 300)
 
 # Exposure response: a control is live if it moves the level by more than
 # EXPOSURE_LIVE, and doubles it if every channel is within EXPOSURE_LINEAR of 2.
@@ -263,6 +285,35 @@ def image_sharpness(rgb: numpy.ndarray) -> float:
                   + numpy.abs(numpy.diff(red, axis=1)).mean()) / level)
 
 
+def image_shift_px(a: numpy.ndarray, b: numpy.ndarray) -> int:
+    '''How many columns the content of `b` lies towards +x of `a`'s, by phase
+    correlation of log red. Both at one resolution.'''
+    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+    x, y = (numpy.log(img[:h, :w, 0].astype(numpy.float64) + 64) for img in (a, b))
+    window = numpy.hanning(h)[:, None] * numpy.hanning(w)[None, :]
+    fa, fb = numpy.fft.fft2((x - x.mean()) * window), numpy.fft.fft2((y - y.mean()) * window)
+    cross = fb * numpy.conj(fa)
+    cross /= numpy.abs(cross) + 1e-12
+    corr = numpy.real(numpy.fft.ifft2(cross))
+    dx = int(numpy.unravel_index(numpy.argmax(corr), corr.shape)[1])
+    return dx - w if dx > w // 2 else dx
+
+
+def placement_fields(bands, frame: FramePosition | None) -> dict:
+    fields = {'bands': [{'kind': b.kind.value, 'start': b.start, 'stop': b.stop,
+                         'clipped': [b.clipped_start, b.clipped_stop],
+                         'confidence': round(b.confidence, 2)} for b in bands]}
+    if frame is None:
+        return {**fields, 'frame': None}
+    return {**fields, 'frame': {
+        'start': round(frame.start, 1), 'stop': round(frame.stop, 1),
+        'measured': [frame.measured_start, frame.measured_stop],
+        'confidence': round(frame.confidence, 2),
+        'shift_mm': round(frame.shift_mm, 3),
+        'overhang_mm': [round(v, 2) for v in frame.overhang_mm],
+        'width_mm': round(frame.width_mm, 2)}}
+
+
 class Suite:
     def __init__(self, scanner: Scanner, out: Path) -> None:
         self.scanner = scanner
@@ -275,6 +326,10 @@ class Suite:
         # Offsets sent since the last NEXT or PREV and not yet sent back.
         self.unreturned_mm = 0.0
         self.findings: dict = {}
+        # Image millimetres per commanded millimetre of offset, signed: what the
+        # stepsize stage and each framing correction measured. offset_scale is
+        # their median, None before any.
+        self.scale_samples: list[float] = []
         self.scan_args = SimpleNamespace(png=False, tiff=False)
 
         inq = scanner.params.inq
@@ -593,6 +648,39 @@ class Suite:
             self.move('offset', -mm)
         self.scan('home')
 
+    def stepsize(self) -> None:
+        '''What an offset step moves, measured in the image: the slope of image
+        shift against commanded steps, out and back, and what each return misses.'''
+        self.full_frame(self.preview_dpi)
+        px_per_mm = self.preview_dpi / MM_PER_INCH
+        home = self.scan('home')
+        moves = []
+        for steps in STEP_SIZES:
+            mm = round((steps + 0.01) / OFFSET_STEPS_PER_MM, 3)
+            self.move('offset', mm)
+            out = self.scan(f"plus{steps}")
+            self.move('offset', -mm)
+            back = self.scan(f"back{steps}")
+            shift = image_shift_px(home.rgb, out.rgb)
+            missed = image_shift_px(home.rgb, back.rgb)
+            moves.append({'steps': steps, 'commanded_mm': round(steps / OFFSET_STEPS_PER_MM, 3),
+                          'image_px': shift, 'image_mm': round(shift / px_per_mm, 3),
+                          'return_missed_mm': round(missed / px_per_mm, 3)})
+            print(f"{steps} steps: {shift} px = {shift / px_per_mm:.2f} mm; "
+                  f"return missed by {missed / px_per_mm:+.2f} mm")
+            home = back
+        x = numpy.array([m['commanded_mm'] for m in moves])
+        y = numpy.array([m['image_mm'] for m in moves])
+        slope, intercept = numpy.polyfit(x, y, 1)
+        self.scale_samples.append(float(slope))
+        self.record.update(moves=moves, image_mm_per_commanded_mm=round(slope, 4),
+                           intercept_mm=round(intercept, 3),
+                           mm_per_step=round(slope / OFFSET_STEPS_PER_MM, 5))
+        self.findings['offset_mm_per_step'] = round(slope / OFFSET_STEPS_PER_MM, 5)
+        print(f"\nan offset step moves the image {slope / OFFSET_STEPS_PER_MM:.4f} mm "
+              f"(nominal {1 / OFFSET_STEPS_PER_MM:.4f}), "
+              f"{'towards +x' if slope > 0 else 'towards -x'}")
+
     def stepping(self) -> None:
         self.full_frame(self.preview_dpi)
         self.scan('start')
@@ -626,8 +714,8 @@ class Suite:
             self.move('offset', -shift)
             self.scan('restored')
 
-    def rewind(self) -> None:
-        self.full_frame(self.preview_dpi)
+    def to_first_frame(self) -> None:
+        '''PREV until the frame counter reads 0.'''
         state = self.state()
         if state is None:
             raise RuntimeError("no READ STATE to rewind by")
@@ -639,6 +727,10 @@ class Suite:
             if before and after and after['frame'] == before['frame']:
                 self.record['note'] = f"PREV stopped moving the counter at {after['frame']}"
                 break
+
+    def rewind(self) -> None:
+        self.full_frame(self.preview_dpi)
+        self.to_first_frame()
         self.scan('start_again')
 
     def walk(self) -> None:
@@ -657,6 +749,112 @@ class Suite:
         self.state()
         self.move('prev', 1)
         self.scan('back_from_end')
+
+    @property
+    def offset_scale(self) -> float | None:
+        return float(numpy.median(self.scale_samples)) if self.scale_samples else None
+
+    def locate(self, r, frame_mm: float = FRAME_MM, label: str = 'located'):
+        px_per_mm = r.resolution / MM_PER_INCH
+        bands = find_bands(r.rgb, px_per_mm)
+        frame = locate_frame(bands, r.rgb.shape[1], px_per_mm, frame_mm)
+        self.event(op=label, **placement_fields(bands, frame))
+        return frame
+
+    def framing(self) -> None:
+        '''Roll scanning's positioning loop, every frame from the first.
+
+        Each frame: NEXT, a preview, the frame located, one offset by its shift
+        from centre (converted with the measured offset scale, learnt from the
+        first correction if stepsize did not run), and a check preview whose
+        remaining shift is the loop's error. Every correction is also a sample
+        of the offset scale, so one bad measurement cannot steer the rest.
+        Corrections are not undone: NEXT carries them to the next frame. The frame width is learnt from frames
+        whose edges both showed.
+        '''
+        self.full_frame(self.preview_dpi)
+        self.to_first_frame()
+        frame_mm = FRAME_MM
+        widths, residuals = [], []
+        self.record['frames'] = frames = []
+        try:
+            self.preview_timings()
+            self.full_frame(self.preview_dpi)
+            self.set(reuse_calibration=True)
+            for index in range(MAX_WALK_FRAMES):
+                if index:
+                    self.next(1)
+                entry = {'index': index}
+                frames.append(entry)
+                frame = self.locate(self.scan('preview'), frame_mm)
+                if frame is None:
+                    entry['result'] = 'no frame'
+                    continue
+                entry.update(shift_mm=round(frame.shift_mm, 3), measured=frame.measured,
+                             confidence=round(frame.confidence, 2))
+                if frame.measured_start and frame.measured_stop:
+                    widths.append(frame.width_mm)
+                    frame_mm = float(numpy.median(widths))
+                if not frame.measured:
+                    entry['result'] = 'no edge seen'
+                    continue
+                if abs(frame.shift_mm) < FRAMING_MIN_SHIFT_MM:
+                    entry['result'] = 'centred'
+                    continue
+                steps = round(abs(frame.shift_mm / (self.offset_scale or 1.0))
+                              * OFFSET_STEPS_PER_MM)
+                if not 1 <= steps <= 0xFF:
+                    entry['result'] = 'centred' if not steps else 'shift beyond one offset'
+                    continue
+                direction = 1 if frame.shift_mm * (self.offset_scale or 1.0) > 0 else -1
+                # What the steps sent amount to; a hair over so offset_frame's
+                # truncation lands on them exactly.
+                commanded = direction * steps / OFFSET_STEPS_PER_MM
+                self.move('offset', round(direction * (steps + 0.01) / OFFSET_STEPS_PER_MM, 3))
+                after = self.locate(self.scan('check'), frame_mm, 'checked')
+                entry.update(commanded_steps=direction * steps,
+                             commanded_mm=round(commanded, 3))
+                if after is None or not after.measured:
+                    entry['result'] = 'lost after the move'
+                    continue
+                moved = frame.shift_mm - after.shift_mm
+                entry.update(result='corrected', residual_mm=round(after.shift_mm, 3),
+                             moved_mm=round(moved, 3))
+                residuals.append(after.shift_mm)
+                if abs(commanded) >= FRAMING_SCALE_MIN_MM:
+                    self.scale_samples.append(moved / commanded)
+                    entry['offset_scale_sample'] = round(moved / commanded, 4)
+                print(f"frame {index}: shift {frame.shift_mm:+.2f} mm, "
+                      f"left {after.shift_mm:+.2f} mm")
+        finally:
+            self.unset('reuse_calibration')
+            self.record.update(frame_mm=round(frame_mm, 2),
+                               frame_widths_mm=[round(w, 2) for w in widths],
+                               offset_scale=self.offset_scale and round(self.offset_scale, 4))
+            if residuals:
+                r = numpy.abs(residuals)
+                self.record['residual_mm'] = {'median': round(float(numpy.median(r)), 3),
+                                              'max': round(float(r.max()), 3)}
+
+    def preview_timings(self) -> None:
+        '''One preview at each PREVIEW_TIMING_DPI on the current frame: how long it
+        takes, and where it puts the frame. Each reuses the shading reference
+        where the scanner allows, as the loop's previews do.'''
+        timings = []
+        self.set(reuse_calibration=True)
+        try:
+            for dpi in PREVIEW_TIMING_DPI:
+                if dpi > self.scanner.info.inquiry.max_resolution_x:
+                    continue
+                self.full_frame(dpi)
+                r = self.scan(f"timing{dpi}")
+                frame = self.locate(r)
+                timings.append({'dpi': dpi, 'duration_s': round(r.duration_s, 1),
+                                'shading_acquired': r.shading_acquired,
+                                'shift_mm': frame and round(frame.shift_mm, 3)})
+        finally:
+            self.unset('reuse_calibration')
+            self.record['preview_timings'] = timings
 
 
 def parse_args(argv=None):
