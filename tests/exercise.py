@@ -45,6 +45,13 @@ applies on top. It costs one extra pass:
 
 Every scan logs the exposure, gain, offset and light it sent, at INFO.
 
+--log FILE is the whole record of a run: everything printed here, the library's
+DEBUG log with every command's payload and reply, the versions and git state the
+run used, and any traceback. --note and --ask add what only the person at the
+scanner can see:
+
+    python tests/exercise.py --assume film_transport --advance-only --ask --log t5a.log
+
 Ctrl-C during a scan cancels it cleanly (STOP SCAN at the next chunk boundary).
 
 Results are written as <prefix>_rgb.npy, shape (height, width, 3), plus
@@ -55,8 +62,13 @@ Pixels are exactly as scanned: a negative stays a negative. --png also writes an
 '''
 
 import argparse
+import atexit
 import dataclasses
+import io
 import logging
+import platform
+import shlex
+import subprocess
 import struct
 import sys
 import time
@@ -670,16 +682,28 @@ def dump_inquiry(info: DeviceInfo) -> int:
     return 0
 
 
-def move_transport(scanner: Scanner, what: str, action) -> int:
+def move_transport(scanner: Scanner, what: str, action, ask: bool = False) -> int:
     """Run one transport move and report the state it left behind."""
     print(f"\n{what}...")
+    started = time.monotonic()
     try:
         action()
     except (PieusbError, ValueError) as e:
         print(f"Could not {what.lower()}: {type(e).__name__}: {e}")
         return 1
-    print("Done.")
+    print(f"Done in {time.monotonic() - started:.1f}s.")
+    if ask:
+        ask_observation("What did the film do? Which way did it move, and how far")
     return report_transport_state(scanner)
+
+
+def ask_observation(question: str) -> None:
+    """Put what the person at the scanner saw into the log."""
+    try:
+        answer = input(f"\n{question}? (Enter to skip) ").strip()
+    except EOFError:
+        answer = ''
+    log.info(f"[observed] {question}: {answer or '(no answer)'}")
 
 
 def run_autofocus(scanner: Scanner, prefix: Path) -> int:
@@ -696,9 +720,12 @@ def run_autofocus(scanner: Scanner, prefix: Path) -> int:
     top = max(af.scores) or 1.0
     for pos, score in zip(af.positions, af.scores):
         bar = '#' * round(30 * score / top)
-        mark = '  <- chosen' if pos == af.focus else ''
+        mark = '  <- chosen' if af.peaked and pos == af.focus else ''
         print(f"  focus {pos:3d}  {score:8.4f}  {bar}{mark}")
-    print(f"Focus set to {af.focus} for the scan that follows.")
+    if af.peaked:
+        print(f"Focus set to {af.focus} for the scan that follows.")
+    else:
+        print(f"No clear peak; focus left at {af.focus} for the scan that follows.")
     prefix.parent.mkdir(parents=True, exist_ok=True)
     path = prefix.with_name(prefix.name + '_af_lines.npy')
     numpy.save(path, af.lines)
@@ -706,9 +733,9 @@ def run_autofocus(scanner: Scanner, prefix: Path) -> int:
     return 0
 
 
-def advance_slide(scanner: Scanner, frames: int = 1) -> int:
+def advance_slide(scanner: Scanner, frames: int = 1, ask: bool = False) -> int:
     return move_transport(scanner, f"Advancing {frames} frame(s)",
-                          lambda: scanner.advance(frames))
+                          lambda: scanner.advance(frames), ask)
 
 
 def parse_args(argv=None):
@@ -786,7 +813,14 @@ def parse_args(argv=None):
     g.add_argument('-v', '--verbose', action='store_true',
                    help='DEBUG logging to stderr -- one line per SCSI command, very chatty')
     g.add_argument('--log', metavar='FILE',
-                   help='write a DEBUG log to FILE (independent of -v)')
+                   help='write the whole run to FILE: everything printed, a DEBUG log '
+                        'with every payload and reply, versions and git state '
+                        '(independent of -v)')
+    g.add_argument('--note', action='append', default=[], metavar='TEXT',
+                   help='record TEXT in the log, e.g. what is loaded; repeatable')
+    g.add_argument('--ask', action='store_true',
+                   help='after each transport move, ask what the film did and log '
+                        'the answer')
     g.add_argument('--warmup-timeout', type=float, default=180, metavar='S',
                    help='how long to wait for the lamp before giving up (default: 180)')
     return p.parse_args(argv)
@@ -809,7 +843,86 @@ def setup_logging(args) -> None:
         handler.setFormatter(logging.Formatter(
             '%(asctime)s %(levelname)s %(name)s: %(message)s'))
         root.addHandler(handler)
+        # Console output joins the file only: the console already shows it, and
+        # the console handler holds the real stderr, so log lines are not doubled.
+        for name, stream in (('stdout', sys.stdout), ('stderr', sys.stderr)):
+            echo = logging.getLogger(f'exercise.{name}')
+            echo.propagate = False
+            echo.addHandler(handler)
+            tee = _Tee(stream, echo)
+            setattr(sys, name, tee)
+            atexit.register(tee.flush_line)
+        logging.captureWarnings(True)
         print(f"debug log -> {args.log}")
+        run_log = logging.getLogger('exercise.run')
+        run_log.propagate = False
+        run_log.addHandler(handler)
+        log_run_context(run_log, args)
+
+
+class _Tee(io.TextIOBase):
+    '''A console stream that also logs every line written to it.'''
+
+    def __init__(self, stream, logger: logging.Logger) -> None:
+        self._stream = stream
+        self._logger = logger
+        self._partial = ''
+
+    def write(self, text: str) -> int:
+        self._stream.write(text)
+        lines = (self._partial + text).split('\n')
+        self._partial = lines.pop()
+        for line in lines:
+            self._logger.info(line)
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def flush_line(self) -> None:
+        if self._partial:
+            self._logger.info(self._partial)
+            self._partial = ''
+
+    def isatty(self) -> bool:
+        return self._stream.isatty()
+
+    @property
+    def encoding(self):
+        return self._stream.encoding
+
+
+def _git(*cmd: str) -> str:
+    try:
+        out = subprocess.run(['git', *cmd], cwd=Path(__file__).resolve().parent.parent,
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f'unavailable ({e})'
+    return out.stdout.strip() if out.returncode == 0 else f'unavailable ({out.stderr.strip()})'
+
+
+def _version(module: str) -> str:
+    try:
+        return getattr(__import__(module), '__version__', 'installed, no version')
+    except ImportError:
+        return 'not installed'
+
+
+def log_run_context(log: logging.Logger, args) -> None:
+    """What a log needs to be read without asking how the run was made."""
+    log.info(f"[run] argv: {shlex.join(sys.argv)}")
+    log.info(f"[run] cwd: {Path.cwd()}")
+    log.info(f"[run] python {platform.python_version()} on {platform.platform()}")
+    log.info(f"[run] pyusb {_version('usb')}, libusb_package {_version('libusb_package')}, "
+             f"numpy {numpy.__version__}, Pillow {_version('PIL')}")
+    log.info(f"[run] pieusb from {Path(pieusb.__file__).resolve().parent}")
+    log.info(f"[run] git: {_git('describe', '--always', '--dirty', '--tags')} "
+             f"on {_git('rev-parse', '--abbrev-ref', 'HEAD')}")
+    status = _git('status', '--short', '--untracked-files=no')
+    for line in status.splitlines():
+        log.info(f"[run] git modified: {line}")
+    for note in args.note:
+        log.info(f"[note] {note}")
 
 
 def main(argv=None) -> int:
@@ -847,21 +960,22 @@ def main(argv=None) -> int:
 
     with Scanner(info) as scanner:
         if args.advance_only:
-            return advance_slide(scanner, args.frames)
+            return advance_slide(scanner, args.frames, args.ask)
 
         if args.rewind:
             return move_transport(scanner, f"Rewinding {args.frames} frame(s)",
-                                  lambda: scanner.rewind(args.frames))
+                                  lambda: scanner.rewind(args.frames), args.ask)
 
         if args.eject is not None:
             return move_transport(scanner, f"Ejecting {args.eject}",
                                   lambda: scanner.eject(EjectDirection.UP
                                                         if args.eject == 'up'
-                                                        else EjectDirection.DOWN))
+                                                        else EjectDirection.DOWN),
+                                  args.ask)
 
         if args.offset_mm is not None:
             return move_transport(scanner, f"Offsetting by {args.offset_mm} mm",
-                                  lambda: scanner.offset_frame(args.offset_mm))
+                                  lambda: scanner.offset_frame(args.offset_mm), args.ask)
 
         if args.transport_state:
             return report_transport_state(scanner)
@@ -957,11 +1071,14 @@ def main(argv=None) -> int:
         if args.advance:
             if result.cancelled or result.error is not None:
                 print("\nNot advancing: the scan did not complete.")
-            elif advance_slide(scanner) != 0:
+            elif advance_slide(scanner, ask=args.ask) != 0:
                 return 1
 
         return status
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    # A traceback needs no handler here: it reaches the log through stderr.
+    code = main()
+    logging.getLogger('exercise.run').info(f"[run] exit status {code}")
+    sys.exit(code)

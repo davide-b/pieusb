@@ -127,7 +127,8 @@ debugging, and a value set there overrides what `exposure` would derive.
 
 ### Slide transport
 
-The DigitDia 4000 and DigitDia 6000 feed slides from a magazine. Moving the
+The DigitDia 4000 and DigitDia 6000 feed slides from a magazine, and the
+ProScan 4000 feeds a filmstrip or slide carrier. Moving the
 transport is a call of its own rather than something `scan()` does for you, so
 the loop above becomes:
 
@@ -164,13 +165,17 @@ scan already does this for itself.
 ### Verified on hardware
 
 - ProScan 10T
-- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**
+- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**,
+  with absolute exposure
+- ProScan 4000: scanning, exposure, focus and `autofocus()` with a filmstrip
+  carrier, and `advance()` and `offset_frame()`
 
 ### Not verified on hardware
 
-- Slide transport (`advance()`, `init_transport()`), on either DigitDia. The
-  commands follow the SANE `pieusb` backend, but no scanner with a transport has
-  been on the bench here.
+- ProScan 4000: `rewind()`, `eject()`, the slide carrier, and `exposure` in a
+  single scan without `reuse_calibration`
+- Slide transport on either DigitDia. The commands follow the SANE `pieusb`
+  backend, but no DigitDia has been on the bench here.
 
 # WARNING
 

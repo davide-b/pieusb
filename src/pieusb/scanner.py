@@ -107,6 +107,11 @@ PREVIEW_RESOLUTION_FALLBACK = 300
 # on the ProScan 4000, whose maximum is 3600.
 AUTOFOCUS_RESOLUTION = 5000
 
+# The sharpest line's score over the sweep's median below which the sweep has no
+# peak to trust. Sweeps of detailed film reach 1.11-1.21; a sweep of the default
+# frame's near-featureless lower half on an RPS 10M reached 1.04.
+AUTOFOCUS_MIN_PEAK = 1.07
+
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
 START_SCAN_ATTEMPTS = 30
 START_SCAN_RETRY_S = 5
@@ -128,6 +133,16 @@ STATE_FILMSTRIP_CARRIER = 0x04
 # SCSI_SLIDE offset steps are 1/240 inch.
 OFFSET_STEPS_PER_INCH = 240
 OFFSET_STEPS_PER_MM = OFFSET_STEPS_PER_INCH / 25.4
+
+SLIDE_ACTION_NAMES = {
+    SLIDE_OFFSET_FORWARD: 'OFFSET FORWARD',
+    SLIDE_OFFSET_BACK: 'OFFSET BACK',
+    SLIDE_EJECT_DOWN: 'EJECT DOWN',
+    SLIDE_EJECT_UP: 'EJECT UP',
+    SLIDE_NEXT: 'NEXT',
+    SLIDE_PREV: 'PREV',
+    SLIDE_INIT: 'INIT',
+}
 
 # REMOVE BEFORE RELEASE, together with the two log.warning calls that use it,
 # once a scanner with a slide transport has run these commands.
@@ -341,10 +356,14 @@ class Scanner:
         `byte3` has no known meaning; both vendors leave it 0 except on SLIDE_PREV,
         where the one captured payload sets it to 1.
         """
+        log.debug(f"[slide] {SLIDE_ACTION_NAMES.get(action, f'0x{action:02x}')} "
+                  f"value {value} byte3 {byte3}")
+        started = time.monotonic()
         self.dev.command(SCSI_SLIDE, out_data=bytes([action, value, 0x00, byte3]))
         if action == SLIDE_INIT:
             self._transport_initialized = True
         self.wait_ready()
+        log.debug(f"[slide] idle after {time.monotonic() - started:.1f}s")
 
     def transport_state(self) -> TransportState | None:
         """READ STATE, decoded, or None on a scanner without a film transport.
@@ -356,13 +375,18 @@ class Scanner:
             return None
         raw = self.dev.command(SCSI_READ_STATE, in_size=READ_STATE_SIZE,
                                cdb_length=READ_STATE_SIZE)
-        return TransportState(
+        state = TransportState(
             frame=raw[2],
             focus=raw[3],
             focus_max=raw[4],
             flags=raw[6],
             raw=bytes(raw),
         )
+        log.debug(f"[transport] READ STATE {state.raw.hex(' ')}: frame {state.frame}, "
+                  f"focus {state.focus}/{state.focus_max}, flags 0x{state.flags:02x}, "
+                  f"medium present {state.medium_present}, "
+                  f"filmstrip carrier {state.filmstrip_carrier}")
+        return state
 
     def focus_range(self) -> tuple[int, int] | None:
         """The focus positions this scanner accepts, or None if it has no focus.
@@ -489,18 +513,22 @@ class Scanner:
         """Run the device's focus sweep, then adopt the sharpest position as 'focus'.
 
         This is the vendor's autofocus pass: MODE SELECT byte 10 set, the focus
-        parked at its minimum, and a pass that returns one line per focus position
-        -- 30 lines with a filmstrip carrier on an RPS 10M, whose focus range is
-        30. The host scores each line's sharpness and picks the best.
+        parked at its minimum, and a pass that returns as many lines as the focus
+        range -- 30 with a filmstrip carrier on a ProScan 4000. The host scores
+        each line's sharpness in red, as the vendor software does, and picks the
+        best. A sweep whose best line does not stand out (AUTOFOCUS_MIN_PEAK)
+        leaves 'focus' alone, with a warning.
 
         The sweep covers the lower half of the current frame, full width, which on
         the default frame is the region CyberView sweeps. It runs with the
         device's own shading analysis and leaves every option but 'focus' as it
         found it, the cached shading reference included.
 
-        Experimental: that line i was taken at focus minimum + i, and that
-        line_sharpness() ranks them as the vendor does, are inferred from captures
-        and unconfirmed on hardware.
+        Experimental. On a ProScan 4000 with a filmstrip carrier, line i is within
+        one step of focus minimum + i up to about focus 20, where the sweep stops;
+        later lines repeat that position. On an RPS 10M with a filmstrip carrier,
+        line i is focus minimum + i to within the 13-16 a manual sweep found
+        sharpest. Untested with a slide carrier and on other models.
 
         Raises PieusbError on a scanner without focus or that reports no focus
         range, and ScanInProgress while a scan is running.
@@ -536,11 +564,21 @@ class Scanner:
         positions = autofocus_positions(sweep.rgb.shape[0], *limits)
         scores = line_sharpness(sweep.rgb)
         best = positions[int(numpy.argmax(scores))]
-        self.params['focus'].value = best
-        self.params['focus'].assigned = True
-        log.info(f"[autofocus] {len(positions)} lines over focus {limits[0]}..{limits[1]}; "
-                 f"sharpest at {best}")
-        return AutofocusResult(focus=best, positions=tuple(positions),
+        median = float(numpy.median(scores))
+        peak = float(scores.max()) / median if median > 0 else 0.0
+        peaked = peak >= AUTOFOCUS_MIN_PEAK
+        if peaked:
+            self.params['focus'].value = best
+            self.params['focus'].assigned = True
+            log.info(f"[autofocus] {len(positions)} lines over focus "
+                     f"{limits[0]}..{limits[1]}; sharpest at {best}")
+        else:
+            log.warning(f"[autofocus] no clear peak over focus {limits[0]}..{limits[1]} "
+                        f"(sharpest line {peak:.3f}x the median, below "
+                        f"{AUTOFOCUS_MIN_PEAK}); keeping focus "
+                        f"{self.params['focus'].value}. Sweep a region with more detail")
+        return AutofocusResult(focus=self.params['focus'].value, peaked=peaked,
+                               positions=tuple(positions),
                                scores=tuple(float(v) for v in scores),
                                lines=sweep.rgb)
 

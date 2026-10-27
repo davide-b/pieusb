@@ -6,7 +6,8 @@
 - **Per-model capabilities**, `DeviceInfo.capabilities` (`types.Capabilities`):
   `film_transport`, `focus` and `exposure_control`, looked up by model number in
   `inquiry.DEVICE_CAPABILITIES`. A model not in the table gets conservative
-  defaults, so the ProScan 10T and RPS 10M behave as before
+  defaults, so the ProScan 10T behaves as before. The RPS 10M is now an
+  absolute-exposure model (see Exposure)
 - `get_devices()` skips a scanner it cannot identify instead of failing the whole
   enumeration. If none can be identified it raises the first error
 
@@ -15,9 +16,10 @@
   4000/6000): `Scanner.advance(frames)`, `rewind(frames)`, `eject(direction)`,
   `offset_frame(mm)` and `init_transport()`. Each blocks until the mechanism is
   idle and raises `ScanInProgress` during a scan. The medium moves only when one
-  of these is called; the ignored `advance` option is gone. Unverified on
-  hardware, so each call logs a warning. Magazine state is not in the protocol,
-  so an empty magazine is not reported
+  of these is called; the ignored `advance` option is gone. `advance()` and
+  `offset_frame()` are verified on a ProScan 4000 with a filmstrip; `rewind()`
+  and `eject()` are not, and every transport call still logs a warning. Magazine
+  state is not in the protocol, so an empty magazine is not reported
 - `Scanner.transport_state()` decodes READ STATE: frame, focus, focus range,
   `medium_present`, `filmstrip_carrier` and the raw `flags`
 - **Focus** on models with a focus motor: a `focus` option sent before every
@@ -26,25 +28,34 @@
   filmstrip). A focus outside the range is clamped with a warning
 - **`Scanner.autofocus()`, experimental**: runs the device's focus sweep, picks
   the sharpest position and sets `focus` to it. Returns an `AutofocusResult` with
-  every position's score. Unconfirmed on hardware
+  every position's score. Sharpness is scored in red alone, as the vendor
+  software does; a dim blue channel behind a negative's orange mask had made it
+  pick by noise. A sweep with no clear peak leaves `focus` alone, logs a warning
+  and returns `peaked=False`. With a filmstrip carrier its pick is within 1% of
+  the sharpest manual focus on a ProScan 4000 and within the sharpest range on
+  an RPS 10M; untested with a slide carrier
 
 ## Exposure
 - **One exposure control on every model**: `exposure` for the whole image and
   `exposure_r/g/b` per channel on top, as multipliers on the exposure the
   scanner calibrated for itself. The library translates it into whichever device
   field the model honours -- `exp_rel_*` on a ProScan 10T, the device's own
-  `exp_time_*` scaled on a ProScan 4000 -- and clamps it to what the model can
+  `exp_time_*` scaled on a ProScan 4000 or RPS 10M -- and clamps it to what the model can
   do: a relative model cannot go below 1.0. `ScanResult.exposure_factor` reports
   what reached the sensor. `auto_exp` meters into `exposure_r/g/b`, with
   `exposure` as compensation on top
-- **The library decides when a scan needs an extra pass.** On a ProScan 4000 a
+- **The RPS 10M uses absolute exposure.** On the hardware, doubling `exp_time`
+  doubled the image exactly, while doubling `exp_rel` gave 1.44x. As a relative
+  model, a pass reusing the cached calibration also ran at default gain and
+  offset instead of the device's, shifting its colour against the first pass
+- **The library decides when a scan needs an extra pass.** On an absolute model a
   pass that runs the device's shading analysis uses the device's own exposure,
   so any other exposure needs a pass that skips it, and so a shading reference
   taken beforehand. A scan with a custom exposure runs a short calibration pass
   first when none is cached, `auto_exp`'s metering pass doubles as one, and a
   pass whose skip the device refuses is run once more. At the scanner's own
   exposure, and on relative models, a scan is still one pass
-- On a ProScan 4000 each pass adopts the gain, offset and lamp level the device
+- On an absolute model each pass adopts the gain, offset and lamp level the device
   reports for itself, as both vendor drivers do, instead of option defaults that
   made scans come out dark
 - The device fields -- `exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`, `light`
@@ -83,13 +94,20 @@
   - new flags: `--repeat`, `--pass-option`, `--assume`, `--autofocus`,
     `--inquiry-hex`, and the transport and focus flags `--advance-only`,
     `--rewind`, `--eject`, `--offset-mm`, `--frames`, `--transport-state`,
-    `--focus`
+    `--focus`, `--note` and `--ask`, which put what the person at the scanner
+    sees into the log
+  - `--log FILE` is the whole record of a run: everything printed, tracebacks,
+    warnings, the argv, Python and library versions, and the git commit and
+    modified files the run used. The terminal output is no longer needed
   - each pass reports the exposure that reached the sensor and a per-channel
     sharpness. `--repeat` ends with a level comparison between passes, next to
     their exposures
   - `--list` shows the model number and capabilities. The option table marks
     options set explicitly with `*`, and device fields with `[advanced]`
-- DEBUG logging for each phase of a SCSI transaction
+- DEBUG logging for each phase of a SCSI transaction, with every payload and
+  reply in hex (image and shading reads cut to their first 32 bytes), the sense
+  data of a CHECK CONDITION, each SLIDE command and how long it kept the device
+  busy, and READ STATE decoded
 
 # v0.3.7
 

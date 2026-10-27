@@ -132,11 +132,13 @@ class AutofocusResult:
     '''What Scanner.autofocus() measured.
 
     `scores[i]` is the sharpness of the line the device took at focus
-    `positions[i]`, and `focus` is the position with the highest score, which the
-    Scanner has adopted as its 'focus' option. `lines` is the sweep itself,
-    (lines, width, 3), shading-corrected.
+    `positions[i]`. `peaked` says whether the best score stood out from the rest;
+    if it did, `focus` is its position, which the Scanner has adopted as its
+    'focus' option, and if not, `focus` is the option left as it was. `lines` is
+    the sweep itself, (lines, width, 3), shading-corrected.
     '''
     focus: int
+    peaked: bool
     positions: tuple[int, ...]
     scores: tuple[float, ...]
     lines: numpy.ndarray

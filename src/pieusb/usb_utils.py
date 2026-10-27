@@ -30,6 +30,8 @@ def find_device(vid: int, pid: int) -> usb.core.Device | None:
     dev = usb.core.find(idVendor=vid, idProduct=pid, backend=backend)
     if dev is None:
         log.debug("[find_device] device not found")
-    log.debug("[find_device] found device")
+    else:
+        log.debug(f"[find_device] found device: bus {dev.bus} address {dev.address}, "
+                  f"bcdDevice 0x{dev.bcdDevice:04x}, bcdUSB 0x{dev.bcdUSB:04x}")
 
     return dev

@@ -94,6 +94,17 @@ IEEE_SETTLE_S = 0.003
 # vendor driver and SANE re-issue at about 0.5 s.
 RETRY_S = 1.0
 
+# Payloads and replies up to this size are logged whole; a longer one, which is
+# image or shading data, as its first HEX_LOG_HEAD bytes and its length.
+HEX_LOG_FULL = 256
+HEX_LOG_HEAD = 32
+
+
+def _hex(data: bytes) -> str:
+    if len(data) <= HEX_LOG_FULL:
+        return data.hex(' ')
+    return f"{data[:HEX_LOG_HEAD].hex(' ')} ... ({len(data)} bytes)"
+
 class UASDevice:
     def __init__(self, dev: usb.core.Device) -> None:
         self.dev = dev
@@ -221,7 +232,8 @@ class UASDevice:
             custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
             == usb.util.ENDPOINT_IN,
         )
-        log.debug(f"[open] bulk IN endpoint = {self.ep_in}")
+        log.debug(f"[open] bulk IN endpoint 0x{self.ep_in.bEndpointAddress:02x}, "
+                  f"wMaxPacketSize {self.ep_in.wMaxPacketSize}")
     
         log.debug(f"[open] claim_interface({self.intf_number})...")
         usb.util.claim_interface(self.dev, self.intf_number)
@@ -259,7 +271,8 @@ class UASDevice:
         result = b""
 
         if status == STATUS_OK and len(out_data) > 0:
-            log.debug(f"      [txn 0x{opcode:02x}] writing {len(out_data)} payload bytes")
+            log.debug(f"      [txn 0x{opcode:02x}] writing {len(out_data)} payload bytes: "
+                      f"{_hex(bytes(out_data))}")
             for b in out_data:
                 self._ctrl_out_byte(PORT_SCSI_CMD, b)
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)
@@ -268,7 +281,8 @@ class UASDevice:
             log.debug(f"      [txn 0x{opcode:02x}] announcing {in_size} bytes")
             self._bulk_size(in_size)
             result = self._bulk_in(in_size)
-            log.debug(f"      [txn 0x{opcode:02x}] read {len(result)} bytes")
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(f"      [txn 0x{opcode:02x}] read {len(result)} bytes: {_hex(result)}")
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)
             log.debug(f"      [txn 0x{opcode:02x}] status 0x{status:02x}")
 
@@ -305,6 +319,8 @@ class UASDevice:
                 if data_expected and len(result) != in_size:
                     if data_phase_retries < MAX_DATA_PHASE_RETRIES:
                         data_phase_retries += 1
+                        log.debug(f"    [cmd 0x{opcode:02x}] short read, {len(result)} of "
+                                  f"{in_size} bytes; retry {data_phase_retries}")
                         status = STATUS_AGAIN
                         continue
                     raise TransportError(
@@ -326,10 +342,15 @@ class UASDevice:
                 raise TransportError(f"USB status 0x{status:02x}")
             raise TransportError(f"unhandled USB status 0x{status:02x}")
 
+        log.debug(f"    [cmd 0x{opcode:02x}] timed out after {COMMAND_TIMEOUT_S}s, "
+                  f"last status 0x{status:02x}")
         raise Timeout(f"command 0x{opcode:02x} timed out after {COMMAND_TIMEOUT_S}s")
 
     def get_sense(self):
         raw = self.command(SCSI_REQUEST_SENSE, in_size=14)
         # The top nibble of byte 2 carries FILEMARK/EOM/ILI, not the sense key.
-        return {"sense_key": raw[2] & 0x0F, "sense_code": raw[12],
-                "sense_qualifier": raw[13]}
+        sense = {"sense_key": raw[2] & 0x0F, "sense_code": raw[12],
+                 "sense_qualifier": raw[13]}
+        log.debug(f"    [sense] key 0x{sense['sense_key']:x}, code 0x{sense['sense_code']:02x}, "
+                  f"qualifier 0x{sense['sense_qualifier']:02x}")
+        return sense

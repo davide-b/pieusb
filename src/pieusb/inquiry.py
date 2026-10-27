@@ -37,6 +37,9 @@ DEVICE_CAPABILITIES = {
         focus=True,
         exposure_control=ExposureControl.ABSOLUTE,
     ),
+    0x0048: Capabilities(              # RPS 10M
+        exposure_control=ExposureControl.ABSOLUTE,
+    ),
     0x002f: Capabilities(film_transport=True),   # DigitDia 4000
     0x003a: Capabilities(film_transport=True),   # DigitDia 6000
 }
