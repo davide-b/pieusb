@@ -18,7 +18,9 @@ the scanner has the hardware it drives:
 
 --profile characterize (the default) admits every risk; regression admits
 read-only and scan stages and runs the library exactly as configured for the
-model. Which motors a model has comes from pieusb.inquiry.MODEL_MOTORS. A model
+model. The suite then drives no motor itself, but the library still does what
+it does in normal use: on a model it drives focus on, a SLIDE focus command
+precedes every scan. Which motors a model has comes from pieusb.inquiry.MODEL_MOTORS. A model
 not in it gets none unless --allow names them -- an unknown scanner may have no
 transport, and a ProScan 10T must never be sent a SLIDE -- and --allow cannot
 add a motor a known model lacks.
@@ -488,7 +490,13 @@ class Suite:
             self.record['ratios'] = ratios
         verdict = exposure_verdict(ratios['exp_time_x2'], ratios['exp_rel_x2'])
         configured = self.scanner.info.capabilities.exposure_control.name
-        self.record.update(verdict=verdict, library_configured=configured,
+        # The verdict picks one; a model can honour both, so record each.
+        response = {name: ('doubles' if all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
+                           else 'live' if any(abs(v - 1) > EXPOSURE_LIVE for v in r)
+                           else 'no effect')
+                    for name, r in ratios.items() if name != 'base_again'}
+        self.record.update(verdict=verdict, response=response,
+                           library_configured=configured,
                            matches_library=verdict == configured)
         self.findings['exposure_control'] = verdict
         print(f"\nexposure control: measured {verdict}, library configured {configured}"
