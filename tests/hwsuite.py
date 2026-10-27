@@ -44,7 +44,8 @@ Transport stages, in an order that needs no reloading:
                  each scanned and returned
     stepping     NEXT 1, NEXT 2, PREV with byte 3 = 1, PREV with byte 3 = 0
     redetect     NEXT after deliberately shifting the film each way: does NEXT
-                 find the frame, or move a fixed distance?
+                 find the frame, or move a fixed distance? Then PREV and the
+                 shift undone, so later stages start where this one did
     rewind       PREV back to frame 0, then a scan to compare with the start
     walk         every frame to the end: home and both centring offsets
     recovery     PREV from the end, and a scan
@@ -399,7 +400,6 @@ class Suite:
             # Whether a frame move absorbs an offset is what 'redetect' measures,
             # so record what was outstanding rather than guess.
             self.event(op='unreturned_offset', mm=self.unreturned_mm, before=op)
-            self.unreturned_mm = 0.0
         after = self.state('after')
         self.event(op=op, value=value, busy_s=busy,
                    frame_before=before and before['frame'],
@@ -582,11 +582,17 @@ class Suite:
     def redetect(self) -> None:
         self.full_frame(self.preview_dpi)
         self.scan('home')
-        for shift in (REDETECT_OFFSET_MM, None, -REDETECT_OFFSET_MM, None):
-            if shift is not None:
-                self.move('offset', shift)
-            self.next(1)
-            self.scan(f"after_offset{shift:+g}" if shift is not None else 'after_plain')
+        for shift in (REDETECT_OFFSET_MM, -REDETECT_OFFSET_MM):
+            self.move('offset', shift)
+            try:
+                self.next(1)
+            except EndOfStrip:
+                self.move('offset', -shift)
+                raise
+            self.scan(f"after_offset{shift:+g}")
+            self.move('prev', 1)
+            self.move('offset', -shift)
+            self.scan('restored')
 
     def rewind(self) -> None:
         self.full_frame(self.preview_dpi)
