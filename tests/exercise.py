@@ -52,6 +52,23 @@ scanner can see:
 
     python tests/exercise.py --assume film_transport --advance-only --ask --log t5a.log
 
+--steps runs a sequence of transport moves and scans in one process, on one
+Scanner, separated by ';'. Each move is followed by READ STATE:
+
+    scan[=NAME]   scan with the current options, saved as PREFIX_NN_NAME
+    next[=N]      advance N frames (default 1)
+    prev[=N]      rewind N frames, SLIDE byte 3 = 1 as Scanner.rewind() sends it
+    prev0[=N]     rewind N frames with byte 3 = 0, as CyberView sends it on an RPS 10M
+    offset=MM     shift the film by MM (signed), as offset_frame()
+    state         READ STATE alone
+    ask[=TEXT]    ask the person at the scanner, and log the answer
+
+--steps-repeat N runs the list N times, and stops early when a 'next' leaves
+the frame counter where it was -- the likely end of the strip:
+
+    python tests/exercise.py --assume film_transport,focus -o focus=14 \
+        --steps "scan=home; offset=2; scan=plus2; offset=-2; scan=back" --log f1.log
+
 Ctrl-C during a scan cancels it cleanly (STOP SCAN at the next chunk boundary).
 
 Results are written as <prefix>_rgb.npy, shape (height, width, 3), plus
@@ -83,6 +100,7 @@ import pieusb
 from pieusb.exceptions import DeviceNotReady, ParamError, PieusbError, WarmingUp
 from pieusb.option import Unit
 from pieusb.scanner import Scanner
+from pieusb.transport import SLIDE_PREV
 from pieusb.types import (
     DeviceInfo,
     EjectDirection,
@@ -467,7 +485,8 @@ def report_result(r: ScanResult, args, prefix: Path) -> int:
         numpy.save(ir_path, r.ir)
         print(f"  saved {ir_path}")
 
-    save_tiffs(r, prefix)
+    if getattr(args, 'tiff', True):
+        save_tiffs(r, prefix)
 
     if args.png:
         save_png(r, prefix)
@@ -699,6 +718,7 @@ def move_transport(scanner: Scanner, what: str, action, ask: bool = False) -> in
 
 def ask_observation(question: str) -> None:
     """Put what the person at the scanner saw into the log."""
+    question = question.rstrip('? ')
     try:
         answer = input(f"\n{question}? (Enter to skip) ").strip()
     except EOFError:
@@ -730,6 +750,87 @@ def run_autofocus(scanner: Scanner, prefix: Path) -> int:
     path = prefix.with_name(prefix.name + '_af_lines.npy')
     numpy.save(path, af.lines)
     print(f"  saved {path}")
+    return 0
+
+
+STEP_NAMES = ('scan', 'next', 'prev', 'prev0', 'offset', 'state', 'ask')
+
+
+def parse_steps(spec: str) -> list[tuple[str, str]]:
+    """--steps as (op, argument) pairs, rejecting a typo before anything moves."""
+    steps = []
+    for part in spec.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        op, _, arg = part.partition('=')
+        op, arg = op.strip(), arg.strip()
+        if op not in STEP_NAMES:
+            raise SystemExit(f"--steps: unknown step {op!r}; choose from {', '.join(STEP_NAMES)}")
+        if op in ('next', 'prev', 'prev0') and arg and not arg.isdigit():
+            raise SystemExit(f"--steps: {op}={arg}: the frame count must be a whole number")
+        if op == 'offset':
+            try:
+                float(arg)
+            except ValueError:
+                raise SystemExit(f"--steps: offset={arg}: needs a signed distance in mm")
+        steps.append((op, arg))
+    return steps
+
+
+def run_steps(scanner: Scanner, args) -> int:
+    """Run --steps, --steps-repeat times. Stops at the first failure, or when a
+    'next' does not move the frame counter."""
+    steps = parse_steps(args.steps)
+    base = Path(args.output)
+    count = 0
+    for rep in range(1, args.steps_repeat + 1):
+        if args.steps_repeat > 1:
+            print(f"\n=== round {rep} of {args.steps_repeat} " + "=" * 40)
+        for op, arg in steps:
+            count += 1
+            label = f"[step {count}] {op}" + (f"={arg}" if arg else "")
+            log.info(label)
+            if op == 'scan':
+                prefix = base.with_name(f"{base.name}_{count:03d}_{arg or 'scan'}")
+                print(f"\n{label}: scanning to {prefix}_rgb.*")
+                status, result = run_one_pass(scanner, args, prefix)
+                if status != 0 or result is None:
+                    return status or 1
+                continue
+            if op == 'state':
+                if report_transport_state(scanner) != 0:
+                    return 1
+                continue
+            if op == 'ask':
+                ask_observation(arg or "What did the film do")
+                continue
+            before = scanner.transport_state()
+            frames = int(arg) if arg else 1
+            if op == 'next':
+                action = lambda: scanner.advance(frames)
+            elif op == 'prev':
+                action = lambda: scanner.rewind(frames)
+            elif op == 'prev0':
+                # Scanner.rewind() always sends byte 3 = 1; this is the variant
+                # CyberView sends on an RPS 10M.
+                action = lambda: scanner._slide(SLIDE_PREV, frames, byte3=0x00)
+            else:
+                action = lambda: scanner.offset_frame(float(arg))
+            if move_transport(scanner, label, action) != 0:
+                return 1
+            after = scanner.transport_state()
+            if op == 'next' and before is not None and after is not None:
+                if after.frame == before.frame:
+                    print(f"\nThe frame counter stayed at {after.frame} after NEXT: "
+                          f"probably the end of the strip. Stopping.")
+                    log.info(f"[steps] end of strip? frame {after.frame} unchanged by NEXT, "
+                             f"flags 0x{before.flags:02x} -> 0x{after.flags:02x}")
+                    if args.ask:
+                        ask_observation("What did the film do on that last advance")
+                    return 0
+    if args.ask:
+        ask_observation("Anything about the film or the scanner during the run worth noting")
     return 0
 
 
@@ -796,6 +897,13 @@ def parse_args(argv=None):
                         'passes after N. Repeatable')
 
     g = p.add_argument_group('focus (models with a focus motor)')
+    g.add_argument('--steps', metavar='SEQUENCE',
+                   help="run a ';'-separated sequence of moves and scans on one "
+                        'Scanner: scan[=NAME], next[=N], prev[=N], prev0[=N], '
+                        'offset=MM, state, ask[=TEXT]. See the top of this file')
+    g.add_argument('--steps-repeat', type=int, default=1, metavar='N',
+                   help='run --steps N times, stopping when a next does not move '
+                        'the frame counter (default: 1)')
     g.add_argument('--transport-state', action='store_true',
                    help='print READ STATE: frame, focus, focus range, flags')
     g.add_argument('--focus', type=int, metavar='N',
@@ -873,7 +981,8 @@ class _Tee(io.TextIOBase):
         lines = (self._partial + text).split('\n')
         self._partial = lines.pop()
         for line in lines:
-            self._logger.info(line)
+            # A progress bar rewrites itself with \r; only its last state is news.
+            self._logger.info(line.rsplit('\r', 1)[-1])
         return len(text)
 
     def flush(self) -> None:
@@ -928,6 +1037,8 @@ def log_run_context(log: logging.Logger, args) -> None:
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args)
+    if args.steps:
+        parse_steps(args.steps)
 
     print("Enumerating...")
     devices = pieusb.get_devices()
@@ -1037,6 +1148,9 @@ def main(argv=None) -> int:
 
         if args.autofocus and run_autofocus(scanner, Path(args.output)) != 0:
             return 1
+
+        if args.steps:
+            return run_steps(scanner, args)
 
         # Every pass shares one Scanner, which is what makes reuse_calibration
         # mean anything: the shading reference it reuses is per-Scanner, so a

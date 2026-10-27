@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+'''
+Unattended hardware suite: characterise a scanner, or check that a verified one
+still behaves as before.
+
+    python tests/hwsuite.py --output rps10m-suite                    # characterize
+    python tests/hwsuite.py --profile regression --output 10t-suite  # scans only
+    python tests/hwsuite.py --allow focus --output new-model         # unknown model
+
+Every stage declares a risk, and runs only if the profile admits that risk and
+the scanner has the hardware it drives:
+
+    read-only   identity                       nothing changes
+    scan        default_scan, exposure         ordinary scans
+    focus       autofocus                      moves the focus motor
+    transport   offsets, stepping, redetect,   moves film; also needs film loaded
+                rewind, walk, recovery
+
+--profile characterize (the default) admits every risk; regression admits
+read-only and scan stages and runs the library exactly as configured for the
+model. Which motors a model has comes from pieusb.inquiry.MODEL_MOTORS. A model
+not in it gets none unless --allow names them -- an unknown scanner may have no
+transport, and a ProScan 10T must never be sent a SLIDE -- and --allow cannot
+add a motor a known model lacks.
+
+Model-specific numbers are not kept here. Test positions derive from what the
+scanner reports (scan window, focus range) and library constants (offset step);
+expected results from the library's configuration for the model (the exposure
+stage checks Capabilities.exposure_control). What is left are tolerances.
+
+Load film (for transport stages: a strip of colour negative at its first frame),
+start it, and leave it. It stops on its own: at the end of the strip, or at the
+first transport or focus command that fails, since carrying on after one risks
+the film. Send back the whole output folder: suite.log has everything the
+terminal showed plus every command and reply, summary.json what each stage found
+and a suggested capability entry, and each stage's folder its scans as .npy.
+
+Transport stages, in an order that needs no reloading:
+
+    offsets      small offsets at 600 dpi, and the centring move CyberView uses,
+                 each scanned and returned
+    stepping     NEXT 1, NEXT 2, PREV with byte 3 = 1, PREV with byte 3 = 0
+    redetect     NEXT after deliberately shifting the film each way: does NEXT
+                 find the frame, or move a fixed distance?
+    rewind       PREV back to frame 0, then a scan to compare with the start
+    walk         every frame to the end: home and both centring offsets
+    recovery     PREV from the end, and a scan
+
+A stage that runs out of film is recorded as partial and the suite goes on.
+'''
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from enum import IntEnum
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import exercise as ex
+from exercise import log
+
+import numpy
+
+import pieusb
+from pieusb.exceptions import DeviceNotReady, PieusbError, WarmingUp
+from pieusb.inquiry import MODEL_MOTORS
+from pieusb.option import EXPOSURE_TIME_MAX
+from pieusb.scanner import OFFSET_STEPS_PER_MM, Scanner
+from pieusb.transport import SLIDE_PREV
+from pieusb.types import ExposureControl
+
+
+class Risk(IntEnum):
+    READ_ONLY = 0
+    SCAN = 1
+    FOCUS = 2
+    TRANSPORT = 3
+
+
+# The motor a risk drives, as a Capabilities field name.
+RISK_MOTOR = {Risk.FOCUS: 'focus', Risk.TRANSPORT: 'film_transport'}
+MOTORS = tuple(RISK_MOTOR.values())
+
+
+@dataclass(frozen=True)
+class Stage:
+    name: str
+    risk: Risk
+    # Transport stages also need film loaded, which only READ STATE can tell.
+    needs_medium: bool = False
+
+
+STAGES = (
+    Stage('identity', Risk.READ_ONLY),
+    Stage('default_scan', Risk.SCAN),
+    Stage('exposure', Risk.SCAN),
+    Stage('autofocus', Risk.FOCUS),
+    Stage('offsets', Risk.TRANSPORT, needs_medium=True),
+    Stage('stepping', Risk.TRANSPORT, needs_medium=True),
+    Stage('redetect', Risk.TRANSPORT, needs_medium=True),
+    Stage('rewind', Risk.TRANSPORT, needs_medium=True),
+    Stage('walk', Risk.TRANSPORT, needs_medium=True),
+    Stage('recovery', Risk.TRANSPORT, needs_medium=True),
+)
+STAGE_NAMES = tuple(s.name for s in STAGES)
+
+# The highest risk each profile admits.
+PROFILES = {'characterize': Risk.TRANSPORT, 'regression': Risk.SCAN}
+
+PREVIEW_DPI = 300
+OFFSET_DPI = 600
+PATCH_DPI = 2500
+PATCH_MM = 10
+FOCUS_SWEEP_POINTS = 8
+SMALL_OFFSET_MM = 2.0
+REDETECT_OFFSET_MM = 3.0
+# CyberView's centring move on an RPS 10M, 70 steps for a 36.5 mm window; other
+# windows scale it.
+CENTRING_STEPS = 70
+CENTRING_WINDOW_MM = 36.5
+MAX_WALK_FRAMES = 60
+
+# Exposure response: a control is live if it moves the level by more than
+# EXPOSURE_LIVE, and doubles it if every channel is within EXPOSURE_LINEAR of 2.
+# Levels are compared over pixels below EXPOSURE_MASK of full scale in the base
+# scan, so a doubled pixel cannot clip.
+EXPOSURE_LIVE = 0.10
+EXPOSURE_LINEAR = 0.25
+EXPOSURE_MASK = 0.4
+GAIN_STEP = 8
+GAIN_MAX = 63
+
+# A focus sweep whose sharpest scan beats its softest by this much shows the
+# focus motor does something.
+FOCUS_EFFECT = 1.2
+
+
+class Halt(Exception):
+    '''A motor command failed: stop the suite rather than move anything further.'''
+
+
+class EndOfStrip(Exception):
+    '''NEXT left the frame counter where it was.'''
+
+
+class Skip(Exception):
+    '''The stage cannot run on this scanner as it is now.'''
+
+
+def motors_for(model: int, allow: frozenset) -> frozenset:
+    '''The motors the suite may drive: the known hardware, or what --allow names.'''
+    if model in MODEL_MOTORS:
+        lacking = allow - MODEL_MOTORS[model]
+        if lacking:
+            raise SystemExit(f"--allow {', '.join(sorted(lacking))}: model 0x{model:04x} "
+                             f"is known to have no such hardware")
+        return MODEL_MOTORS[model]
+    return allow
+
+
+def select_stages(profile: str, motors: frozenset, only=None) -> list[tuple[Stage, str | None]]:
+    '''Every stage, with the reason it will not run, or None if it will.'''
+    plan = []
+    for stage in STAGES:
+        reason = None
+        motor = RISK_MOTOR.get(stage.risk)
+        if only is not None and stage.name not in only:
+            reason = 'not selected by --only'
+        elif stage.risk > PROFILES[profile]:
+            reason = f"the {profile} profile does not run {stage.risk.name.lower()} stages"
+        elif motor is not None and motor not in motors:
+            reason = f"no {motor} motor known on this model (--allow {motor} on an unknown one)"
+        plan.append((stage, reason))
+    return plan
+
+
+def level_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
+    '''Per channel, the mean level of `other` over `base`, over pixels that stay
+    below EXPOSURE_MASK of full scale in `base`.'''
+    full = numpy.iinfo(base.dtype).max
+    ratios = []
+    for c in range(base.shape[2]):
+        b = base[:, :, c].astype(numpy.float64)
+        o = other[:, :, c].astype(numpy.float64)
+        mask = b < EXPOSURE_MASK * full
+        if mask.sum() < 0.01 * mask.size:
+            mask = numpy.ones_like(mask)
+        ratios.append(round(float(o[mask].mean() / max(b[mask].mean(), 1e-9)), 4))
+    return ratios
+
+
+def exposure_verdict(exp_time: list[float], exp_rel: list[float]) -> str:
+    '''Which exposure control a model honours, from its response to doubling each.
+
+    Both can be live -- on an RPS 10M exp_rel x2 gave x1.44 and exp_time x2 gave
+    x2.0 -- so the one that doubles the image wins.
+    '''
+    def live(r):
+        return any(abs(v - 1) > EXPOSURE_LIVE for v in r)
+
+    def doubles(r):
+        return all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
+
+    if live(exp_time) and (doubles(exp_time) or not live(exp_rel)):
+        return ExposureControl.ABSOLUTE.name
+    if live(exp_rel):
+        return ExposureControl.RELATIVE.name
+    return 'undetermined'
+
+
+def focus_sweep(lo: int, hi: int, points: int = FOCUS_SWEEP_POINTS) -> list[int]:
+    if hi - lo + 1 <= points:
+        return list(range(lo, hi + 1))
+    return sorted({round(lo + i * (hi - lo) / (points - 1)) for i in range(points)})
+
+
+def image_sharpness(rgb: numpy.ndarray) -> float:
+    '''Red channel, as autofocus scores it: mean |gradient| over level, both axes.'''
+    red = rgb[:, :, 0].astype(numpy.float64)
+    level = red.mean()
+    if level <= 0:
+        return 0.0
+    return float((numpy.abs(numpy.diff(red, axis=0)).mean()
+                  + numpy.abs(numpy.diff(red, axis=1)).mean()) / level)
+
+
+class Suite:
+    def __init__(self, scanner: Scanner, out: Path) -> None:
+        self.scanner = scanner
+        self.out = out
+        self.stages: list[dict] = []
+        self.record: dict | None = None
+        self.started = time.monotonic()
+        self.prev_byte3 = 0x01
+        self.medium_present: bool | None = None
+        # Offsets sent since the last NEXT or PREV and not yet sent back.
+        self.unreturned_mm = 0.0
+        self.findings: dict = {}
+        self.scan_args = SimpleNamespace(png=False, tiff=False)
+
+        inq = scanner.params.inq
+        self.default_frame = tuple(scanner.params[n].value
+                                   for n in ('tl_x', 'tl_y', 'br_x', 'br_y'))
+        x0, y0, x1, y1 = (ex.native_to_mm(v, inq) for v in self.default_frame)
+        self.window_mm = (x1 - x0, y1 - y0)
+        cx, cy, half = (x0 + x1) / 2, (y0 + y1) / 2, PATCH_MM / 2
+        self.patch_mm = (max(x0, cx - half), max(y0, cy - half),
+                         min(x1, cx + half), min(y1, cy + half))
+        steps = round(CENTRING_STEPS * self.window_mm[0] / CENTRING_WINDOW_MM)
+        # offset_frame() truncates mm to steps; a hair over lands on `steps` exactly.
+        self.centring_mm = round((steps + 0.01) / OFFSET_STEPS_PER_MM, 3)
+        max_dpi = inq.max_resolution_x
+        self.preview_dpi = min(PREVIEW_DPI, max_dpi)
+        self.offset_dpi = min(OFFSET_DPI, max_dpi)
+        self.patch_dpi = min(PATCH_DPI, max_dpi)
+
+    # --- recording --------------------------------------------------------
+
+    def event(self, **fields) -> None:
+        fields['t'] = round(time.monotonic() - self.started, 2)
+        self.record['events'].append(fields)
+
+    def write_summary(self, **extra) -> None:
+        summary = {'stages': self.stages, 'findings': self.findings,
+                   'suggested_capabilities': self.suggested_capabilities(), **extra}
+        (self.out / 'summary.json').write_text(json.dumps(summary, indent=1, default=str))
+
+    def suggested_capabilities(self) -> dict:
+        '''A DEVICE_CAPABILITIES entry from what the run measured; None where it
+        measured nothing.'''
+        f = self.findings
+        return {
+            'film_transport': f.get('frame_counter_moves'),
+            'focus': f.get('focus_changes_sharpness'),
+            'exposure_control': f.get('exposure_control'),
+        }
+
+    def run(self, plan: list[tuple[Stage, str | None]]) -> int:
+        status = 0
+        for stage, reason in plan:
+            self.record = {'stage': stage.name, 'risk': stage.risk.name.lower(),
+                           'status': 'running', 'events': []}
+            self.stages.append(self.record)
+            if reason is None and stage.needs_medium and not self.medium_present:
+                reason = 'no film loaded according to READ STATE'
+            if reason is not None:
+                self.record['status'] = 'skipped'
+                self.record['note'] = reason
+                log.info(f"[suite] stage {stage.name} skipped: {reason}")
+                continue
+            print(f"\n{'=' * 70}\n== stage: {stage.name}\n{'=' * 70}")
+            log.info(f"[suite] stage {stage.name}")
+            stage_started = time.monotonic()
+            try:
+                getattr(self, stage.name)()
+                self.record['status'] = 'ok'
+            except Skip as e:
+                self.record['status'] = 'skipped'
+                self.record['note'] = str(e)
+            except EndOfStrip as e:
+                self.record['status'] = 'partial'
+                self.record['note'] = f"end of strip: {e}"
+                print(f"\nStage {stage.name} ran out of film: {e}")
+            except Halt as e:
+                self.record['status'] = 'halted'
+                self.record['note'] = str(e)
+                print(f"\nSTOPPING THE SUITE: {e}")
+                status = 1
+            except (PieusbError, ValueError, RuntimeError) as e:
+                self.record['status'] = 'failed'
+                self.record['note'] = f"{type(e).__name__}: {e}"
+                log.exception(f"[suite] stage {stage.name} failed")
+            finally:
+                self.record['duration_s'] = round(time.monotonic() - stage_started, 1)
+                self.write_summary()
+            print(f"\n-- stage {stage.name}: {self.record['status']} "
+                  f"in {self.record['duration_s']:.0f}s")
+            if status:
+                break
+        return status
+
+    # --- primitives -------------------------------------------------------
+
+    def focus(self) -> int | None:
+        try:
+            return self.scanner.params['focus'].value
+        except KeyError:
+            return None
+
+    def state(self, label: str = 'state') -> dict | None:
+        try:
+            s = self.scanner.transport_state()
+        except PieusbError as e:
+            self.event(op=label, error=f"{type(e).__name__}: {e}")
+            return None
+        if s is None:
+            return None
+        fields = dict(frame=s.frame, focus=s.focus, focus_max=s.focus_max,
+                      flags=f"0x{s.flags:02x}", medium_present=s.medium_present,
+                      raw=s.raw.hex(' '))
+        self.event(op=label, **fields)
+        return fields
+
+    def scan(self, name: str):
+        stage_dir = self.out / self.record['stage']
+        n = sum(1 for e in self.record['events'] if e['op'] == 'scan') + 1
+        prefix = stage_dir / f"{n:02d}_{name}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nscan {prefix.name}: {self.scanner.params['resolution'].value} dpi, "
+              f"focus {self.focus()}")
+        status, r = ex.run_one_pass(self.scanner, self.scan_args, prefix)
+        if r is not None and r.cancelled:
+            raise KeyboardInterrupt
+        if r is None or r.error is not None:
+            raise RuntimeError(f"scan {name} did not complete")
+        self.event(op='scan', name=name, file=f"{prefix.relative_to(self.out)}_rgb.npy",
+                   width=r.width, height=r.height, resolution=r.resolution,
+                   focus=self.focus(), shading_acquired=r.shading_acquired,
+                   exposure_factor=r.exposure_factor, exposure=r.exposure, gain=r.gain,
+                   mean=[round(float(r.rgb[:, :, c].mean()), 1) for c in range(3)],
+                   duration_s=round(r.duration_s, 1))
+        return r
+
+    def move(self, op: str, value) -> tuple[dict | None, dict | None]:
+        """One transport command, with READ STATE either side. Raises Halt on failure."""
+        before = self.state('before')
+        started = time.monotonic()
+        print(f"\n{op} {value}...")
+        try:
+            if op == 'next':
+                self.scanner.advance(value)
+            elif op == 'prev':
+                self.scanner._slide(SLIDE_PREV, value, byte3=self.prev_byte3)
+            elif op == 'prev0':
+                self.scanner._slide(SLIDE_PREV, value, byte3=0x00)
+            elif op == 'prev1':
+                self.scanner._slide(SLIDE_PREV, value, byte3=0x01)
+            elif op == 'offset':
+                self.scanner.offset_frame(value)
+            else:
+                raise ValueError(op)
+        except (PieusbError, ValueError) as e:
+            self.event(op=op, value=value, error=f"{type(e).__name__}: {e}")
+            raise Halt(f"{op} {value} failed: {type(e).__name__}: {e}") from e
+        busy = round(time.monotonic() - started, 2)
+        if op == 'offset':
+            self.unreturned_mm = round(self.unreturned_mm + value, 3)
+        elif self.unreturned_mm:
+            # Whether a frame move absorbs an offset is what 'redetect' measures,
+            # so record what was outstanding rather than guess.
+            self.event(op='unreturned_offset', mm=self.unreturned_mm, before=op)
+            self.unreturned_mm = 0.0
+        after = self.state('after')
+        self.event(op=op, value=value, busy_s=busy,
+                   frame_before=before and before['frame'],
+                   frame_after=after and after['frame'])
+        print(f"{op} {value}: {busy:.1f}s, frame "
+              f"{before and before['frame']} -> {after and after['frame']}")
+        if op != 'offset' and before and after and after['frame'] != before['frame']:
+            self.findings['frame_counter_moves'] = True
+        return before, after
+
+    def next(self, frames: int = 1) -> None:
+        before, after = self.move('next', frames)
+        if before and after and after['frame'] == before['frame']:
+            raise EndOfStrip(f"frame counter stayed at {after['frame']} after NEXT {frames}")
+
+    def set(self, **options) -> None:
+        for name, value in options.items():
+            setattr(self.scanner, name, value)
+
+    def unset(self, *names) -> None:
+        '''Back to the option default, as if never assigned.'''
+        for name in names:
+            par = self.scanner.params[name]
+            par.value = par.opt.default
+            par.assigned = False
+
+    def full_frame(self, dpi: int) -> None:
+        ex.set_frame(self.scanner, *self.default_frame)
+        self.set(resolution=dpi)
+
+    # --- read-only and scan stages ----------------------------------------
+
+    def identity(self) -> None:
+        ex.describe(0, self.scanner.info)
+        ex.report_calibration(self.scanner)
+        self.record['inquiry'] = {k: getattr(self.scanner.info.inquiry, k) for k in (
+            'max_resolution_x', 'max_scan_w', 'max_scan_h', 'x0', 'y0', 'x1', 'y1',
+            'minimum_exposure', 'maximum_exposure', 'firmware_version', 'model')}
+        self.record['derived'] = {
+            'window_mm': [round(v, 2) for v in self.window_mm],
+            'patch_mm': [round(v, 2) for v in self.patch_mm],
+            'centring_offset_mm': self.centring_mm,
+        }
+        if self.scanner.info.capabilities.film_transport:
+            state = self.state()
+            self.medium_present = bool(state and state['medium_present'])
+            if state and state['frame'] != 0:
+                print(f"\nNote: the frame counter reads {state['frame']}, not 0. "
+                      f"Running from here.")
+
+    def default_scan(self) -> None:
+        '''One scan exactly as the library configures this model.'''
+        self.full_frame(self.preview_dpi)
+        self.scan('default')
+
+    def exposure(self) -> None:
+        '''Which device field moves the image: exp_time, exp_rel or gain.
+
+        Every compared pass skips the shading analysis and corrects from one
+        reference, since an analysing pass may re-derive its own exposure.
+        '''
+        names = [f'{f}_{c}' for f in ('exp_time', 'exp_rel', 'gain') for c in 'rgb']
+        self.full_frame(self.preview_dpi)
+        self.set(reuse_calibration=False)
+        self.scan('calibrate')
+        self.set(reuse_calibration=True)
+        ratios = {}
+        try:
+            base = self.scan('base')
+            exp_time = [min(2 * base.exposure[c], EXPOSURE_TIME_MAX) for c in range(3)]
+            gain = [min(base.gain[c] + GAIN_STEP, GAIN_MAX) for c in range(3)]
+            variants = (
+                ('exp_time_x2', {f'exp_time_{s}': exp_time[c] for c, s in enumerate('rgb')}),
+                ('exp_rel_x2', {f'exp_rel_{s}': 200 for s in 'rgb'}),
+                (f'gain_plus{GAIN_STEP}', {f'gain_{s}': gain[c] for c, s in enumerate('rgb')}),
+                ('base_again', {}),
+            )
+            for name, values in variants:
+                self.set(**values)
+                try:
+                    r = self.scan(name)
+                finally:
+                    self.unset(*values)
+                ratios[name] = level_ratio(base.rgb, r.rgb)
+                print(f"{name}: level x {ratios[name]}")
+        finally:
+            self.unset(*names, 'reuse_calibration')
+            self.record['ratios'] = ratios
+        verdict = exposure_verdict(ratios['exp_time_x2'], ratios['exp_rel_x2'])
+        configured = self.scanner.info.capabilities.exposure_control.name
+        self.record.update(verdict=verdict, library_configured=configured,
+                           matches_library=verdict == configured)
+        self.findings['exposure_control'] = verdict
+        print(f"\nexposure control: measured {verdict}, library configured {configured}"
+              + ("" if verdict in (configured, 'undetermined') else "   <- MISMATCH"))
+
+    # --- focus ------------------------------------------------------------
+
+    def autofocus(self) -> None:
+        limits = self.scanner.focus_range()
+        if limits is None:
+            raise Skip("the scanner reports no focus range")
+        inq = self.scanner.params.inq
+        ex.set_frame(self.scanner, *(ex.mm_to_native(v, inq) for v in self.patch_mm))
+        self.set(resolution=self.patch_dpi)
+        try:
+            af = self.scanner.autofocus()
+        except PieusbError as e:
+            raise Halt(f"autofocus failed: {type(e).__name__}: {e}") from e
+        path = self.out / self.record['stage'] / 'autofocus_lines.npy'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        numpy.save(path, af.lines)
+        self.event(op='autofocus', focus=af.focus, peaked=af.peaked,
+                   scores=[round(s, 5) for s in af.scores],
+                   file=str(path.relative_to(self.out)))
+        print(f"\nautofocus: {'picked' if af.peaked else 'no clear peak, kept'} "
+              f"focus {af.focus}")
+
+        self.set(reuse_calibration=True)
+        sharpness = {}
+        try:
+            for focus in focus_sweep(*limits):
+                self.set(focus=focus)
+                sharpness[focus] = round(image_sharpness(self.scan(f"focus{focus:02d}").rgb), 5)
+        finally:
+            self.unset('reuse_calibration')
+            self.record['sweep_sharpness'] = sharpness
+        best = max(sharpness, key=sharpness.get)
+        values = list(sharpness.values())
+        self.findings['focus_changes_sharpness'] = max(values) > FOCUS_EFFECT * min(values)
+        # Later stages scan at the sweep's best: it is measured, the pick inferred.
+        self.set(focus=best)
+        self.record.update(sweep_best=best, autofocus_pick=af.focus if af.peaked else None,
+                           focus_used_from_here=best)
+        print(f"sweep sharpest at {best}; autofocus picked "
+              f"{af.focus if af.peaked else 'nothing'}")
+
+    # --- transport --------------------------------------------------------
+
+    def offsets(self) -> None:
+        self.full_frame(self.offset_dpi)
+        for mm in (SMALL_OFFSET_MM, -SMALL_OFFSET_MM):
+            self.scan('home')
+            self.move('offset', mm)
+            self.scan(f"offset{mm:+g}")
+            self.move('offset', -mm)
+        self.scan('home')
+        self.full_frame(self.preview_dpi)
+        for mm in (self.centring_mm, -self.centring_mm):
+            self.scan('home')
+            self.move('offset', mm)
+            self.scan(f"offset{mm:+g}")
+            self.move('offset', -mm)
+        self.scan('home')
+
+    def stepping(self) -> None:
+        self.full_frame(self.preview_dpi)
+        self.scan('start')
+        self.next(1)
+        self.scan('next1')
+        self.next(2)
+        self.scan('next2')
+        for op in ('prev1', 'prev0'):
+            before, after = self.move(op, 1)
+            self.scan(op)
+            moved = before and after and after['frame'] == before['frame'] - 1
+            self.record[f'{op}_moved_counter'] = bool(moved)
+        # Rewinds later in the suite use whichever form moved the counter,
+        # the library's own if both did.
+        if not self.record['prev1_moved_counter'] and self.record['prev0_moved_counter']:
+            self.prev_byte3 = 0x00
+        self.record['prev_byte3_used_from_here'] = self.prev_byte3
+
+    def redetect(self) -> None:
+        self.full_frame(self.preview_dpi)
+        self.scan('home')
+        for shift in (REDETECT_OFFSET_MM, None, -REDETECT_OFFSET_MM, None):
+            if shift is not None:
+                self.move('offset', shift)
+            self.next(1)
+            self.scan(f"after_offset{shift:+g}" if shift is not None else 'after_plain')
+
+    def rewind(self) -> None:
+        self.full_frame(self.preview_dpi)
+        state = self.state()
+        if state is None:
+            raise RuntimeError("no READ STATE to rewind by")
+        for _ in range(state['frame'] + 2):
+            state = self.state()
+            if state is None or state['frame'] == 0:
+                break
+            before, after = self.move('prev', 1)
+            if before and after and after['frame'] == before['frame']:
+                self.record['note'] = f"PREV stopped moving the counter at {after['frame']}"
+                break
+        self.scan('start_again')
+
+    def walk(self) -> None:
+        self.full_frame(self.preview_dpi)
+        for _ in range(MAX_WALK_FRAMES):
+            self.scan('home')
+            self.move('offset', self.centring_mm)
+            self.scan('plus')
+            self.move('offset', -2 * self.centring_mm)
+            self.scan('minus')
+            self.move('offset', self.centring_mm)
+            self.next(1)
+
+    def recovery(self) -> None:
+        self.full_frame(self.preview_dpi)
+        self.state()
+        self.move('prev', 1)
+        self.scan('back_from_end')
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--output', metavar='DIR',
+                   help='folder for the log, images and summary '
+                        '(default: hwsuite-YYYYmmdd-HHMMSS)')
+    p.add_argument('--profile', choices=tuple(PROFILES), default='characterize',
+                   help='characterize: every stage the scanner has hardware for '
+                        '(default). regression: read-only and scan stages only')
+    p.add_argument('--allow', metavar='MOTOR[,MOTOR]', default='',
+                   help=f"on a model the suite does not know, drive these motors: "
+                        f"{', '.join(MOTORS)}. Refused on a known model that lacks them")
+    p.add_argument('--device', type=int, default=0, metavar='N',
+                   help='which enumerated device to use (default: 0)')
+    p.add_argument('--only', metavar='STAGE[,STAGE...]',
+                   help=f"run only these stages, in suite order: {', '.join(STAGE_NAMES)}")
+    p.add_argument('--note', action='append', default=[], metavar='TEXT',
+                   help='record TEXT in the log, e.g. what film is loaded; repeatable')
+    p.add_argument('--no-ask', action='store_true',
+                   help='do not ask the closing question')
+    p.add_argument('--warmup-timeout', type=float, default=300, metavar='S',
+                   help='how long to wait for the lamp (default: 300)')
+    return p.parse_args(argv)
+
+
+def parse_names(spec: str, valid, flag: str) -> frozenset:
+    names = frozenset(s.strip() for s in spec.split(',') if s.strip())
+    unknown = names - set(valid)
+    if unknown:
+        raise SystemExit(f"{flag}: unknown {', '.join(sorted(unknown))}; "
+                         f"choose from {', '.join(valid)}")
+    return names
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    allow = parse_names(args.allow, MOTORS, '--allow')
+    only = parse_names(args.only, STAGE_NAMES, '--only') if args.only else None
+
+    out = Path(args.output or datetime.now().strftime('hwsuite-%Y%m%d-%H%M%S'))
+    out.mkdir(parents=True, exist_ok=True)
+    ex.setup_logging(SimpleNamespace(verbose=False, log=str(out / 'suite.log'),
+                                     note=args.note))
+
+    print("Enumerating...")
+    devices = pieusb.get_devices()
+    if not 0 <= args.device < len(devices):
+        print(f"No scanner at --device {args.device} ({len(devices)} found).")
+        return 1
+    info = devices[args.device]
+    model = info.inquiry.model
+    motors = motors_for(model, allow)
+    if args.profile == 'regression':
+        # Regression runs the library exactly as configured for the model.
+        motors = frozenset()
+    plan = select_stages(args.profile, motors, only)
+    log.info(f"[suite] {info.model} (model 0x{model:04x}), profile {args.profile}, "
+             f"motors {', '.join(sorted(motors)) or 'none'}")
+    for stage, reason in plan:
+        log.info(f"[suite]   {stage.name:<13} {stage.risk.name.lower():<10} "
+                 f"{'runs' if reason is None else 'skipped: ' + reason}")
+    if motors:
+        info = ex.assume_capabilities(info, ','.join(sorted(motors)))
+
+    with Scanner(info) as scanner:
+        scanner.mode = 'rgb'
+        scanner.color_depth = 16
+        print(f"\nWaiting for the scanner to be ready (up to {args.warmup_timeout:.0f}s)...")
+        try:
+            scanner.wait_ready(args.warmup_timeout)
+        except (WarmingUp, DeviceNotReady) as e:
+            print(f"Not ready: {e}")
+            return 1
+        suite = Suite(scanner, out)
+        extra = dict(output=str(out), notes=args.note, profile=args.profile,
+                     model=f"0x{model:04x}", model_name=info.model,
+                     motors=sorted(motors))
+        try:
+            status = suite.run(plan)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            if suite.record is not None:
+                suite.record['status'] = 'interrupted'
+            status = 130
+        finally:
+            suite.write_summary(**extra)
+
+    print(f"\nSuggested capabilities: {suite.suggested_capabilities()}")
+    print(f"\nDone. Send back the whole folder: {out.resolve()}")
+    if not args.no_ask:
+        ex.ask_observation("Anything about the film or the scanner during the run worth "
+                           "noting -- noises, the film coming out, frames skipped")
+    return status
+
+
+if __name__ == '__main__':
+    # A traceback needs no handler here: it reaches the log through stderr.
+    code = main()
+    log.info(f"[run] exit status {code}")
+    sys.exit(code)

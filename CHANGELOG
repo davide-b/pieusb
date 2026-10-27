@@ -96,6 +96,9 @@
     `--rewind`, `--eject`, `--offset-mm`, `--frames`, `--transport-state`,
     `--focus`, `--note` and `--ask`, which put what the person at the scanner
     sees into the log
+  - `--steps` runs a sequence of scans and transport moves on one Scanner
+    (`scan`, `next`, `prev`, `prev0`, `offset`, `state`, `ask`), and
+    `--steps-repeat` repeats it until NEXT stops moving the frame counter
   - `--log FILE` is the whole record of a run: everything printed, tracebacks,
     warnings, the argv, Python and library versions, and the git commit and
     modified files the run used. The terminal output is no longer needed
@@ -104,6 +107,19 @@
     their exposures
   - `--list` shows the model number and capabilities. The option table marks
     options set explicitly with `*`, and device fields with `[advanced]`
+- `tests/hwsuite.py`, an unattended hardware suite. Each stage declares a risk
+  (read-only, scan, focus, transport) and runs only where the profile admits it
+  and the model has the motor: `--profile characterize` runs everything the
+  hardware has, `--profile regression` scans only, with the library as
+  configured. It measures which exposure control a model honours against its
+  capability entry, checks autofocus against a manual sweep, and on a filmstrip
+  measures offsets, stepping and positioning and walks the strip to its end. It
+  writes the log, the scans and a `summary.json` with a suggested capability
+  entry to one folder, and stops at the first failed motor command. An unknown
+  model gets motors only through `--allow`. `tests/test_hwsuite.py` runs it
+  against simulated scanners
+- `inquiry.MODEL_MOTORS`: the motors each model physically has, separate from
+  what `DEVICE_CAPABILITIES` lets the library drive
 - DEBUG logging for each phase of a SCSI transaction, with every payload and
   reply in hex (image and shading reads cut to their first 32 bytes), the sense
   data of a CHECK CONDITION, each SLIDE command and how long it kept the device

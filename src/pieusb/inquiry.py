@@ -44,6 +44,16 @@ DEVICE_CAPABILITIES = {
     0x003a: Capabilities(film_transport=True),   # DigitDia 6000
 }
 
+# The motors each model physically has, as Capabilities field names, whether or
+# not DEVICE_CAPABILITIES lets the library drive them yet. Capabilities is what
+# the library does; this is what a hardware test may exercise. A model absent
+# here is unknown, not motorless.
+MODEL_MOTORS = {
+    0x0047: frozenset(),                              # ProScan 10T
+    0x0048: frozenset({'film_transport', 'focus'}),   # RPS 10M
+    0x002c: frozenset({'film_transport', 'focus'}),   # ProScan 4000
+}
+
 def capabilities_for(model_nr: int) -> Capabilities:
     return DEVICE_CAPABILITIES.get(model_nr, Capabilities())
 
