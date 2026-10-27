@@ -79,7 +79,8 @@ from exercise import log
 import numpy
 
 import pieusb
-from pieusb.framing import FRAME_MM, FramePosition, find_bands, locate_frame
+from pieusb.framing import (BAND_MIN_CLIPPED_PX, FRAME_MM, BandKind, FramePosition,
+                            find_bands, locate_frame)
 from pieusb.exceptions import DeviceNotReady, PieusbError, WarmingUp
 from pieusb.inquiry import MODEL_MOTORS
 from pieusb.option import EXPOSURE_TIME_MAX
@@ -754,12 +755,19 @@ class Suite:
     def offset_scale(self) -> float | None:
         return float(numpy.median(self.scale_samples)) if self.scale_samples else None
 
-    def locate(self, r, frame_mm: float = FRAME_MM, label: str = 'located'):
+    def locate(self, r, frame_mm: float = FRAME_MM, label: str = 'located',
+               base_levels: list[float] | None = None):
+        '''Find the frame in a scan. `base_levels`, the gaps measured so far on
+        this strip, lets slivers of them count, and collects this scan's.'''
         px_per_mm = r.resolution / MM_PER_INCH
-        bands = find_bands(r.rgb, px_per_mm)
+        base = float(numpy.median(base_levels)) if base_levels else None
+        bands = find_bands(r.rgb, px_per_mm, base_level=base)
         frame = locate_frame(bands, r.rgb.shape[1], px_per_mm, frame_mm)
+        if base_levels is not None:
+            base_levels.extend(b.level for b in bands
+                               if b.kind is BandKind.GAP and b.width >= BAND_MIN_CLIPPED_PX)
         self.event(op=label, **placement_fields(bands, frame))
-        return frame
+        return frame, bands
 
     def framing(self) -> None:
         '''Roll scanning's positioning loop, every frame from the first.
@@ -775,7 +783,7 @@ class Suite:
         self.full_frame(self.preview_dpi)
         self.to_first_frame()
         frame_mm = FRAME_MM
-        widths, residuals = [], []
+        widths, residuals, base_levels = [], [], []
         self.record['frames'] = frames = []
         try:
             self.preview_timings()
@@ -786,7 +794,8 @@ class Suite:
                     self.next(1)
                 entry = {'index': index}
                 frames.append(entry)
-                frame = self.locate(self.scan('preview'), frame_mm)
+                frame, bands = self.locate(self.scan('preview'), frame_mm,
+                                           base_levels=base_levels)
                 if frame is None:
                     entry['result'] = 'no frame'
                     continue
@@ -796,7 +805,9 @@ class Suite:
                     widths.append(frame.width_mm)
                     frame_mm = float(numpy.median(widths))
                 if not frame.measured:
-                    entry['result'] = 'no edge seen'
+                    # No band at all: the picture runs to both edges, so the gaps
+                    # lie outside the window and the frame is about centred.
+                    entry['result'] = 'fills the window' if not bands else 'no edge seen'
                     continue
                 if abs(frame.shift_mm) < FRAMING_MIN_SHIFT_MM:
                     entry['result'] = 'centred'
@@ -811,7 +822,7 @@ class Suite:
                 # truncation lands on them exactly.
                 commanded = direction * steps / OFFSET_STEPS_PER_MM
                 self.move('offset', round(direction * (steps + 0.01) / OFFSET_STEPS_PER_MM, 3))
-                after = self.locate(self.scan('check'), frame_mm, 'checked')
+                after, _ = self.locate(self.scan('check'), frame_mm, 'checked', base_levels)
                 entry.update(commanded_steps=direction * steps,
                              commanded_mm=round(commanded, 3))
                 if after is None or not after.measured:
@@ -848,7 +859,7 @@ class Suite:
                     continue
                 self.full_frame(dpi)
                 r = self.scan(f"timing{dpi}")
-                frame = self.locate(r)
+                frame, _ = self.locate(r)
                 timings.append({'dpi': dpi, 'duration_s': round(r.duration_s, 1),
                                 'shading_acquired': r.shading_acquired,
                                 'shift_mm': frame and round(frame.shift_mm, 3)})

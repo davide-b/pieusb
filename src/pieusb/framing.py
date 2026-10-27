@@ -44,6 +44,11 @@ LEVEL_STEP = 0.5
 # BAND_MIN_CLIPPED_PX, since it may show as a sliver.
 BAND_MIN_MM = 0.3
 BAND_MIN_CLIPPED_PX = 3
+# A frame centred in the window shows its gaps as slivers of a column or two.
+# Those count when the strip's base level is known and the sliver matches it to
+# within BASE_MATCH in log2: on a ProScan 4000 strip every gap sat at
+# 0.177-0.180 of full scale.
+BASE_MATCH = 0.15
 # Wider than this, a uniform band is not a gap between frames.
 GAP_MAX_MM = 3.0
 # A gap is the film's least or most dense region: at or above this quantile of
@@ -188,13 +193,16 @@ def _polarity(cols: _Columns, picture: numpy.ndarray, start: int,
 
 
 def find_bands(rgb: numpy.ndarray, px_per_mm: float,
-               polarity: Polarity | None = None) -> list[Band]:
+               polarity: Polarity | None = None,
+               base_level: float | None = None) -> list[Band]:
     '''Every uniform vertical band in a filmstrip scan, left to right.
 
     `rgb` is (height, width, 3+) with the film along x, integer or float in 0..1.
     `polarity` says which way a gap stands out when the film type is known; None
-    accepts either. A narrow uniform band that stands out neither way, such as a
-    flat patch of scene, is not returned.
+    accepts either. `base_level`, the level of gaps already found on this strip,
+    lets a sliver at the image edge narrower than BAND_MIN_CLIPPED_PX count when
+    it matches. A narrow uniform band that stands out neither way, such as a flat
+    patch of scene, is not returned.
     '''
     cols = _columns(rgb)
     w = cols.level.size
@@ -204,10 +212,14 @@ def find_bands(rgb: numpy.ndarray, px_per_mm: float,
     for start, stop in pieces:
         clipped_start, clipped_stop = start == 0, stop == w
         width = stop - start
-        if width < (BAND_MIN_CLIPPED_PX if clipped_start or clipped_stop
-                    else BAND_MIN_MM * px_per_mm):
-            continue
         level = float(numpy.median(cols.level[start:stop]))
+        if clipped_start or clipped_stop:
+            sliver = base_level is not None and abs(
+                numpy.log2(max(level, 1e-6) / base_level)) <= BASE_MATCH
+            if width < BAND_MIN_CLIPPED_PX and not sliver:
+                continue
+        elif width < BAND_MIN_MM * px_per_mm:
+            continue
         colour = numpy.median(cols.rgb[start:stop], axis=0)
         neutral = colour.max() <= NEUTRAL_RATIO * max(colour.min(), 1e-6)
         edge_start = None if clipped_start else _edge(cols, start, stop, 'start')
