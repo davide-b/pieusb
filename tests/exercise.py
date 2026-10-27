@@ -14,8 +14,8 @@ nothing here is a unit test.
     python tests/exercise.py -o sharpen=true -o gain_r=25 --output run7
 
 Exposure is 'exposure' (whole image) and 'exposure_r/g/b' (per channel, on top),
-as multipliers on the exposure the scanner calibrated for itself. The same on
-every model; the library routes it to whichever device field the model honours
+as multipliers on the exposure the scanner chose for itself. The same on
+every model; the library routes it to the device field it drives on that model
 (`--list` reports which) and adds a calibration pass where one is needed:
 
     python tests/exercise.py -o exposure=2.0 --output brighter
@@ -156,13 +156,13 @@ def mm_to_native(value: float, inq) -> int:
 
 
 def report_gain_offset(scanner: Scanner) -> None:
-    '''Print the scanner's own calibration: GET GAIN OFFSET.
+    '''Print the scanner's own settings: GET GAIN OFFSET.
 
-    These are the values auto_exp adopts. Zeros mean the firmware has not measured
-    them yet, which it does during its first scan.
+    The exposure, gain and offset the scanner picks in its shading analysis.
+    Zeros mean it has not run one yet.
     '''
     s = scanner._get_gain_offset()
-    print("\nScanner-reported calibration (GET GAIN OFFSET):")
+    print("\nScanner's own settings (GET GAIN OFFSET):")
     print(f"  saturation levels : {s['saturation_level']}  "
           f"({', '.join(f'{v * 100 / 65536:.0f}%' for v in s['saturation_level'])} of full scale)")
     print(f"  exposure times    : {s['exposure_time']} timer counts (R, G, B, I)")
@@ -177,12 +177,12 @@ def report_gain_offset(scanner: Scanner) -> None:
           "pieusb_scancmd.h:208-213)")
 
 
-def report_calibration(scanner: Scanner) -> None:
+def report_device_settings(scanner: Scanner) -> None:
     """report_gain_offset, tolerating a scanner that will not answer yet."""
     try:
         report_gain_offset(scanner)
     except PieusbError as e:
-        print(f"\nCould not read the scanner's calibration: {type(e).__name__}: {e}")
+        print(f"\nCould not read the scanner's own settings: {type(e).__name__}: {e}")
         print("  (a warming-up scanner may refuse this read; try again in a minute)")
 
 
@@ -458,7 +458,7 @@ def report_result(r: ScanResult, args, prefix: Path) -> int:
           f"shading {'corrected' if r.shading_corrected else 'NOT corrected'}")
     print(f"  shading analysis: {'run by the device' if r.shading_acquired else 'skipped'}")
     if r.exposure_factor is None:
-        print("  exposure        : unknown -- the scanner reported no calibration")
+        print("  exposure        : unknown -- the scanner reported no exposure of its own")
     else:
         print(f"  exposure        : " + "  ".join(
             f"{n}=x{f:.3f}" for n, f in zip("RGB", r.exposure_factor))
@@ -1126,7 +1126,7 @@ def main(argv=None) -> int:
             return 1
 
         if args.gain_offset:
-            report_calibration(scanner)
+            report_device_settings(scanner)
 
         if args.dry_run:
             print("\n--dry-run: options are valid, stopping without scanning.")
@@ -1154,7 +1154,8 @@ def main(argv=None) -> int:
 
         # Every pass shares one Scanner, which is what makes reuse_calibration
         # mean anything: the shading reference it reuses is per-Scanner, so a
-        # second pass run from a second process would calibrate again.
+        # second pass run from a second process would run the shading analysis
+        # again.
         results: list[ScanResult] = []
         status = 0
         for n in range(1, args.repeat + 1):
@@ -1162,10 +1163,11 @@ def main(argv=None) -> int:
             if args.repeat > 1:
                 prefix = prefix.with_name(f"{prefix.name}_pass{n}")
                 print(f"\n--- pass {n} of {args.repeat} " + "-" * 40)
-                # The device re-reports its calibration after a pass that
-                # analysed, so printing it per pass shows whether it moved.
+                # The scanner re-picks its own settings on a pass that runs the
+                # shading analysis, so printing them per pass shows whether they
+                # moved.
                 if args.gain_offset and n > 1:
-                    report_calibration(scanner)
+                    report_device_settings(scanner)
             for assignment in pass_options.get(n, []):
                 assign_option(scanner, assignment)
                 print(f"pass {n}: {assignment}")

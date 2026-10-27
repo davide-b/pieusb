@@ -39,10 +39,14 @@ class EjectDirection(StrEnum):
     DOWN = 'Down'
 
 class ExposureControl(StrEnum):
-    '''Which field actually changes a scan's exposure on a given model.
+    '''Which device field the library drives a model's exposure through.
 
     RELATIVE is exp_rel_*, sent by SCSI_EXPOSURE. ABSOLUTE is exp_time_*, carried
-    by SET GAIN OFFSET. A model honours one and ignores the other.
+    by SET GAIN OFFSET. A pass that skips the device's shading analysis honours
+    both; one that runs it ignores exp_time_*, the device using its own, and on a
+    ProScan 10T still honours exp_rel_*. So RELATIVE needs no extra pass, where
+    ABSOLUTE needs the real pass to skip the analysis. A model can support both,
+    as the 10T does; this records the one the library uses.
     '''
     RELATIVE = 'Relative'
     ABSOLUTE = 'Absolute'
@@ -110,6 +114,8 @@ class ScanPhase(StrEnum):
     METERING = 'Metering'
     CONFIGURING = 'Configuring'
     WARMING_UP = 'Warming up'
+    # The shading analysis: the scanner scans its bare light source for the
+    # shading reference and picks its own exposure, gain and offset.
     CALIBRATING = 'Calibrating'
     SCANNING = 'Scanning'
     PROCESSING = 'Post process'
@@ -120,7 +126,7 @@ class UpdateData:
 
     `progress` runs 0.0 -> 1.0 within `phase` and says nothing about the scan as a
     whole: each phase sweeps the range again, and how many phases a scan has
-    depends on the options (a reused calibration removes CALIBRATING). A phase
+    depends on the options (a skipped shading analysis removes CALIBRATING). A phase
     whose length the device does not report in advance stays at 0.0 throughout, so
     treat a phase change as the event and `progress` as detail within it.
     '''
@@ -155,18 +161,19 @@ class ScanResult:
     the requested frame, and can differ from what the options asked for.
 
     `shading_acquired` says whether the device ran its own shading analysis for
-    this pass. It matters beyond the reference: on a model whose exposure control
-    is ABSOLUTE, a pass that analyses also re-derives its own exposure and
-    overrides `exp_time_*`, so only a pass with this False can honour one.
+    this pass. It matters beyond the reference: a pass that analyses also uses the
+    device's own exposure and gain over `exp_time_*` and `gain_*`, so on a model
+    whose exposure control is ABSOLUTE only a pass with this False can honour an
+    exposure.
 
     `exposure_factor` is the R/G/B exposure that reached the sensor, as a
     multiplier on the scanner's own -- what 'exposure' asked for, after the
-    model's limits clamped it. None if the scanner reported no calibration to
-    multiply.
+    model's limits clamped it. None if the scanner reported no exposure of its
+    own to multiply.
 
     `exposure` and `gain` are the per-filter device values a pass actually sent,
-    R G B I, for debugging: on an ABSOLUTE model they are seeded from the
-    device's own calibration, so this is the only record of them.
+    R G B I, for debugging: they can be seeded from the scanner's own settings,
+    so this is the only record of them.
     '''
     rgb: numpy.ndarray | None
     ir: numpy.ndarray | None = None

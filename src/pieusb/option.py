@@ -116,7 +116,7 @@ DEFAULT_EXPOSURE_TIME = 2937
 EXPOSURE_TIME_MAX = 0xFFFF
 
 # 'exposure' and 'exposure_r/g/b': a multiplier on the exposure the scanner
-# calibrated for itself, 1.0 being that exposure. Bounds are the range VueScan's
+# chose for itself in its shading analysis, 1.0 being that exposure. Bounds are the range VueScan's
 # own gain sliders offer; each model narrows them further, see
 # OptionsTable.validate() and Scanner._exposure().
 DEFAULT_EXPOSURE_FACTOR = 1.0
@@ -380,14 +380,16 @@ def generate_options(inq: InquiryResponse,
         default=False
     )))
 
-    # Reuse the shading (flat-field) reference an earlier scan on this Scanner
-    # acquired instead of acquiring a fresh one. BEST EFFORT, and neither failure
-    # mode can produce an uncorrected image:
+    # Skip the shading analysis, the scanner's scan of its bare light source at
+    # the start of a pass, and reuse the shading (flat-field) reference an
+    # earlier pass on this Scanner acquired. "Calibration" in this option's name,
+    # and throughout, means that analysis. BEST EFFORT, and neither failure mode
+    # can produce an uncorrected image:
     #
     #  - The scanner may refuse, answering START SCAN with MUST_CALIBRATE.
     #  - With nothing cached to reuse, Scanner acquires anyway.
     #
-    # Only ever saves a calibration pass. See Scanner._scan_pass.
+    # Only ever saves the analysis. See Scanner._scan_pass.
     out.append(Parameter(Option(
         name='reuse_calibration',
         type=bool,
@@ -419,14 +421,14 @@ def generate_options(inq: InquiryResponse,
     )))
 
     # THE exposure control, the same on every model: a multiplier on the exposure
-    # the scanner calibrated for itself, so 1.0 is that exposure and 2.0 twice it.
+    # the scanner chose for itself, so 1.0 is that exposure and 2.0 twice it.
     # 'exposure' scales the whole image; 'exposure_r/g/b' scale one channel on top
     # of it, which is what balances a colour negative's orange mask. The infrared
     # plane keeps the device's own exposure.
     #
-    # Scanner translates it into whichever device field the model honours (see
-    # Capabilities.exposure_control and Scanner._exposure()), and runs an extra
-    # calibration pass where the model needs one for the exposure to take effect.
+    # Scanner translates it into the device field the library drives on the model
+    # (see Capabilities.exposure_control and Scanner._exposure()), and runs an extra
+    # calibration pass where that field needs one to take effect.
     # How far it reaches depends on the model: a relative one cannot go below 1.0.
     for name in ('exposure',) + EXPOSURE_FACTOR_OPTIONS:
         out.append(Parameter(Option(
@@ -484,21 +486,29 @@ def generate_options(inq: InquiryResponse,
     #               including infrared, carried by SET GAIN OFFSET.
     #   exp_rel_*   RELATIVE percentage, R/G/B only, sent by SCSI_EXPOSURE.
     #
-    # MEASURED ON A PIE ProScan 10T (rev 1.70): exp_rel_* is the only one that does
-    # anything. exp_time_* has no effect on the image at any value -- 500, 1500,
-    # 2500, 2937, 6000 and 10000 all produce the same exposure to within 0.2% --
-    # and neither does gain_* or light. Whether that generalises to other models is
-    # unknown, so all of them are still sent, and exp_time_*'s documented meaning
-    # is recorded below for the ones where it may work.
+    # Which of them reaches the sensor depends on the pass, not on the model:
+    #
+    #   pass                          exp_rel_*   exp_time_*, gain_*, offset_*
+    #   runs the shading analysis     honoured    ignored: the device uses its own
+    #   skips it                      honoured    honoured as sent
+    #
+    # MEASURED ON A PIE ProScan 10T (rev 1.70). On an analysing pass exp_time_* at
+    # 500, 1500, 2500, 2937, 6000 and 10000 all produce the same exposure to within
+    # 0.2%, and gain_* does nothing either. On a skipping pass doubling exp_time_*
+    # or exp_rel_* doubles the image (x2.00-2.02), and gain_* +8 gives x1.18-1.34.
+    # A ProScan 4000 and an RPS 10M honour exp_time_* on a skipping pass too, and
+    # the 4000 exp_rel_* there as well; whether the 4000 honours exp_rel_* on an
+    # analysing pass is untested.
     #
     # The firmware optimises exp_time_* during warm-up until R and B reach >=90%
     # of full scale and G >=80% (pieusb_scancmd.h:188-197), then reports what it
-    # settled on through GET GAIN OFFSET. A ProScan 10T reports a flat 4100 and
-    # ignores what it is sent; a ProScan 4000 reports 10286/7345/4405 and honours
-    # it.
+    # settled on through GET GAIN OFFSET: 4100 per channel with gain 44/25/37 on a
+    # ProScan 10T, 10286/7345/4405 on a ProScan 4000: the scanner's own settings. A
+    # skipping pass must be sent the settings its cached reference was taken with,
+    # or level and colour shift; Scanner seeds them.
     #
     # INQUIRY's maximum_exposure is not a bound. Both models advertise 2500, the
-    # 4000's own calibration exceeds even four times that, and its drivers write
+    # 4000's own exposure exceeds even four times that, and its drivers write
     # up to 65535. The 16-bit wire field is the only real limit.
     for filt in ('r', 'g', 'b', 'i'):
         out.append(Parameter(Option(
@@ -535,7 +545,7 @@ def generate_options(inq: InquiryResponse,
     # point column-dependent (see postprocess.apply_shading_correction).
     #
     # SANE hard-codes all three to 100 and never varies them (pieusb.c:878-882,
-    # 927), which is why its calibration could never expose this film. The bound
+    # 927), which is why its scans could never expose this film. The bound
     # below is the width of the wire field; behaviour above 1086 is untested.
     for filt in ('r', 'g', 'b'):
         out.append(Parameter(Option(
@@ -653,9 +663,10 @@ def generate_options(inq: InquiryResponse,
     # duration in microseconds (pieusb_specific.c:916). The range below is the width
     # of the wire field, not a documented limit.
     #
-    # No measurable effect on a ProScan 10T: 4, 5, 6 and 7 produce the same image to
-    # within 0.1%. Sent anyway, since 0 is outside the band and no other model has
-    # been tested. Use 'exposure' to change exposure.
+    # No measurable effect on a ProScan 10T on a pass that runs the shading
+    # analysis: 4, 5, 6 and 7 produce the same image to within 0.1%. A pass that
+    # skips it is untested. Sent anyway, since 0 is outside the band. Use
+    # 'exposure' to change exposure.
     out.append(Parameter(Option(
         name='light',
         type=int,

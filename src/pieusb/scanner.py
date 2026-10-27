@@ -220,9 +220,10 @@ class TransportState:
 class _ShadingReference:
     """A shading reference read from the device, ready to correct with.
 
-    Describes the CCD's per-column response under the current calibration, so it
-    outlives a single scan but not the device session -- hence cached on the
-    Scanner, as the C caches it on the open handle (pieusb_specific.h:292-294).
+    Describes the CCD's per-column response under the scanner's current
+    settings, so it outlives a single scan but not the device session -- hence
+    cached on the Scanner, as the C caches it on the open handle
+    (pieusb_specific.h:292-294).
 
     `pixels_per_line` is the CCD-native width it was read at, kept so a reference
     cannot be applied to a pass the device sized differently.
@@ -837,11 +838,14 @@ class Scanner:
                 or any(self.params[f'exp_time_{s}'].assigned for s in ('r', 'g', 'b')))
 
     @contextmanager
-    def _exposure(self, factors: tuple[float, float, float] | None = None):
-        """Translate the generic exposure into the device field this model honours.
+    def _exposure(self, factors: tuple[float, float, float] | None = None,
+                  skip: bool = False):
+        """Translate the generic exposure into the device field driven on this model.
 
         For the duration of one pass: exp_rel_* on a RELATIVE model, exp_time_*
-        seeded from the device's own calibration on an ABSOLUTE one. `factors` are
+        seeded from the scanner's own settings on an ABSOLUTE one. `skip` says
+        the pass will skip the shading analysis, which a RELATIVE model needs to
+        know (_relative_exposure). `factors` are
         the R/G/B multipliers, by default what 'exposure' and 'exposure_r/g/b' ask
         for. A device field the caller set directly is left alone and wins.
 
@@ -852,14 +856,14 @@ class Scanner:
             factors = self.params.exposure_factors()
         absolute = (self.info.capabilities.exposure_control
                     is ExposureControl.ABSOLUTE)
-        translate = self._absolute_exposure if absolute else self._relative_exposure
         try:
-            with translate(factors):
+            with (self._absolute_exposure(factors) if absolute
+                  else self._relative_exposure(factors, skip)):
                 yield
         finally:
             self._applied_factors = None
 
-    def _relative_ceilings(self) -> list[int]:
+    def _relative_ceilings(self, exposure_time) -> list[int]:
         """The largest exp_rel_* per channel before the device's Timer 1 overflows.
 
         exp_rel scales the exposure time the scanner reports for itself into a
@@ -868,7 +872,6 @@ class Scanner:
         has not finished warming up reports 0, which says nothing about the
         register it uses, so the ceiling for its usual exposure time is assumed.
         """
-        exposure_time = self._get_gain_offset()["exposure_time"]
         if not all(exposure_time[c] > 0 for c in range(3)):
             log.warning(f"[exposure] the scanner reports no exposure time "
                         f"({exposure_time}), so where exp_rel overflows its Timer 1 is "
@@ -878,14 +881,24 @@ class Scanner:
                 else MAX_RELATIVE_EXPOSURE for c in range(3)]
 
     @contextmanager
-    def _relative_exposure(self, factors):
+    def _relative_exposure(self, factors, skip: bool):
         """exp_rel_* = 100 x the factor, clamped to what the device can do.
 
         The device clamps below 100 -- 50 behaves as 100 -- so a factor under 1.0
         cannot shorten the exposure. The device is read only when some channel
-        asks for more than 1.0, which needs its Timer 1 ceiling.
+        asks for more than 1.0, which needs its Timer 1 ceiling, or when `skip`.
+
+        A pass that runs the shading analysis derives the device's own exposure,
+        gain and offset, whatever is sent. One that skips it scans with the
+        options as sent, and anything but the settings the cached reference was
+        taken with shifts level and colour (ProScan 10T: 0.42, 0.57, 0.39 of
+        the analysing pass, sent the option defaults). So a skipping pass is
+        sent the scanner's own settings, unscaled: exp_rel does the scaling.
         """
-        values, applied, kept = {}, [], []
+        reported = self._get_gain_offset() if skip else None
+        values, kept = ({}, []) if reported is None else self._device_settings(
+            reported, reported["exposure_time"][:3])
+        applied = []
         ceilings = None
         for c, (suffix, factor) in enumerate(zip(('r', 'g', 'b'), factors)):
             name = f'exp_rel_{suffix}'
@@ -896,7 +909,8 @@ class Scanner:
                 continue
             wanted = round(DEFAULT_RELATIVE_EXPOSURE * factor)
             if wanted > DEFAULT_RELATIVE_EXPOSURE and ceilings is None:
-                ceilings = self._relative_ceilings()
+                reported = reported or self._get_gain_offset()
+                ceilings = self._relative_ceilings(reported["exposure_time"])
             ceiling = ceilings[c] if ceilings else MAX_RELATIVE_EXPOSURE
             value = min(max(wanted, DEFAULT_RELATIVE_EXPOSURE), ceiling)
             if wanted > ceiling:
@@ -909,30 +923,22 @@ class Scanner:
             values[name] = value
             applied.append(value / DEFAULT_RELATIVE_EXPOSURE)
         if kept:
-            log.info(f"[exposure] set directly, overriding 'exposure': {', '.join(kept)}")
+            log.info(f"[exposure] set directly, overriding 'exposure' or the "
+                     f"scanner's own settings: {', '.join(kept)}")
         self._applied_factors = tuple(applied)
         with self._overridden_options(**values):
             yield
 
-    @contextmanager
-    def _absolute_exposure(self, factors):
-        """exp_time_* = the device's own exposure time x the factor.
+    def _device_settings(self, reported, exposure) -> tuple[dict, list[str]]:
+        """Option values seeding the scanner's own settings, with `exposure` as
+        exp_time_r/g/b, and the options kept because the caller assigned them.
 
-        The device's calibration is the baseline, which is what both ProScan 4000
-        drivers do: its exposure, gain, offset and lamp level are seeded into the
-        options and the exposure scaled per channel. Nothing is seeded if the
-        scanner has not measured its calibration yet.
+        Nothing is seeded if the scanner has not run a shading analysis yet, which
+        is when it picks them.
         """
-        reported = self._get_gain_offset()
-        base = reported["exposure_time"]
-        if not all(base[c] > 0 for c in range(3)):
-            log.warning(f"[exposure] the scanner reports no exposure time of its own "
-                        f"({base}); scanning with the options as set")
-            yield
-            return
-
-        values = {}
-        kept = []
+        values, kept = {}, []
+        if not all(reported["exposure_time"][c] > 0 for c in range(3)):
+            return values, kept
 
         def seed(name, value):
             # An option the caller assigned is theirs, not the device's;
@@ -943,11 +949,10 @@ class Scanner:
             else:
                 kept.append(f"{name}={par.value}")
 
-        exposure = scale_exposure_times(base[:3], factors)
         for c, suffix in enumerate(('r', 'g', 'b')):
             seed(f'exp_time_{suffix}', exposure[c])
-        if base[3] > 0:
-            seed('exp_time_i', base[3])
+        if reported["exposure_time"][3] > 0:
+            seed('exp_time_i', reported["exposure_time"][3])
         for c, suffix in enumerate(CHANNEL_SUFFIX):
             if reported["gain"][c]:
                 seed(f'gain_{suffix}', reported["gain"][c])
@@ -955,11 +960,31 @@ class Scanner:
                 seed(f'offset_{suffix}', reported["offset"][c])
         if reported["light"]:
             seed('light', reported["light"])
+        return values, kept
 
+    @contextmanager
+    def _absolute_exposure(self, factors):
+        """exp_time_* = the device's own exposure time x the factor.
+
+        The scanner's own settings are the baseline, which is what both ProScan 4000
+        drivers do: its exposure, gain, offset and lamp level are seeded into the
+        options and the exposure scaled per channel. Nothing is seeded if the
+        scanner has not picked them yet.
+        """
+        reported = self._get_gain_offset()
+        base = reported["exposure_time"]
+        if not all(base[c] > 0 for c in range(3)):
+            log.warning(f"[exposure] the scanner reports no exposure time of its own "
+                        f"({base}); scanning with the options as set")
+            yield
+            return
+
+        values, kept = self._device_settings(
+            reported, scale_exposure_times(base[:3], factors))
         sent = [values.get(f'exp_time_{s}', self.params[f'exp_time_{s}'].value)
                 for s in ('r', 'g', 'b')]
         self._applied_factors = tuple(sent[c] / base[c] for c in range(3))
-        log.info(f"[exposure] device calibration {base[:3]} x "
+        log.info(f"[exposure] scanner's own exposure {base[:3]} x "
                  f"{tuple(round(f, 3) for f in factors)} -> {tuple(sent)}, gain "
                  f"{reported['gain']}, offset {reported['offset']}, light "
                  f"{reported['light']}"
@@ -1013,7 +1038,8 @@ class Scanner:
 
         absolute = (self.info.capabilities.exposure_control
                     is ExposureControl.ABSOLUTE)
-        ceilings = None if absolute else self._relative_ceilings()
+        ceilings = (None if absolute else
+                    self._relative_ceilings(self._get_gain_offset()["exposure_time"]))
         # What the preview ran at, normally 1.0; a device field set directly moves it.
         metered_at = preview.exposure_factor or (DEFAULT_EXPOSURE_FACTOR,) * 3
         full_scale = numpy.iinfo(preview.rgb.dtype).max
@@ -1060,6 +1086,13 @@ class Scanner:
                 self._exposure((DEFAULT_EXPOSURE_FACTOR,) * 3):
             return self._scan_pass(started, self._emit_calibrating, reuse=False)
 
+    def _skips_analysis(self, reuse: bool | None) -> bool:
+        """Whether a pass asks to skip the shading analysis: `reuse`, or the
+        'reuse_calibration' option when None, and only with a reference cached."""
+        if reuse is None:
+            reuse = self.params['reuse_calibration'].value
+        return reuse and self._shading is not None
+
     def _final_pass(self, started: float, force_skip: bool) -> ScanResult:
         """The pass whose image the caller gets.
 
@@ -1069,16 +1102,16 @@ class Scanner:
         leaves a fresh reference behind, so it is run once more.
         """
         reuse = True if force_skip else None
-        with self._exposure():
+        with self._exposure(skip=self._skips_analysis(reuse)):
             result = self._scan_pass(started, self._emit, reuse=reuse)
         if not (force_skip and result.shading_acquired) or result.cancelled:
             return result
-        log.warning("[exposure] the scanner insisted on calibrating, which overrides "
+        log.warning("[exposure] the scanner insisted on its shading analysis, which overrides "
                     "the exposure; scanning again with the reference it just took")
-        with self._exposure():
+        with self._exposure(skip=self._skips_analysis(True)):
             result = self._scan_pass(started, self._emit, reuse=True)
         if result.shading_acquired:
-            log.warning("[exposure] the scanner insisted on calibrating again; this scan "
+            log.warning("[exposure] the scanner insisted on its shading analysis again; this scan "
                         "ran at the scanner's own exposure")
         return result
 
@@ -1147,12 +1180,11 @@ class Scanner:
         # Skipping is what 'reuse_calibration' asks for, but it can only be
         # honoured with a reference already cached: correction happens on the host,
         # so a granted skip with an empty cache would mean raw pixels.
-        if reuse is None:
-            reuse = self.params['reuse_calibration'].value
-        acquire = not reuse or self._shading is None
+        acquire = not self._skips_analysis(reuse)
+        reuse = self.params['reuse_calibration'].value if reuse is None else reuse
         if acquire and reuse:
             log.info("[scan] reuse_calibration is set but no shading reference has been "
-                     "acquired on this Scanner yet; calibrating this pass. Keep the "
+                     "acquired on this Scanner yet; running the shading analysis on this pass. Keep the "
                      "Scanner open across scans for later ones to reuse it")
 
         self.wait_ready()
@@ -1197,7 +1229,7 @@ class Scanner:
                     # be read. This is what keeps a reused reference from going
                     # stale -- the device says when it wants a new one
                     # (pieusb.c:1091-1092).
-                    log.info("[scan]   the scanner refused to skip calibration; "
+                    log.info("[scan]   the scanner refused to skip the shading analysis; "
                              "acquiring a fresh shading reference")
                     acquire = True
                     break
@@ -1210,10 +1242,10 @@ class Scanner:
         self.wait_ready()
 
         # --- Calibration: shading reference, CCD mask, GET PARAMETERS ---------
-        # The last cancellation point before the pixel read; the calibration
+        # The last cancellation point before the pixel read; the shading-reference
         # reads below are short enough not to be worth interrupting mid-way.
         if self.cancel_requested.is_set():
-            log.debug("[scan] cancelled before the calibration read; stopping")
+            log.debug("[scan] cancelled before the shading-reference read; stopping")
             self.stop_scan()
             return self._result(started=started, cancelled=True)
 
@@ -1239,7 +1271,7 @@ class Scanner:
         else:
             # The scanner granted the skip: nothing to read, no CALIBRATING phase,
             # and the cached reference corrects the image instead.
-            log.debug("[scan] calibration skipped; correcting from the reference "
+            log.debug("[scan] shading analysis skipped; correcting from the reference "
                       "cached on this Scanner")
 
         # Read unconditionally, as sane_start() does (pieusb.c:1149). Only shading

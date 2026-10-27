@@ -93,31 +93,41 @@ with Scanner(pieusb.get_devices()[0]) as scanner:
         scanner.wait()
 ```
 
-Shading (flat-field) correction is applied on the host from a reference the
-scanner produces during a calibration pass, so the reference has to be read at
-least once before it can be reused. The first scan above therefore calibrates
-whatever the option says; the rest skip it and correct from the cached reference,
-which is what saves the time. The scanner keeps the last word: when it decides
-its calibration has gone stale -- after a power cycle, or on its own drift
-checks -- it refuses the skip and that scan calibrates again.
+**What calibration means here.** At the start of a pass the scanner can run a
+*shading analysis*: it scans its bare light source and returns a *shading
+reference*, one white level per sensor column, from which the library evens out
+the columns of every image (flat-field correction). In the same step the
+scanner chooses its own exposure, gain and offset per channel -- *the scanner's
+own settings*. A pass that runs the shading analysis is said to calibrate; a
+*calibration pass* is a short one run only for that. Auto-exposure (`auto_exp`)
+is unrelated: a pass that meters the film.
+
+The reference has to be read at least once before it can be reused, so the first
+scan above runs the shading analysis whatever the option says; the rest skip it
+and correct from the cached reference, which is what saves the time. The scanner
+keeps the last word: when it decides its reference has gone stale -- after a
+power cycle, or on its own drift checks -- it refuses the skip and that scan
+runs the analysis again.
 
 Every scan is shading-corrected either way. `reuse_calibration` only ever
-determines whether a pass pays for its own calibration, never whether the image
-gets corrected. Since the cache lives on the `Scanner`, a fresh one starts cold:
-a loop that opens a `Scanner` per frame is correct but calibrates every time.
+determines whether a pass pays for its own shading analysis, never whether the
+image gets corrected. A pass that skips it is sent the scanner's own settings
+from the analysis that took the reference, so it matches that pass in level and
+colour. Since the cache lives on the `Scanner`, a fresh one starts cold: a loop
+that opens a `Scanner` per frame is correct but runs the analysis every time.
 
 ### Exposure
 
 ```python
-scanner.exposure = 1.5        # 1.0 is the exposure the scanner calibrated for itself
+scanner.exposure = 1.5        # 1.0 is the scanner's own exposure, from its shading analysis
 scanner.exposure_b = 2.0      # per channel, on top of `exposure`
 scanner.auto_exp = True       # or meter it; `exposure` then acts as compensation
 ```
 
-The same options on every scanner. Models differ in which device setting
-actually changes the exposure, and some need an extra calibration pass before
-it takes effect; the library handles both, so a scan may take one pass more than
-you asked for. `result.exposure_factor` reports what reached the sensor, per
+The same options on every scanner. Models differ in which device setting the
+library drives, and on some that setting only takes effect on a pass that skips
+the shading analysis, so a calibration pass has to come first; the library
+handles both, so a scan may take one pass more than you asked for. `result.exposure_factor` reports what reached the sensor, per
 channel. Some scanners can only lengthen their exposure -- the ProScan 10T
 among them -- so values below 1.0 are clamped there, with a warning.
 

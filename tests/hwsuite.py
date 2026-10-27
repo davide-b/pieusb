@@ -134,10 +134,15 @@ MAX_WALK_FRAMES = 60
 # Exposure response: a control is live if it moves the level by more than
 # EXPOSURE_LIVE, and doubles it if every channel is within EXPOSURE_LINEAR of 2.
 # Levels are compared over pixels below EXPOSURE_MASK of full scale in the base
-# scan, so a doubled pixel cannot clip.
+# scan, so a doubled pixel cannot clip, as the slope between EXPOSURE_BLOCK
+# square block means: averaging keeps noise from flattening the slope, and a
+# slope ignores the black level, which moves between passes that run the
+# shading analysis (ProScan 10T blue: -348 of ~2100, same slope).
 EXPOSURE_LIVE = 0.10
 EXPOSURE_LINEAR = 0.25
 EXPOSURE_MASK = 0.4
+EXPOSURE_BLOCK = 8
+EXPOSURE_MIN_BLOCKS = 16
 GAIN_STEP = 8
 GAIN_MAX = 63
 
@@ -185,12 +190,26 @@ def select_stages(profile: str, motors: frozenset, only=None) -> list[tuple[Stag
     return plan
 
 
+def block_means(a: numpy.ndarray, k: int = EXPOSURE_BLOCK) -> numpy.ndarray:
+    h, w = a.shape[0] // k * k, a.shape[1] // k * k
+    if not h or not w:
+        return numpy.zeros((0, 0, a.shape[2]))
+    return a[:h, :w].astype(numpy.float64).reshape(h // k, k, w // k, k, -1).mean(axis=(1, 3))
+
+
 def level_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
-    '''Per channel, the mean level of `other` over `base`, over pixels that stay
-    below EXPOSURE_MASK of full scale in `base`.'''
+    '''Per channel, how `other` scales `base`: the slope between their block
+    means below EXPOSURE_MASK of full scale in `base`. An image too small or too
+    flat for a slope gets the ratio of its means instead.'''
     full = numpy.iinfo(base.dtype).max
+    b_blocks, o_blocks = block_means(base), block_means(other)
     ratios = []
     for c in range(base.shape[2]):
+        b, o = b_blocks[:, :, c].ravel(), o_blocks[:, :, c].ravel()
+        mask = b < EXPOSURE_MASK * full
+        if mask.sum() >= EXPOSURE_MIN_BLOCKS and b[mask].std() > 1e-6 * full:
+            ratios.append(round(float(numpy.polyfit(b[mask], o[mask], 1)[0]), 4))
+            continue
         b = base[:, :, c].astype(numpy.float64)
         o = other[:, :, c].astype(numpy.float64)
         mask = b < EXPOSURE_MASK * full
@@ -200,23 +219,32 @@ def level_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
     return ratios
 
 
-def exposure_verdict(exp_time: list[float], exp_rel: list[float]) -> str:
-    '''Which exposure control a model honours, from its response to doubling each.
+def doubles(r: list[float]) -> bool:
+    return all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
 
-    Both can be live -- on an RPS 10M exp_rel x2 gave x1.44 and exp_time x2 gave
-    x2.0 -- so the one that doubles the image wins.
+
+def live(r: list[float]) -> bool:
+    return any(abs(v - 1) > EXPOSURE_LIVE for v in r)
+
+
+def exposure_verdict(ratios: dict, configured: str) -> tuple[str, list[str]]:
+    '''Which exposure modes work on a model, and the one to use.
+
+    The modes differ on a pass that runs the shading analysis, which re-derives
+    the exposure on an ABSOLUTE model. RELATIVE works if exp_rel doubles the image
+    on such a pass; ABSOLUTE if exp_time doubles it on a pass that skips it. A
+    skipping pass alone cannot tell them apart: on a ProScan 10T and 4000 both
+    controls double there. The mode the library is configured with wins if it
+    works.
     '''
-    def live(r):
-        return any(abs(v - 1) > EXPOSURE_LIVE for v in r)
-
-    def doubles(r):
-        return all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
-
-    if live(exp_time) and (doubles(exp_time) or not live(exp_rel)):
-        return ExposureControl.ABSOLUTE.name
-    if live(exp_rel):
-        return ExposureControl.RELATIVE.name
-    return 'undetermined'
+    works = []
+    if 'exp_rel_x2_analysed' in ratios and doubles(ratios['exp_rel_x2_analysed']):
+        works.append(ExposureControl.RELATIVE.name)
+    if doubles(ratios['exp_time_x2']):
+        works.append(ExposureControl.ABSOLUTE.name)
+    if configured in works:
+        return configured, works
+    return (works[0] if works else 'undetermined'), works
 
 
 def focus_sweep(lo: int, hi: int, points: int = FOCUS_SWEEP_POINTS) -> list[int]:
@@ -434,7 +462,7 @@ class Suite:
 
     def identity(self) -> None:
         ex.describe(0, self.scanner.info)
-        ex.report_calibration(self.scanner)
+        ex.report_device_settings(self.scanner)
         self.record['inquiry'] = {k: getattr(self.scanner.info.inquiry, k) for k in (
             'max_resolution_x', 'max_scan_w', 'max_scan_h', 'x0', 'y0', 'x1', 'y1',
             'minimum_exposure', 'maximum_exposure', 'firmware_version', 'model')}
@@ -458,13 +486,15 @@ class Suite:
     def exposure(self) -> None:
         '''Which device field moves the image: exp_time, exp_rel or gain.
 
-        Every compared pass skips the shading analysis and corrects from one
-        reference, since an analysing pass may re-derive its own exposure.
+        The compared passes skip the shading analysis and correct from one
+        reference, since an analysing pass may re-derive its own exposure. One
+        more, exp_rel doubled on an analysing pass against the calibrating one,
+        tells whether the RELATIVE mode works (exposure_verdict).
         '''
         names = [f'{f}_{c}' for f in ('exp_time', 'exp_rel', 'gain') for c in 'rgb']
         self.full_frame(self.preview_dpi)
         self.set(reuse_calibration=False)
-        self.scan('calibrate')
+        calibrate = self.scan('calibrate')
         self.set(reuse_calibration=True)
         ratios = {}
         try:
@@ -485,19 +515,21 @@ class Suite:
                     self.unset(*values)
                 ratios[name] = level_ratio(base.rgb, r.rgb)
                 print(f"{name}: level x {ratios[name]}")
+            # Last, since an analysing pass replaces the cached reference.
+            self.set(reuse_calibration=False, **{f'exp_rel_{s}': 200 for s in 'rgb'})
+            r = self.scan('exp_rel_x2_analysed')
+            ratios['exp_rel_x2_analysed'] = level_ratio(calibrate.rgb, r.rgb)
+            print(f"exp_rel_x2_analysed: level x {ratios['exp_rel_x2_analysed']}")
         finally:
             self.unset(*names, 'reuse_calibration')
             self.record['ratios'] = ratios
-        verdict = exposure_verdict(ratios['exp_time_x2'], ratios['exp_rel_x2'])
         configured = self.scanner.info.capabilities.exposure_control.name
-        # The verdict picks one; a model can honour both, so record each.
-        response = {name: ('doubles' if all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
-                           else 'live' if any(abs(v - 1) > EXPOSURE_LIVE for v in r)
-                           else 'no effect')
+        verdict, works = exposure_verdict(ratios, configured)
+        response = {name: ('doubles' if doubles(r) else 'live' if live(r) else 'no effect')
                     for name, r in ratios.items() if name != 'base_again'}
-        self.record.update(verdict=verdict, response=response,
+        self.record.update(verdict=verdict, works=works, response=response,
                            library_configured=configured,
-                           matches_library=verdict == configured)
+                           matches_library=configured in works)
         self.findings['exposure_control'] = verdict
         print(f"\nexposure control: measured {verdict}, library configured {configured}"
               + ("" if verdict in (configured, 'undetermined') else "   <- MISMATCH"))

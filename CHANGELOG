@@ -38,16 +38,22 @@
 ## Exposure
 - **One exposure control on every model**: `exposure` for the whole image and
   `exposure_r/g/b` per channel on top, as multipliers on the exposure the
-  scanner calibrated for itself. The library translates it into whichever device
-  field the model honours -- `exp_rel_*` on a ProScan 10T, the device's own
+  scanner chose for itself. The library translates it into the device field
+  it drives on the model -- `exp_rel_*` on a ProScan 10T, the device's own
   `exp_time_*` scaled on a ProScan 4000 or RPS 10M -- and clamps it to what the model can
   do: a relative model cannot go below 1.0. `ScanResult.exposure_factor` reports
   what reached the sensor. `auto_exp` meters into `exposure_r/g/b`, with
   `exposure` as compensation on top
 - **The RPS 10M uses absolute exposure.** On the hardware, doubling `exp_time`
-  doubled the image exactly, while doubling `exp_rel` gave 1.44x. As a relative
-  model, a pass reusing the cached calibration also ran at default gain and
-  offset instead of the device's, shifting its colour against the first pass
+  doubled the image exactly. Doubling `exp_rel` gave 1.44x, but on passes that
+  reused the cached shading reference at default gain and offset (see Fixes),
+  so whether relative exposure also works on the 10M is open
+- **Which exposure control works depends on the pass, not the model.** A pass
+  that runs the device's shading analysis uses the device's own exposure and gain
+  and ignores `exp_time_*` and `gain_*`; one that skips it honours them as sent.
+  `exp_rel_*` is honoured on both kinds on a ProScan 10T, and on a skipping pass
+  on a ProScan 4000. Measured on a 10T, where `exp_time_*` had been recorded as
+  having no effect at all: that was on analysing passes
 - **The library decides when a scan needs an extra pass.** On an absolute model a
   pass that runs the device's shading analysis uses the device's own exposure,
   so any other exposure needs a pass that skips it, and so a shading reference
@@ -64,11 +70,17 @@
   overwrite it
 - The `exp_time_*` ceiling is 65535, the wire field's limit. It used to be four
   times INQUIRY's `maximum_exposure`, which refused a ProScan 4000 its own
-  calibration
+  exposure
 - `ScanResult.shading_acquired`, `.exposure` and `.gain` record whether a pass
   ran the device's shading analysis and what exposure and gain it actually sent
 
 ## Fixes
+- **`reuse_calibration` on a relative-exposure model (ProScan 10T)** scanned at
+  0.42 / 0.57 / 0.39 per channel of a pass that runs the shading analysis. One
+  that skips it scans with the exposure, gain and offset it is sent, and was
+  sent the option defaults rather than the settings its cached reference was
+  taken with. Such a pass is now sent the scanner's own settings, as absolute
+  models already were. Passes that run the analysis are unchanged
 - **An abandoned transaction no longer wedges the scanner until a power cycle.**
   The control timeout is 40 s (a ProScan 4000 was measured holding for 30 s),
   and a USB error mid-transaction resets the IEEE1284 link before raising
@@ -111,8 +123,9 @@
   (read-only, scan, focus, transport) and runs only where the profile admits it
   and the model has the motor: `--profile characterize` runs everything the
   hardware has, `--profile regression` scans only, with the library as
-  configured. It measures which exposure control a model honours against its
-  capability entry, checks autofocus against a manual sweep, and on a filmstrip
+  configured. It measures which exposure modes work on a model (exp_rel on a
+  pass that runs the shading analysis, exp_time on one that skips it, as
+  black-level-independent slopes) against its capability entry, checks autofocus against a manual sweep, and on a filmstrip
   measures offsets, stepping and positioning and walks the strip to its end. It
   writes the log, the scans and a `summary.json` with a suggested capability
   entry to one folder, and stops at the first failed motor command. An unknown
