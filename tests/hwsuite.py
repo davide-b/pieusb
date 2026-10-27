@@ -31,9 +31,10 @@ stage checks Capabilities.exposure_control). What is left are tolerances.
 Load film (for transport stages: a strip of colour negative at its first frame),
 start it, and leave it. It stops on its own: at the end of the strip, or at the
 first transport or focus command that fails, since carrying on after one risks
-the film. Send back the whole output folder: suite.log has everything the
-terminal showed plus every command and reply, summary.json what each stage found
-and a suggested capability entry, and each stage's folder its scans as .npy.
+the film. Every run ends by packing the output folder as <folder>.zip beside
+it, the one file to send back: suite.log has everything the terminal showed
+plus every command and reply, summary.json what each stage found and a
+suggested capability entry, and each stage's folder its scans as .npy.
 
 Transport stages, in an order that needs no reloading:
 
@@ -51,6 +52,8 @@ A stage that runs out of film is recorded as partial and the suite goes on.
 
 import argparse
 import json
+import logging
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -653,7 +656,34 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     ex.setup_logging(SimpleNamespace(verbose=False, log=str(out / 'suite.log'),
                                      note=args.note))
+    code = 1
+    try:
+        code = run_suite(args, out, allow, only)
+    except SystemExit as e:
+        log.error(f"[run] {e}")
+        raise
+    except BaseException:
+        # Logged here too: the zip is written before the interpreter prints the
+        # traceback to stderr.
+        log.exception("[run] hwsuite.py stopped on an exception")
+        raise
+    finally:
+        log.info(f"[run] exit status {code}")
+        zip_output(out)
+    return code
 
+
+def zip_output(out: Path) -> None:
+    '''Pack the output folder as <folder>.zip beside it, the one file to send back.'''
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    archive = Path(shutil.make_archive(str(out), 'zip', root_dir=out.resolve().parent,
+                                       base_dir=out.resolve().name))
+    print(f"\nSend back this one file: {archive.resolve()} "
+          f"({archive.stat().st_size / 1e6:.0f} MB)")
+
+
+def run_suite(args, out: Path, allow: frozenset, only) -> int:
     print("Enumerating...")
     devices = pieusb.get_devices()
     if not 0 <= args.device < len(devices):
@@ -698,7 +728,6 @@ def main(argv=None) -> int:
             suite.write_summary(**extra)
 
     print(f"\nSuggested capabilities: {suite.suggested_capabilities()}")
-    print(f"\nDone. Send back the whole folder: {out.resolve()}")
     if not args.no_ask:
         ex.ask_observation("Anything about the film or the scanner during the run worth "
                            "noting -- noises, the film coming out, frames skipped")
@@ -706,7 +735,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == '__main__':
-    # A traceback needs no handler here: it reaches the log through stderr.
-    code = main()
-    log.info(f"[run] exit status {code}")
-    sys.exit(code)
+    sys.exit(main())
