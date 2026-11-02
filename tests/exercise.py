@@ -15,8 +15,7 @@ nothing here is a unit test.
 
 Exposure is 'exposure' (whole image) and 'exposure_r/g/b' (per channel, on top),
 as multipliers on the exposure the scanner chose for itself. The same on
-every model; the library routes it to the device field it drives on that model
-(`--list` reports which) and adds a calibration pass where one is needed:
+every model, sent as exp_rel_* and taking effect in the pass itself:
 
     python tests/exercise.py -o exposure=2.0 --output brighter
     python tests/exercise.py -o exposure_r=2.47 -o exposure_g=5.63 \
@@ -36,7 +35,6 @@ same open Scanner and shading reference:
 only, to trial a code path on hardware the capability table does not enable yet:
 
     python tests/exercise.py --assume film_transport,focus --transport-state
-    python tests/exercise.py --assume absolute --repeat 2 --pass-option 2:exposure=2
 
 auto_exp meters a preview pass and sets exposure_r/g/b from it; 'exposure' still
 applies on top. It costs one extra pass:
@@ -97,14 +95,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 import numpy
 
 import pieusb
-from pieusb.exceptions import DeviceNotReady, ParamError, PieusbError, WarmingUp
+from pieusb.exceptions import DeviceNotReady, EndOfStrip, ParamError, PieusbError, WarmingUp
 from pieusb.option import Unit
 from pieusb.scanner import Scanner
 from pieusb.transport import SLIDE_PREV
 from pieusb.types import (
     DeviceInfo,
     EjectDirection,
-    ExposureControl,
     ScanPhase,
     ScanResult,
     UpdateData,
@@ -138,7 +135,6 @@ def describe(index: int, info: DeviceInfo) -> None:
     print(f"     model number      : 0x{inq.model:04x}")
     print(f"     film transport    : {cap.film_transport}")
     print(f"     focus             : {cap.focus}")
-    print(f"     exposure control  : {cap.exposure_control}")
 
 
 
@@ -284,7 +280,7 @@ def parse_pass_options(specs: list[str], repeat: int) -> dict[int, list[str]]:
     return out
 
 
-ASSUMABLE = ('film_transport', 'focus', 'absolute', 'relative')
+ASSUMABLE = ('film_transport', 'focus')
 
 
 def assume_capabilities(info: DeviceInfo, spec: str) -> DeviceInfo:
@@ -294,22 +290,15 @@ def assume_capabilities(info: DeviceInfo, spec: str) -> DeviceInfo:
     if unknown:
         raise SystemExit(f"--assume: unknown {', '.join(unknown)}; "
                          f"choose from {', '.join(ASSUMABLE)}")
-    if 'absolute' in names and 'relative' in names:
-        raise SystemExit("--assume: absolute and relative are exclusive")
     changes = {}
     if 'film_transport' in names:
         changes['film_transport'] = True
     if 'focus' in names:
         changes['focus'] = True
-    if 'absolute' in names:
-        changes['exposure_control'] = ExposureControl.ABSOLUTE
-    if 'relative' in names:
-        changes['exposure_control'] = ExposureControl.RELATIVE
     cap = dataclasses.replace(info.capabilities, **changes)
     print(f"\n*** --assume: capabilities overridden for this run ***")
     print(f"     film transport    : {cap.film_transport}")
     print(f"     focus             : {cap.focus}")
-    print(f"     exposure control  : {cap.exposure_control}")
     return dataclasses.replace(info, capabilities=cap)
 
 
@@ -707,10 +696,13 @@ def move_transport(scanner: Scanner, what: str, action, ask: bool = False) -> in
     started = time.monotonic()
     try:
         action()
+    except EndOfStrip as e:
+        print(f"End of strip after {time.monotonic() - started:.1f}s: {e}")
     except (PieusbError, ValueError) as e:
         print(f"Could not {what.lower()}: {type(e).__name__}: {e}")
         return 1
-    print(f"Done in {time.monotonic() - started:.1f}s.")
+    else:
+        print(f"Done in {time.monotonic() - started:.1f}s.")
     if ask:
         ask_observation("What did the film do? Which way did it move, and how far")
     return report_transport_state(scanner)
@@ -823,7 +815,7 @@ def run_steps(scanner: Scanner, args) -> int:
             if op == 'next' and before is not None and after is not None:
                 if after.frame == before.frame:
                     print(f"\nThe frame counter stayed at {after.frame} after NEXT: "
-                          f"probably the end of the strip. Stopping.")
+                          f"the end of the strip. Stopping.")
                     log.info(f"[steps] end of strip? frame {after.frame} unchanged by NEXT, "
                              f"flags 0x{before.flags:02x} -> 0x{after.flags:02x}")
                     if args.ask:

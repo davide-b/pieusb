@@ -1,6 +1,5 @@
 from pieusb.types import (
     Capabilities,
-    ExposureControl,
     InquiryResponse,
     Filter,
     ColorFormat,
@@ -32,14 +31,7 @@ MODEL_NAMES = {
 # Per-model knowledge, in the spirit of SANE's pieusb.conf flags. A model absent
 # here gets the conservative Capabilities() defaults.
 DEVICE_CAPABILITIES = {
-    0x002c: Capabilities(              # ProScan 4000
-        film_transport=True,
-        focus=True,
-        exposure_control=ExposureControl.ABSOLUTE,
-    ),
-    0x0048: Capabilities(              # RPS 10M
-        exposure_control=ExposureControl.ABSOLUTE,
-    ),
+    0x002c: Capabilities(film_transport=True, focus=True),   # ProScan 4000
     0x002f: Capabilities(film_transport=True),   # DigitDia 4000
     0x003a: Capabilities(film_transport=True),   # DigitDia 6000
 }

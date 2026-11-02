@@ -7,7 +7,8 @@ Exception hierarchy for pieusb.
     |-- CheckCondition      SCSI CHECK CONDITION, carrying decoded sense data
     |-- DeviceNotReady      device is reachable but cannot start a scan
     |   `-- WarmingUp       ... specifically because the lamp is warming up
-    `-- ScanInProgress      host-side: this Scanner already has a scan running
+    |-- ScanInProgress      host-side: this Scanner already has a scan running
+    `-- EndOfStrip          advance() moved nothing: the medium is at its end
 
 Layering note: `CheckCondition` is what the transport layer raises -- it reports
 what the device said, nothing more. Turning a particular sense triple into
@@ -38,6 +39,16 @@ class ScanInProgress(PieusbError):
     DeviceNotReady, because "wait and retry" and "you have a bug" want different
     handling.
     '''
+
+class EndOfStrip(PieusbError):
+    '''advance() left the frame counter where it was: there is no next frame.
+
+    `frame` is the counter the medium stays at, its last frame.
+    '''
+
+    def __init__(self, frame: int) -> None:
+        self.frame = frame
+        super().__init__(f"no frame after frame {frame}: the frame counter did not move")
 
 class DeviceNotReady(PieusbError):
     '''The device is reachable but cannot start a scan.'''

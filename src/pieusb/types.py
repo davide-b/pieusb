@@ -38,19 +38,6 @@ class EjectDirection(StrEnum):
     UP = 'Up'
     DOWN = 'Down'
 
-class ExposureControl(StrEnum):
-    '''Which device field the library drives a model's exposure through.
-
-    RELATIVE is exp_rel_*, sent by SCSI_EXPOSURE. ABSOLUTE is exp_time_*, carried
-    by SET GAIN OFFSET. A pass that skips the device's shading analysis honours
-    both; one that runs it ignores exp_time_*, the device using its own, and on a
-    ProScan 10T still honours exp_rel_*. So RELATIVE needs no extra pass, where
-    ABSOLUTE needs the real pass to skip the analysis. A model can support both,
-    as the 10T does; this records the one the library uses.
-    '''
-    RELATIVE = 'Relative'
-    ABSOLUTE = 'Absolute'
-
 @dataclass(frozen=True)
 class Capabilities:
     '''Per-model facts INQUIRY does not report, keyed on model number in
@@ -60,7 +47,6 @@ class Capabilities:
     film_transport: bool = False
     # Whether SCSI_SLIDE action 0x10 moves a focus motor.
     focus: bool = False
-    exposure_control: ExposureControl = ExposureControl.RELATIVE
 
 @dataclass(frozen=True)
 class InquiryResponse:
@@ -162,9 +148,8 @@ class ScanResult:
 
     `shading_acquired` says whether the device ran its own shading analysis for
     this pass. It matters beyond the reference: a pass that analyses also uses the
-    device's own exposure and gain over `exp_time_*` and `gain_*`, so on a model
-    whose exposure control is ABSOLUTE only a pass with this False can honour an
-    exposure.
+    device's own exposure, gain and offset over `exp_time_*`, `gain_*` and
+    `offset_*`, so only a pass with this False is affected by those options.
 
     `exposure_factor` is the R/G/B exposure that reached the sensor, as a
     multiplier on the scanner's own -- what 'exposure' asked for, after the

@@ -10,7 +10,7 @@ from pieusb.inquiry import (
     InquiryResponse,
     Filter
 )
-from pieusb.types import Capabilities, ExposureControl
+from pieusb.types import Capabilities
 from pieusb.transport import (
     UASDevice,
     SCSI_WRITE,
@@ -117,26 +117,13 @@ EXPOSURE_TIME_MAX = 0xFFFF
 
 # 'exposure' and 'exposure_r/g/b': a multiplier on the exposure the scanner
 # chose for itself in its shading analysis, 1.0 being that exposure. Bounds are the range VueScan's
-# own gain sliders offer; each model narrows them further, see
-# OptionsTable.validate() and Scanner._exposure().
+# own gain sliders offer; the scanner narrows them to 1.0 up to its Timer 1
+# ceiling, see OptionsTable.validate() and Scanner._exposure().
 DEFAULT_EXPOSURE_FACTOR = 1.0
 EXPOSURE_FACTOR_MIN = 0.001
 EXPOSURE_FACTOR_MAX = 200.0
 EXPOSURE_FACTOR_OPTIONS = ('exposure_r', 'exposure_g', 'exposure_b')
 
-
-def scale_exposure_times(base, factors):
-    '''Apply per-channel factors to absolute exposure times.
-
-    A channel over EXPOSURE_TIME_MAX pulls every channel down by the same factor,
-    so their ratios survive; each result is then floored at DEFAULT_EXPOSURE_TIME.
-    Both ProScan 4000 drivers behave this way.
-    '''
-    wanted = [b * f for b, f in zip(base, factors)]
-    peak = max(wanted, default=0)
-    if peak > EXPOSURE_TIME_MAX:
-        wanted = [w * EXPOSURE_TIME_MAX / peak for w in wanted]
-    return tuple(max(int(w), DEFAULT_EXPOSURE_TIME) for w in wanted)
 
 # SCSI_SLIDE's focus byte. 1 is the near end of the range on every model that has
 # a focus motor; the far end is holder-dependent and only the device knows it, so
@@ -295,18 +282,17 @@ class OptionsTable:
         if self['fast_infrared'].value and mode != 'rgbi':
             log.warning(f"option 'fast_infrared' has no effect in '{mode}' mode (no infrared plane)")
 
-        # The generic exposure against what a relative model can do. Warned about
-        # rather than refused, and clamped at scan time: the real ceiling depends
-        # on the exposure time the device reports, which only Scanner reads.
-        if self.capabilities.exposure_control is ExposureControl.RELATIVE:
-            ceiling = MAX_RELATIVE_EXPOSURE / DEFAULT_RELATIVE_EXPOSURE
-            for c, factor in zip('RGB', self.exposure_factors()):
-                if factor < 1.0:
-                    log.warning(f"exposure {factor:g} on {c}: this scanner can only "
-                                f"lengthen its exposure, so it scans at 1.0")
-                elif factor > ceiling:
-                    log.warning(f"exposure {factor:g} on {c}: above the ~{ceiling:.1f} "
-                                f"this scanner reaches; it will be clamped")
+        # The generic exposure against what exp_rel can do. Warned about rather
+        # than refused, and clamped at scan time: the real ceiling depends on the
+        # exposure time the device reports, which only Scanner reads.
+        ceiling = MAX_RELATIVE_EXPOSURE / DEFAULT_RELATIVE_EXPOSURE
+        for c, factor in zip('RGB', self.exposure_factors()):
+            if factor < 1.0:
+                log.warning(f"exposure {factor:g} on {c}: the scanner can only "
+                            f"lengthen its exposure, so it scans at 1.0")
+            elif factor > ceiling:
+                log.warning(f"exposure {factor:g} on {c}: above the ~{ceiling:.1f} "
+                            f"the scanner reaches; it will be clamped")
 
         # exp_rel_* set directly, for debugging. Warned about rather than refused:
         # the real ceiling depends on the exposure time the device reports, which
@@ -426,10 +412,9 @@ def generate_options(inq: InquiryResponse,
     # of it, which is what balances a colour negative's orange mask. The infrared
     # plane keeps the device's own exposure.
     #
-    # Scanner translates it into the device field the library drives on the model
-    # (see Capabilities.exposure_control and Scanner._exposure()), and runs an extra
-    # calibration pass where that field needs one to take effect.
-    # How far it reaches depends on the model: a relative one cannot go below 1.0.
+    # Scanner sends it as exp_rel_* (Scanner._exposure()), which takes effect in
+    # the pass itself on every model measured. It cannot go below 1.0, and its top
+    # is the Timer 1 ceiling, which depends on the exposure the scanner chose.
     for name in ('exposure',) + EXPOSURE_FACTOR_OPTIONS:
         out.append(Parameter(Option(
             name=name,
@@ -496,9 +481,10 @@ def generate_options(inq: InquiryResponse,
     # 500, 1500, 2500, 2937, 6000 and 10000 all produce the same exposure to within
     # 0.2%, and gain_* does nothing either. On a skipping pass doubling exp_time_*
     # or exp_rel_* doubles the image (x2.00-2.02), and gain_* +8 gives x1.18-1.34.
-    # A ProScan 4000 and an RPS 10M honour exp_time_* on a skipping pass too, and
-    # the 4000 exp_rel_* there as well; whether the 4000 honours exp_rel_* on an
-    # analysing pass is untested.
+    # A ProScan 4000 does the same on both kinds of pass (x1.96-2.02); an RPS 10M
+    # honours exp_time_* on a skipping pass, its exp_rel_* not yet measured
+    # cleanly. Scanner drives exposure through exp_rel_* alone, since it takes
+    # effect without skipping the analysis; exp_time_* is sent as seeded or set.
     #
     # The firmware optimises exp_time_* during warm-up until R and B reach >=90%
     # of full scale and G >=80% (pieusb_scancmd.h:188-197), then reports what it
@@ -524,9 +510,8 @@ def generate_options(inq: InquiryResponse,
     # (pieusb_scancmd.c:521-544). Infrared has no entry: the C struct holds three
     # colours.
     #
-    # The field 'exposure' drives on a relative model such as the ProScan 10T, at
-    # 100 x the factor, per channel. Measured against a colour negative at 300 dpi,
-    # 16-bit:
+    # The field 'exposure' drives, at 100 x the factor, per channel. Measured on a
+    # ProScan 10T against a colour negative at 300 dpi, 16-bit:
     #
     #   exp_rel   50    100    200    250    400    800   1086   1500   1598
     #   measured   x1     x1  x1.97  x2.46  x3.93  x8.03  x10.5  x14.7  clips

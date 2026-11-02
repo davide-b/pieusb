@@ -1,11 +1,8 @@
 from pieusb.option import (
     generate_options,
-    scale_exposure_times,
     set_options,
     DEFAULT_EXPOSURE_FACTOR,
     DEFAULT_FOCUS,
-    EXPOSURE_FACTOR_MAX,
-    EXPOSURE_FACTOR_MIN,
     EXPOSURE_FACTOR_OPTIONS,
     FOCUS_MIN,
     DEFAULT_RELATIVE_EXPOSURE,
@@ -24,7 +21,6 @@ from pieusb.types import (
     AutofocusResult,
     DeviceInfo,
     EjectDirection,
-    ExposureControl,
     UpdateData,
     ScanResult,
     ScanPhase
@@ -54,6 +50,7 @@ from pieusb.exceptions import (
     PieusbError,
     WarmingUp,
     DeviceNotReady,
+    EndOfStrip,
     ScanInProgress
 )
 
@@ -84,10 +81,6 @@ CHANNEL_SUFFIX = ('r', 'g', 'b', 'i')
 # The options auto_exp derives, and therefore restores afterwards.
 METERED_OPTIONS = EXPOSURE_FACTOR_OPTIONS
 
-# Height of the strip a calibration-only pass scans (Scanner._calibrate). The
-# shading reference is the same size whatever the frame, so this only bounds the
-# image the pass reads and throws away.
-CALIBRATION_STRIP_MM = 1
 MM_PER_INCH = 25.4
 
 # Where auto_exp aims the metered channel, as a fraction of full scale. Below 1.0
@@ -150,39 +143,6 @@ UNVERIFIED_TRANSPORT = (
     "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
     "run these commands, and they move hardware"
 )
-
-@dataclass(frozen=True)
-class PassPlan:
-    """The passes one scan runs, before the one whose image the caller gets."""
-    # auto_exp's metering pass.
-    meter: bool
-    # A pass that only acquires a shading reference.
-    calibrate: bool
-    # Whether the real pass must skip the shading analysis.
-    force_skip: bool
-
-
-def plan_passes(*, absolute: bool, auto_exp: bool, custom_exposure: bool,
-                reuse_calibration: bool, reference_cached: bool) -> PassPlan:
-    """Decide which passes a scan needs for its exposure to take effect.
-
-    On an ABSOLUTE model a pass that runs the device's shading analysis
-    re-derives its own exposure, so any exposure but the scanner's own reaches
-    the sensor only on a pass that skips it -- and skipping needs a reference
-    to correct from. A RELATIVE model honours its exposure either way. So:
-
-    - auto_exp always meters first. That pass leaves a reference behind, so on
-      an ABSOLUTE model it is the calibration pass too.
-    - An ABSOLUTE model with a custom exposure (or auto_exp) forces the real pass
-      to skip, calibrating first unless a reference is cached and
-      reuse_calibration allows using it.
-    - Otherwise one pass, analysing or not as reuse_calibration says.
-    """
-    force_skip = absolute and (auto_exp or custom_exposure)
-    calibrate = (force_skip and not auto_exp
-                 and not (reuse_calibration and reference_cached))
-    return PassPlan(meter=auto_exp, calibrate=calibrate, force_skip=force_skip)
-
 
 def autofocus_positions(lines: int, focus_min: int, focus_max: int) -> list[int]:
     """The focus position each line of an autofocus pass was taken at.
@@ -450,34 +410,52 @@ class Scanner:
         log.warning(UNVERIFIED_TRANSPORT)
         self._slide(SLIDE_INIT, self._focus_for_scan())
 
-    def advance(self, frames: int = 1) -> None:
+    def advance(self, frames: int = 1) -> int:
         """Advance the medium by `frames`, blocking until the transport is idle.
 
         scan() never moves the medium; the caller decides when it does. A batch can
         therefore keep one frame in the gate for as many passes as it wants, and
         advance once it is done with it.
 
+        Returns how many frames the medium moved, read off the READ STATE frame
+        counter either side of the move: fewer than `frames` when the strip ended
+        on the way. Raises EndOfStrip when it moved none. At the end of a strip a
+        ProScan 4000 accepts NEXT, refuses it within 0.2 s, and leaves the counter
+        where it was; the RPS 10M's counter moves with NEXT the same way, but its
+        end of strip is unmeasured, as is a slide magazine on any model.
+
         Raises ScanInProgress while a scan is running -- the worker thread owns the
-        device -- and PieusbError on a scanner without a slide transport. Nothing
-        in the protocol describes magazine state, so this cannot report an
-        exhausted magazine: the device either fails the command in its own terms
-        or the advance appears to succeed.
+        device -- and PieusbError on a scanner without a slide transport.
         """
         self._require_slide_transport()
-        self._step_frames(SLIDE_NEXT, frames)
+        before, after = self._step_frames(SLIDE_NEXT, frames)
+        moved = after - before
+        if moved <= 0:
+            raise EndOfStrip(after)
+        if moved < frames:
+            log.info(f"[transport] NEXT {frames} moved {moved}: the strip ended on the way")
+        return moved
 
-    def rewind(self, frames: int = 1) -> None:
-        """Move the medium back by `frames`, blocking until the transport is idle."""
+    def rewind(self, frames: int = 1) -> int:
+        """Move the medium back by `frames`, blocking until the transport is idle.
+
+        Returns how many frames the medium moved back, read off the frame counter:
+        fewer than `frames`, down to 0, when it reached the first frame first.
+        """
         self._require_slide_transport()
-        self._step_frames(SLIDE_PREV, frames)
+        before, after = self._step_frames(SLIDE_PREV, frames)
+        return before - after
 
-    def _step_frames(self, action: int, frames: int) -> None:
+    def _step_frames(self, action: int, frames: int) -> tuple[int, int]:
+        """NEXT or PREV, returning the frame counter before and after."""
         if not 1 <= frames <= 0xFF:
             raise ValueError(f"frames must be 1..255, got {frames}")
         log.warning(UNVERIFIED_TRANSPORT)
         if not self._transport_initialized:
             self._slide(SLIDE_INIT, self._focus_for_scan())
+        before = self.transport_state().frame
         self._slide(action, frames, byte3=0x01 if action == SLIDE_PREV else 0x00)
+        return before, self.transport_state().frame
 
     def offset_frame(self, mm: float) -> None:
         """Shift the medium off its detected frame position by `mm`.
@@ -741,20 +719,12 @@ class Scanner:
         indistinguishable SCANNING sweeps."""
         self._emit(replace(update, phase=ScanPhase.METERING))
 
-    def _emit_calibrating(self, update: UpdateData) -> None:
-        """A calibration-only pass reports as CALIBRATING throughout."""
-        self._emit(replace(update, phase=ScanPhase.CALIBRATING))
-
     def _result(self, rgb=None, ir=None, *, started: float, width: int = 0, height: int = 0,
                 shading_corrected: bool = False, shading_acquired: bool = False,
                 cancelled: bool = False,
                 error: Exception | None = None) -> ScanResult:
         """Build a ScanResult, filling in the settings the scan actually ran with."""
         factors = self._applied_factors
-        if (factors is not None and shading_acquired
-                and self.info.capabilities.exposure_control is ExposureControl.ABSOLUTE):
-            # The device's own analysis re-derived the exposure, overriding ours.
-            factors = (DEFAULT_EXPOSURE_FACTOR,) * 3
         return ScanResult(
             rgb=rgb,
             ir=ir,
@@ -833,37 +803,6 @@ class Scanner:
             for name, value in saved.items():
                 self.params[name].value = value
 
-    def _custom_exposure(self) -> bool:
-        """Whether this scan asks for anything but the scanner's own exposure."""
-        return (any(f != DEFAULT_EXPOSURE_FACTOR for f in self.params.exposure_factors())
-                or any(self.params[f'exp_time_{s}'].assigned for s in ('r', 'g', 'b')))
-
-    @contextmanager
-    def _exposure(self, factors: tuple[float, float, float] | None = None,
-                  skip: bool = False):
-        """Translate the generic exposure into the device field driven on this model.
-
-        For the duration of one pass: exp_rel_* on a RELATIVE model, exp_time_*
-        seeded from the scanner's own settings on an ABSOLUTE one. `skip` says
-        the pass will skip the shading analysis, which a RELATIVE model needs to
-        know (_relative_exposure). `factors` are
-        the R/G/B multipliers, by default what 'exposure' and 'exposure_r/g/b' ask
-        for. A device field the caller set directly is left alone and wins.
-
-        Every option is restored on the way out. The multipliers actually sent are
-        held in self._applied_factors meanwhile, for _result().
-        """
-        if factors is None:
-            factors = self.params.exposure_factors()
-        absolute = (self.info.capabilities.exposure_control
-                    is ExposureControl.ABSOLUTE)
-        try:
-            with (self._absolute_exposure(factors) if absolute
-                  else self._relative_exposure(factors, skip)):
-                yield
-        finally:
-            self._applied_factors = None
-
     def _relative_ceilings(self, exposure_time) -> list[int]:
         """The largest exp_rel_* per channel before the device's Timer 1 overflows.
 
@@ -882,20 +821,32 @@ class Scanner:
                 else MAX_RELATIVE_EXPOSURE for c in range(3)]
 
     @contextmanager
-    def _relative_exposure(self, factors, skip: bool):
-        """exp_rel_* = 100 x the factor, clamped to what the device can do.
+    def _exposure(self, factors: tuple[float, float, float] | None = None,
+                  skip: bool = False):
+        """Translate the generic exposure into exp_rel_*, for the duration of one pass.
 
-        The device clamps below 100 -- 50 behaves as 100 -- so a factor under 1.0
-        cannot shorten the exposure. The device is read only when some channel
-        asks for more than 1.0, which needs its Timer 1 ceiling, or when `skip`.
+        exp_rel_* = 100 x the factor, clamped to what the device can do. It is
+        honoured whether or not the pass runs the shading analysis, on every
+        model measured (ProScan 10T, ProScan 4000), so every exposure takes
+        effect in the pass that asks for it. The device clamps below 100 -- 50
+        behaves as 100 -- so a factor under 1.0 cannot shorten the exposure.
+        `factors` are the R/G/B multipliers, by default what 'exposure' and
+        'exposure_r/g/b' ask for. A device field the caller set directly is left
+        alone and wins.
 
-        A pass that runs the shading analysis derives the device's own exposure,
-        gain and offset, whatever is sent. One that skips it scans with the
-        options as sent, and anything but the settings the cached reference was
-        taken with shifts level and colour (ProScan 10T: 0.42, 0.57, 0.39 of
-        the analysing pass, sent the option defaults). So a skipping pass is
-        sent the scanner's own settings, unscaled: exp_rel does the scaling.
+        A pass that runs the shading analysis uses the device's own exposure,
+        gain and offset, whatever is sent. One that skips it (`skip`) scans with
+        the options as sent, and anything but the settings the cached reference
+        was taken with shifts level and colour (ProScan 10T: 0.42, 0.57, 0.39 of
+        the analysing pass, sent the option defaults). So a skipping pass is sent
+        the scanner's own settings, unscaled. The device is read only then, or
+        when some channel asks for more than 1.0, which needs its Timer 1 ceiling.
+
+        Every option is restored on the way out. The multipliers actually sent are
+        held in self._applied_factors meanwhile, for _result().
         """
+        if factors is None:
+            factors = self.params.exposure_factors()
         reported = self._get_gain_offset() if skip else None
         values, kept = ({}, []) if reported is None else self._device_settings(
             reported, reported["exposure_time"][:3])
@@ -927,8 +878,11 @@ class Scanner:
             log.info(f"[exposure] set directly, overriding 'exposure' or the "
                      f"scanner's own settings: {', '.join(kept)}")
         self._applied_factors = tuple(applied)
-        with self._overridden_options(**values):
-            yield
+        try:
+            with self._overridden_options(**values):
+                yield
+        finally:
+            self._applied_factors = None
 
     def _device_settings(self, reported, exposure) -> tuple[dict, list[str]]:
         """Option values seeding the scanner's own settings, with `exposure` as
@@ -963,56 +917,19 @@ class Scanner:
             seed('light', reported["light"])
         return values, kept
 
-    @contextmanager
-    def _absolute_exposure(self, factors):
-        """exp_time_* = the device's own exposure time x the factor.
-
-        The scanner's own settings are the baseline, which is what both ProScan 4000
-        drivers do: its exposure, gain, offset and lamp level are seeded into the
-        options and the exposure scaled per channel. Nothing is seeded if the
-        scanner has not picked them yet.
-        """
-        reported = self._get_gain_offset()
-        base = reported["exposure_time"]
-        if not all(base[c] > 0 for c in range(3)):
-            log.warning(f"[exposure] the scanner reports no exposure time of its own "
-                        f"({base}); scanning with the options as set")
-            yield
-            return
-
-        values, kept = self._device_settings(
-            reported, scale_exposure_times(base[:3], factors))
-        sent = [values.get(f'exp_time_{s}', self.params[f'exp_time_{s}'].value)
-                for s in ('r', 'g', 'b')]
-        self._applied_factors = tuple(sent[c] / base[c] for c in range(3))
-        log.info(f"[exposure] scanner's own exposure {base[:3]} x "
-                 f"{tuple(round(f, 3) for f in factors)} -> {tuple(sent)}, gain "
-                 f"{reported['gain']}, offset {reported['offset']}, light "
-                 f"{reported['light']}"
-                 + (f"; set directly: {', '.join(kept)}" if kept else ""))
-        with self._overridden_options(**values):
-            yield
-
     def _meter_exposure(self, started: float) -> ScanResult | None:
         """Run a metering pass and set exposure_r/g/b from what it measured.
 
         The pass runs at the scanner's own exposure, the METERING_PERCENTILE of
         each colour plane is compared against METERING_TARGET of full scale, and
-        each channel's factor is the shortfall. The same on every model, since the
-        factor means the same on every model; only how far it can go differs. A
-        relative model cannot go below 1.0 or past its Timer 1 ceiling, and is
-        clamped there with the shortfall reported.
+        each channel's factor is the shortfall, clamped to 1.0 below and the Timer
+        1 ceiling above with the shortfall reported.
 
         Measured on a PIE ProScan 10T against a colour negative: this puts all
         three channels within 1% of each other at ~88% of full scale, where
         untouched they sit at 4.39 : 1.93 : 1.00 with red at 34%. The per-pixel
         level does not depend on resolution there, so metering at preview
         resolution carries over to the real scan.
-
-        On an ABSOLUTE model the metering pass is also the calibration pass the
-        real one needs (plan_passes), and the real pass skips the shading
-        analysis -- otherwise the device re-derives its own exposure and the
-        metered one never reaches the sensor.
 
         Returns None once exposure_r/g/b have been set, or the metering pass's
         own ScanResult if it was cancelled. Failures propagate.
@@ -1037,10 +954,7 @@ class Scanner:
         if preview.rgb is None:
             raise PieusbError("metering pass returned no image data")
 
-        absolute = (self.info.capabilities.exposure_control
-                    is ExposureControl.ABSOLUTE)
-        ceilings = (None if absolute else
-                    self._relative_ceilings(self._get_gain_offset()["exposure_time"]))
+        ceilings = self._relative_ceilings(self._get_gain_offset()["exposure_time"])
         # What the preview ran at, normally 1.0; a device field set directly moves it.
         metered_at = preview.exposure_factor or (DEFAULT_EXPOSURE_FACTOR,) * 3
         full_scale = numpy.iinfo(preview.rgb.dtype).max
@@ -1053,10 +967,7 @@ class Scanner:
                             f"{self.params[name].value}")
                 continue
             wanted = metered_at[c] * target / measured
-            if absolute:
-                low, high = EXPOSURE_FACTOR_MIN, EXPOSURE_FACTOR_MAX
-            else:
-                low, high = 1.0, ceilings[c] / DEFAULT_RELATIVE_EXPOSURE
+            low, high = 1.0, ceilings[c] / DEFAULT_RELATIVE_EXPOSURE
             value = min(max(wanted, low), high)
             log.info(f"[autoexp] {CHANNEL_NAMES[c]}: metered {measured:.0f}/{full_scale} "
                      f"({measured / full_scale * 100:.1f}%), {name} -> {value:.3f}")
@@ -1071,22 +982,6 @@ class Scanner:
             self.params[name].value = value
         return None
 
-    def _calibrate(self, started: float) -> ScanResult:
-        """Acquire a shading reference for the pass about to run, and nothing else.
-
-        The same settings as that pass -- so the reference is the width it will
-        check for -- over a strip CALIBRATION_STRIP_MM tall, with the image
-        discarded. The device runs its shading analysis at its own exposure.
-        """
-        strip = max(1, round(CALIBRATION_STRIP_MM / MM_PER_INCH
-                             * self.info.inquiry.max_resolution_x))
-        tl_y, br_y = self.params['tl_y'].value, self.params['br_y'].value
-        log.info("[exposure] calibration pass, so the exposure can reach the sensor "
-                 "on the scan itself")
-        with self._overridden_options(br_y=min(tl_y + strip, br_y)), \
-                self._exposure((DEFAULT_EXPOSURE_FACTOR,) * 3):
-            return self._scan_pass(started, self._emit_calibrating, reuse=False)
-
     def _skips_analysis(self, reuse: bool | None) -> bool:
         """Whether a pass asks to skip the shading analysis: `reuse`, or the
         'reuse_calibration' option when None, and only with a reference cached."""
@@ -1094,55 +989,17 @@ class Scanner:
             reuse = self.params['reuse_calibration'].value
         return reuse and self._shading is not None
 
-    def _final_pass(self, started: float, force_skip: bool) -> ScanResult:
-        """The pass whose image the caller gets.
-
-        `force_skip` makes it skip the shading analysis and correct from the
-        cached reference, which on an ABSOLUTE model is the only way an exposure
-        reaches the sensor. The scanner can still refuse; the pass that refused
-        leaves a fresh reference behind, so it is run once more.
-        """
-        reuse = True if force_skip else None
-        with self._exposure(skip=self._skips_analysis(reuse)):
-            result = self._scan_pass(started, self._emit, reuse=reuse)
-        if not (force_skip and result.shading_acquired) or result.cancelled:
-            return result
-        log.warning("[exposure] the scanner insisted on its shading analysis, which overrides "
-                    "the exposure; scanning again with the reference it just took")
-        with self._exposure(skip=self._skips_analysis(True)):
-            result = self._scan_pass(started, self._emit, reuse=True)
-        if result.shading_acquired:
-            log.warning("[exposure] the scanner insisted on its shading analysis again; this scan "
-                        "ran at the scanner's own exposure")
-        return result
-
     def _run_scan(self, started: float) -> ScanResult:
-        """Run the passes a scan needs. Raises; _scan_worker catches.
-
-        plan_passes() decides which: a metering pass for auto_exp, a calibration
-        pass where the model needs one for the exposure to take effect, then the
-        real one. The metered exposure_r/g/b belong to this scan alone and are
-        restored afterwards.
-        """
-        plan = plan_passes(
-            absolute=(self.info.capabilities.exposure_control
-                      is ExposureControl.ABSOLUTE),
-            auto_exp=self.params['auto_exp'].value,
-            custom_exposure=self._custom_exposure(),
-            reuse_calibration=self.params['reuse_calibration'].value,
-            reference_cached=self._shading is not None,
-        )
-        log.debug(f"[scan] {plan}")
+        """Run the passes a scan needs: a metering pass for auto_exp, then the
+        real one. Raises; _scan_worker catches. The metered exposure_r/g/b belong
+        to this scan alone and are restored afterwards."""
         with self._saved_options(*METERED_OPTIONS):
-            if plan.meter:
+            if self.params['auto_exp'].value:
                 cancelled = self._meter_exposure(started)
                 if cancelled is not None:
                     return cancelled
-            if plan.calibrate:
-                calibration = self._calibrate(started)
-                if calibration.cancelled:
-                    return calibration
-            return self._final_pass(started, plan.force_skip)
+            with self._exposure(skip=self._skips_analysis(None)):
+                return self._scan_pass(started, self._emit)
 
     def _scan_pass(self, started: float, emit: Callable[[UpdateData], None],
                    autofocus: bool = False, reuse: bool | None = None) -> ScanResult:

@@ -124,12 +124,11 @@ scanner.exposure_b = 2.0      # per channel, on top of `exposure`
 scanner.auto_exp = True       # or meter it; `exposure` then acts as compensation
 ```
 
-The same options on every scanner. Models differ in which device setting the
-library drives, and on some that setting only takes effect on a pass that skips
-the shading analysis, so a calibration pass has to come first; the library
-handles both, so a scan may take one pass more than you asked for. `result.exposure_factor` reports what reached the sensor, per
-channel. Some scanners can only lengthen their exposure -- the ProScan 10T
-among them -- so values below 1.0 are clamped there, with a warning.
+The same options on every scanner, taking effect in the scan that asks for
+them. `result.exposure_factor` reports what reached the sensor, per channel.
+The scanner can only lengthen its exposure, so values below 1.0 are clamped to
+1.0 with a warning, and the longest it reaches depends on the exposure it chose
+for itself.
 
 The device settings behind it (`exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`,
 `light`) are marked `advanced` in the option table. They can be set for
@@ -143,14 +142,19 @@ transport is a call of its own rather than something `scan()` does for you, so
 the loop above becomes:
 
 ```python
+from pieusb.exceptions import EndOfStrip
+
 with Scanner(pieusb.get_devices()[0]) as scanner:
     scanner.resolution = 5000
     scanner.reuse_calibration = True
 
-    for _ in range(50):
+    while True:
         scanner.scan(on_update, on_complete)
         scanner.wait()
-        scanner.advance()
+        try:
+            scanner.advance()
+        except EndOfStrip:
+            break
 ```
 
 `advance()` blocks until the transport is idle again, and refuses to run while a
@@ -163,8 +167,10 @@ Keeping the frame in the gate is a matter of not calling `advance()`:
 scan it twice at different exposures, or discard a pass and repeat it, then move
 on when you are done with it.
 
-Nothing in the protocol describes magazine state, so `advance()` cannot tell you
-the magazine has run out. Count frames yourself.
+`advance()` returns how many frames the medium moved, read off the scanner's
+frame counter, and raises `EndOfStrip` when it moved none: the medium is at its
+last frame. A ProScan 4000 with a filmstrip signals its end this way. On the
+RPS 10M and with a slide magazine it is not yet measured.
 
 `init_transport()` prepares the transport and is there for priming it before the
 first scan, or for recovering after the magazine has been handled by hand. Every
@@ -175,15 +181,14 @@ scan already does this for itself.
 ### Verified on hardware
 
 - ProScan 10T
-- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**,
-  with absolute exposure
+- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**.
+  Its exposure control (`exp_rel_*`) is not yet measured cleanly
 - ProScan 4000: scanning, exposure, focus and `autofocus()` with a filmstrip
   carrier, and `advance()` and `offset_frame()`
 
 ### Not verified on hardware
 
-- ProScan 4000: `rewind()`, `eject()`, the slide carrier, and `exposure` in a
-  single scan without `reuse_calibration`
+- ProScan 4000: `rewind()`, `eject()` and the slide carrier
 - Slide transport on either DigitDia. The commands follow the SANE `pieusb`
   backend, but no DigitDia has been on the bench here.
 

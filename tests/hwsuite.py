@@ -27,8 +27,8 @@ add a motor a known model lacks.
 
 Model-specific numbers are not kept here. Test positions derive from what the
 scanner reports (scan window, focus range) and library constants (offset step);
-expected results from the library's configuration for the model (the exposure
-stage checks Capabilities.exposure_control). What is left are tolerances.
+expected results from what the library assumes (the exposure stage checks that
+exp_rel works on every pass). What is left are tolerances.
 
 Load film (for transport stages: a strip of colour negative at its first frame),
 start it, and leave it. It stops on its own: at the end of the strip, or at the
@@ -57,6 +57,11 @@ Transport stages, in an order that needs no reloading:
                  timings at a few resolutions on the first frame
 
 A stage that runs out of film is recorded as partial and the suite goes on.
+The end of the strip is what Scanner.advance() reports (EndOfStrip). Each time
+it does, a scan where the film should still be is compared with one taken
+there before the NEXT; if the film moved after all, the library's detection is
+wrong on this model and the suite stops. summary.json's findings.end_of_strip
+lists every report, with the READ STATE that followed.
 '''
 
 import argparse
@@ -81,12 +86,11 @@ import numpy
 import pieusb
 from pieusb.framing import (BAND_MIN_CLIPPED_PX, FRAME_MM, BandKind, FramePosition,
                             find_bands, locate_frame)
-from pieusb.exceptions import DeviceNotReady, PieusbError, WarmingUp
+from pieusb.exceptions import DeviceNotReady, EndOfStrip, PieusbError, WarmingUp
 from pieusb.inquiry import MODEL_MOTORS
 from pieusb.option import EXPOSURE_TIME_MAX
 from pieusb.scanner import MM_PER_INCH, OFFSET_STEPS_PER_MM, Scanner
 from pieusb.transport import SLIDE_PREV
-from pieusb.types import ExposureControl
 
 
 class Risk(IntEnum):
@@ -153,6 +157,11 @@ FRAMING_SCALE_MIN_MM = 0.5
 # Preview resolutions timed on the first frame, and whether each finds the same
 # frame; the loop itself previews at PREVIEW_DPI.
 PREVIEW_TIMING_DPI = (100, 150, 300)
+# A scan after an end of strip differing from the one before the NEXT by more
+# than this (mean absolute difference over mean level) shows the film moved. A
+# repeat scan of film that stayed differs by noise; a frame's move replaces the
+# picture.
+END_OF_STRIP_MOVED = 0.1
 
 # Exposure response: a control is live if it moves the level by more than
 # EXPOSURE_LIVE, and doubles it if every channel is within EXPOSURE_LINEAR of 2.
@@ -176,10 +185,6 @@ FOCUS_EFFECT = 1.2
 
 class Halt(Exception):
     '''A motor command failed: stop the suite rather than move anything further.'''
-
-
-class EndOfStrip(Exception):
-    '''NEXT left the frame counter where it was.'''
 
 
 class Skip(Exception):
@@ -242,6 +247,12 @@ def level_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
     return ratios
 
 
+def image_difference(a: numpy.ndarray, b: numpy.ndarray) -> float:
+    '''Mean absolute difference between two scans, over the first one's mean level.'''
+    a, b = a.astype(numpy.float64), b.astype(numpy.float64)
+    return float(numpy.abs(a - b).mean() / max(a.mean(), 1e-9))
+
+
 def doubles(r: list[float]) -> bool:
     return all(abs(v - 2) <= EXPOSURE_LINEAR for v in r)
 
@@ -250,24 +261,17 @@ def live(r: list[float]) -> bool:
     return any(abs(v - 1) > EXPOSURE_LIVE for v in r)
 
 
-def exposure_verdict(ratios: dict, configured: str) -> tuple[str, list[str]]:
-    '''Which exposure modes work on a model, and the one to use.
+def exposure_verdict(ratios: dict) -> tuple[bool, list[str]]:
+    '''Whether the library's exposure works on a model, and which doublings did.
 
-    The modes differ on a pass that runs the shading analysis, which re-derives
-    the exposure on an ABSOLUTE model. RELATIVE works if exp_rel doubles the image
-    on such a pass; ABSOLUTE if exp_time doubles it on a pass that skips it. A
-    skipping pass alone cannot tell them apart: on a ProScan 10T and 4000 both
-    controls double there. The mode the library is configured with wins if it
-    works.
+    The library sends exposure as exp_rel on every pass, so it needs exp_rel to
+    double the image both on a pass that runs the shading analysis and on one
+    that skips it (reuse_calibration). exp_time doubling on a skipping pass is
+    recorded too, though the library does not drive it.
     '''
-    works = []
-    if 'exp_rel_x2_analysed' in ratios and doubles(ratios['exp_rel_x2_analysed']):
-        works.append(ExposureControl.RELATIVE.name)
-    if doubles(ratios['exp_time_x2']):
-        works.append(ExposureControl.ABSOLUTE.name)
-    if configured in works:
-        return configured, works
-    return (works[0] if works else 'undetermined'), works
+    works = [name for name in ('exp_rel_x2_analysed', 'exp_rel_x2', 'exp_time_x2')
+             if name in ratios and doubles(ratios[name])]
+    return {'exp_rel_x2_analysed', 'exp_rel_x2'} <= set(works), works
 
 
 def focus_sweep(lo: int, hi: int, points: int = FOCUS_SWEEP_POINTS) -> list[int]:
@@ -326,6 +330,9 @@ class Suite:
         self.medium_present: bool | None = None
         # Offsets sent since the last NEXT or PREV and not yet sent back.
         self.unreturned_mm = 0.0
+        # (unreturned_mm, scan) for every scan since the frame counter last moved:
+        # what a scan after an end of strip is compared with.
+        self.scans_here: list[tuple[float, object]] = []
         self.findings: dict = {}
         # Image millimetres per commanded millimetre of offset, signed: what the
         # stepsize stage and each framing correction measured. offset_scale is
@@ -367,7 +374,6 @@ class Suite:
         return {
             'film_transport': f.get('frame_counter_moves'),
             'focus': f.get('focus_changes_sharpness'),
-            'exposure_control': f.get('exposure_control'),
         }
 
     def run(self, plan: list[tuple[Stage, str | None]]) -> int:
@@ -448,6 +454,7 @@ class Suite:
             raise KeyboardInterrupt
         if r is None or r.error is not None:
             raise RuntimeError(f"scan {name} did not complete")
+        self.scans_here.append((self.unreturned_mm, r))
         self.event(op='scan', name=name, file=f"{prefix.relative_to(self.out)}_rgb.npy",
                    width=r.width, height=r.height, resolution=r.resolution,
                    focus=self.focus(), shading_acquired=r.shading_acquired,
@@ -457,13 +464,15 @@ class Suite:
         return r
 
     def move(self, op: str, value) -> tuple[dict | None, dict | None]:
-        """One transport command, with READ STATE either side. Raises Halt on failure."""
+        """One transport command, with READ STATE either side. Raises Halt on
+        failure, and EndOfStrip, once recorded, when advance() raises it."""
         before = self.state('before')
         started = time.monotonic()
         print(f"\n{op} {value}...")
+        end, moved = None, None
         try:
             if op == 'next':
-                self.scanner.advance(value)
+                moved = self.scanner.advance(value)
             elif op == 'prev':
                 self.scanner._slide(SLIDE_PREV, value, byte3=self.prev_byte3)
             elif op == 'prev0':
@@ -474,6 +483,8 @@ class Suite:
                 self.scanner.offset_frame(value)
             else:
                 raise ValueError(op)
+        except EndOfStrip as e:
+            end, moved = e, 0
         except (PieusbError, ValueError) as e:
             self.event(op=op, value=value, error=f"{type(e).__name__}: {e}")
             raise Halt(f"{op} {value} failed: {type(e).__name__}: {e}") from e
@@ -485,19 +496,59 @@ class Suite:
             # so record what was outstanding rather than guess.
             self.event(op='unreturned_offset', mm=self.unreturned_mm, before=op)
         after = self.state('after')
+        extra = {} if op != 'next' else {'moved': moved, 'end_of_strip': end is not None}
         self.event(op=op, value=value, busy_s=busy,
                    frame_before=before and before['frame'],
-                   frame_after=after and after['frame'])
+                   frame_after=after and after['frame'], **extra)
         print(f"{op} {value}: {busy:.1f}s, frame "
-              f"{before and before['frame']} -> {after and after['frame']}")
-        if op != 'offset' and before and after and after['frame'] != before['frame']:
-            self.findings['frame_counter_moves'] = True
+              f"{before and before['frame']} -> {after and after['frame']}"
+              f"{', end of strip' if end else ''}")
+        counter_moved = not (before and after and after['frame'] == before['frame'])
+        if op != 'offset' and counter_moved:
+            self.scans_here = []
+            if before and after:
+                self.findings['frame_counter_moves'] = True
+        if end is not None:
+            raise end
         return before, after
 
     def next(self, frames: int = 1) -> None:
-        before, after = self.move('next', frames)
-        if before and after and after['frame'] == before['frame']:
-            raise EndOfStrip(f"frame counter stayed at {after['frame']} after NEXT {frames}")
+        try:
+            self.move('next', frames)
+        except EndOfStrip as e:
+            self.verify_end_of_strip(e, frames)
+            raise
+
+    def verify_end_of_strip(self, e: EndOfStrip, frames: int) -> None:
+        '''Whether the film stayed put when advance() reported the end of the strip.
+
+        Scans where the film should still be and compares that with the scan taken
+        at the same offset since the counter last moved, if there is one. Raises
+        Halt if the film moved: the library's end-of-strip detection is wrong on
+        this model, and the counter later stages steer by cannot be trusted.
+        '''
+        events = self.record['events']
+        entry = {'stage': self.record['stage'], 'frame': e.frame, 'next': frames,
+                 'busy_s': next(x['busy_s'] for x in reversed(events) if x['op'] == 'next'),
+                 'state_after': next((x['raw'] for x in reversed(events)
+                                      if x['op'] == 'after'), None)}
+        self.findings.setdefault('end_of_strip', []).append(entry)
+        here = self.unreturned_mm
+        ref = next((r for mm, r in reversed(self.scans_here) if abs(mm - here) < 0.01), None)
+        if ref is None:
+            entry.update(film_stayed=None, note='no scan at this position to compare with')
+            return
+        r = self.scan('after_end_of_strip')
+        if r.rgb.shape != ref.rgb.shape:
+            entry.update(film_stayed=None, note='the comparison scan has another size')
+            return
+        diff = image_difference(ref.rgb, r.rgb)
+        entry.update(difference=round(diff, 4), film_stayed=diff < END_OF_STRIP_MOVED)
+        print(f"end of strip at frame {e.frame}: the scan after differs by {diff:.3f} "
+              f"({'film stayed' if entry['film_stayed'] else 'THE FILM MOVED'})")
+        if not entry['film_stayed']:
+            raise Halt(f"advance() reported the end of the strip at frame {e.frame}, "
+                       f"but the film moved (scan difference {diff:.3f})")
 
     def set(self, **options) -> None:
         for name, value in options.items():
@@ -545,7 +596,8 @@ class Suite:
         The compared passes skip the shading analysis and correct from one
         reference, since an analysing pass may re-derive its own exposure. One
         more, exp_rel doubled on an analysing pass against the calibrating one,
-        tells whether the RELATIVE mode works (exposure_verdict).
+        tells whether exp_rel works there too, as the library assumes
+        (exposure_verdict).
         '''
         names = [f'{f}_{c}' for f in ('exp_time', 'exp_rel', 'gain') for c in 'rgb']
         self.full_frame(self.preview_dpi)
@@ -579,16 +631,14 @@ class Suite:
         finally:
             self.unset(*names, 'reuse_calibration')
             self.record['ratios'] = ratios
-        configured = self.scanner.info.capabilities.exposure_control.name
-        verdict, works = exposure_verdict(ratios, configured)
+        supported, works = exposure_verdict(ratios)
         response = {name: ('doubles' if doubles(r) else 'live' if live(r) else 'no effect')
                     for name, r in ratios.items() if name != 'base_again'}
-        self.record.update(verdict=verdict, works=works, response=response,
-                           library_configured=configured,
-                           matches_library=configured in works)
-        self.findings['exposure_control'] = verdict
-        print(f"\nexposure control: measured {verdict}, library configured {configured}"
-              + ("" if verdict in (configured, 'undetermined') else "   <- MISMATCH"))
+        self.record.update(works=works, response=response, matches_library=supported)
+        self.findings['exp_rel_works'] = supported
+        print(f"\nexposure: exp_rel {'doubles' if supported else 'does NOT double'} the "
+              f"image on both kinds of pass" + ("" if supported else "   <- MISMATCH: the "
+              "library's exposure does not work as it assumes on this model"))
 
     # --- focus ------------------------------------------------------------
 
