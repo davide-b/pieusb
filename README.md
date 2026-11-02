@@ -10,7 +10,7 @@ Python package to enable interfacing with USB-connected Reflecta (a.k.a. Pacific
 
 ### Windows
 
-You need to swap whatever driver Windows auto-assigned to your scanner to WinUSB
+You need to swap whatever driver Windows auto-assigned to your scanner to WinUSB. It is easiest done with Zadig.
 
 ### Linux
 
