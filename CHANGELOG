@@ -1,159 +1,117 @@
 # unreleased
 
+# 0.4.0
+
 ## Models
-- **ProScan 4000 detected and named** (product `0x0143`, model `0x002c`). An
-  unrecognised model now reports its number, as `Unknown (model 0x00ff)`
-- **Per-model capabilities**, `DeviceInfo.capabilities` (`types.Capabilities`):
-  `film_transport`, `focus` and `exposure_control`, looked up by model number in
-  `inquiry.DEVICE_CAPABILITIES`. A model not in the table gets conservative
-  defaults, so the ProScan 10T behaves as before. The RPS 10M is now an
-  absolute-exposure model (see Exposure)
-- `get_devices()` skips a scanner it cannot identify instead of failing the whole
-  enumeration. If none can be identified it raises the first error
+- **ProScan 4000** detected and named (product `0x0143`, model `0x002c`). Unknown
+  models report their number: `Unknown (model 0x00ff)`
+- **Per-model capabilities**: `DeviceInfo.capabilities` (`film_transport`,
+  `focus`) from `inquiry.DEVICE_CAPABILITIES`. Unlisted models get conservative
+  defaults, so the ProScan 10T is unchanged
+- `get_devices()` skips a scanner it cannot identify, and raises only if it can
+  identify none
 
 ## Film transport and focus
 - **Transport control** on models with a film transport (ProScan 4000, DigitDia
-  4000/6000): `Scanner.advance(frames)`, `rewind(frames)`, `eject(direction)`,
-  `offset_frame(mm)` and `init_transport()`. Each blocks until the mechanism is
-  idle and raises `ScanInProgress` during a scan. The medium moves only when one
-  of these is called; the ignored `advance` option is gone. `advance()` and
-  `offset_frame()` are verified on a ProScan 4000 with a filmstrip; `rewind()`
-  and `eject()` are not, and every transport call still logs a warning. Magazine
-  state is not in the protocol, so an empty magazine is not reported
+  4000/6000): `Scanner.advance()`, `rewind()`, `eject()`, `offset_frame(mm)`,
+  `init_transport()`. Each blocks until idle and raises `ScanInProgress` during
+  a scan; the film moves only on these calls (the ignored `advance` option is
+  gone). `advance()`, `rewind()` and `offset_frame()` are verified on a
+  ProScan 4000 filmstrip; `eject()` is not, and every transport call logs a
+  warning
+- **End of strip**: `advance()` returns the frames moved, from the READ STATE
+  frame counter, and raises `EndOfStrip` (with the last `frame`) when it moved
+  none; `rewind()` returns the frames moved back. Built on the ProScan 4000,
+  whose counter stays put at a filmstrip's end; RPS 10M and slide magazines
+  unmeasured
 - `Scanner.transport_state()` decodes READ STATE: frame, focus, focus range,
-  `medium_present`, `filmstrip_carrier` and the raw `flags`
-- **Focus** on models with a focus motor: a `focus` option sent before every
-  scan, `Scanner.set_focus()`, and `Scanner.focus_range()`, which reads the
-  range from the device because it depends on the carrier (1..80 slide, 1..30
-  filmstrip). A focus outside the range is clamped with a warning
-- **`Scanner.autofocus()`, experimental**: runs the device's focus sweep, picks
-  the sharpest position and sets `focus` to it. Returns an `AutofocusResult` with
-  every position's score. Sharpness is scored in red alone, as the vendor
-  software does; a dim blue channel behind a negative's orange mask had made it
-  pick by noise. A sweep with no clear peak leaves `focus` alone, logs a warning
-  and returns `peaked=False`. With a filmstrip carrier its pick is within 1% of
-  the sharpest manual focus on a ProScan 4000 and within the sharpest range on
-  an RPS 10M; untested with a slide carrier
-
-- `pieusb.framing.find_bands()`: the uniform vertical bands in a filmstrip scan,
-  each a gap between frames, a blank stretch (leader, unexposed frame) or clear
-  film past the strip's end, with its columns, whether the image edge cuts it,
-  how sharply it steps to the picture on each side, and a confidence. Bright
-  gaps (negatives) and dark ones (slides) both; checked against scans from a
-  ProScan 4000 and an RPS 10M. Pure numpy, no device access
-- `pieusb.framing.locate_frame()`: from those bands, where the frame lies in the
-  scan, which of its edges were measured and which placed one frame width from
-  the other, how far the content must move to centre it, and how much of it
-  lies outside the window
+  `medium_present`, `filmstrip_carrier`, raw `flags`
+- **Focus**: a `focus` option sent before every scan, `set_focus()`, and
+  `focus_range()`, read from the device since it depends on the carrier (1..80
+  slide, 1..30 filmstrip). Out-of-range values are clamped with a warning
+- **`Scanner.autofocus()`, experimental**: runs the device's focus sweep and sets
+  `focus` to the sharpest position. Lines are scored in red alone, as the vendor
+  does (blue behind the orange mask is noise), and smoothed over neighbouring
+  positions. A sweep too flat to trust (`AUTOFOCUS_MIN_DEPTH`) leaves `focus`
+  alone and returns `peaked=False`. On eight recorded filmstrip sweeps (ProScan
+  4000, RPS 10M) the pick is within about 1% of the sharpest manual focus
+- **`pieusb.framing`** (pure numpy): `find_bands()` finds the uniform vertical
+  bands in a filmstrip scan (frame gaps, blank frames, clear film past the end,
+  bright or dark, down to 1-2 px slivers at the edge) with their edges and a
+  confidence; `locate_frame()` turns them into the frame's position, the shift
+  that centres it, and how much lies outside the window. Checked against ProScan
+  4000 and RPS 10M scans
 
 ## Exposure
-- **One exposure control on every model**: `exposure` for the whole image and
-  `exposure_r/g/b` per channel on top, as multipliers on the exposure the
-  scanner chose for itself. The library translates it into the device field
-  it drives on the model -- `exp_rel_*` on a ProScan 10T, the device's own
-  `exp_time_*` scaled on a ProScan 4000 or RPS 10M -- and clamps it to what the model can
-  do: a relative model cannot go below 1.0. `ScanResult.exposure_factor` reports
-  what reached the sensor. `auto_exp` meters into `exposure_r/g/b`, with
-  `exposure` as compensation on top
-- **The RPS 10M uses absolute exposure.** On the hardware, doubling `exp_time`
-  doubled the image exactly. Doubling `exp_rel` gave 1.44x, but on passes that
-  reused the cached shading reference at default gain and offset (see Fixes),
-  so whether relative exposure also works on the 10M is open
-- **Which exposure control works depends on the pass, not the model.** A pass
-  that runs the device's shading analysis uses the device's own exposure and gain
-  and ignores `exp_time_*` and `gain_*`; one that skips it honours them as sent.
-  `exp_rel_*` is honoured on both kinds on a ProScan 10T, and on a skipping pass
-  on a ProScan 4000. Measured on a 10T, where `exp_time_*` had been recorded as
-  having no effect at all: that was on analysing passes
-- **The library decides when a scan needs an extra pass.** On an absolute model a
-  pass that runs the device's shading analysis uses the device's own exposure,
-  so any other exposure needs a pass that skips it, and so a shading reference
-  taken beforehand. A scan with a custom exposure runs a short calibration pass
-  first when none is cached, `auto_exp`'s metering pass doubles as one, and a
-  pass whose skip the device refuses is run once more. At the scanner's own
-  exposure, and on relative models, a scan is still one pass
-- On an absolute model each pass adopts the gain, offset and lamp level the device
-  reports for itself, as both vendor drivers do, instead of option defaults that
-  made scans come out dark
-- The device fields -- `exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`, `light`
-  -- stay settable for debugging, marked `Option.advanced`. A value set there
-  wins over the one `exposure` would derive, and the device's own values never
-  overwrite it
-- The `exp_time_*` ceiling is 65535, the wire field's limit. It used to be four
-  times INQUIRY's `maximum_exposure`, which refused a ProScan 4000 its own
-  exposure
-- `ScanResult.shading_acquired`, `.exposure` and `.gain` record whether a pass
-  ran the device's shading analysis and what exposure and gain it actually sent
+- **One exposure control on every model**: `exposure`, and `exposure_r/g/b` on
+  top, as multipliers on the scanner's own exposure. Sent as `exp_rel_*`, so a
+  scan is one pass (two with `auto_exp`). Range: 1.0 up to the Timer 1 ceiling
+  (6.4x on red on a ProScan 4000). `ScanResult.exposure_factor` reports what
+  reached the sensor; `auto_exp` meters into `exposure_r/g/b`
+- **What the device honours depends on the pass, not the model.** A pass that
+  runs the shading analysis uses the scanner's own exposure, gain and offset,
+  ignoring `exp_time_*`, `gain_*`, `offset_*`; a pass that skips it honours
+  them. `exp_rel_*` works on both, measured on the ProScan 10T, ProScan 4000
+  and RPS 10M
+- A pass that skips the shading analysis is sent the scanner's own exposure,
+  gain, offset and lamp level, as the ProScan 4000 vendor drivers do
+- Device fields (`exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`, `light`) stay
+  settable for debugging, marked `Option.advanced`; a value set there wins
+- `exp_time_*` may go up to 65535, the wire limit, instead of 4x INQUIRY's
+  `maximum_exposure`, which refused a ProScan 4000 its own exposure
+- `ScanResult.shading_acquired`, `.exposure` and `.gain`: whether a pass ran the
+  shading analysis, and the exposure and gain it sent
 
 ## Fixes
-- **`reuse_calibration` on a relative-exposure model (ProScan 10T)** scanned at
-  0.42 / 0.57 / 0.39 per channel of a pass that runs the shading analysis. One
-  that skips it scans with the exposure, gain and offset it is sent, and was
-  sent the option defaults rather than the settings its cached reference was
-  taken with. Such a pass is now sent the scanner's own settings, as absolute
-  models already were. Passes that run the analysis are unchanged
-- **An abandoned transaction no longer wedges the scanner until a power cycle.**
-  The control timeout is 40 s (a ProScan 4000 was measured holding for 30 s),
-  and a USB error mid-transaction resets the IEEE1284 link before raising
-  `TransportError`
-- SET GAIN OFFSET falls back from 29 to 23 bytes when the scanner rejects the
-  longer form, as a ProScan 4000 does. The accepted length is remembered per
-  device
-- SET_CONFIGURATION is sent only when the device has no active configuration
-- The REQUEST SENSE key is masked to its low nibble, so the flag bits in the top
-  nibble no longer break sense matching
-- INQUIRY's transparency corners are read in the right order. New
+- **`reuse_calibration` on a ProScan 10T** scanned at 0.39-0.57 of the level:
+  the pass was sent option defaults instead of the settings its shading
+  reference was taken with. It now gets the scanner's own settings
+- **An abandoned transaction no longer wedges the scanner** until a power cycle:
+  a 40 s control timeout, and a USB error mid-transaction resets the IEEE1284
+  link before raising `TransportError`
+- SET GAIN OFFSET falls back from 29 to 23 bytes when refused (ProScan 4000),
+  remembered per device
+- SET_CONFIGURATION is sent only to an unconfigured device
+- The REQUEST SENSE key is masked to its low nibble, so flag bits no longer
+  break sense matching
+- INQUIRY's transparency corners are read in the right order; new
   `InquiryResponse.firmware_version`
 
 ## Tools and tests
-- Offline test suites, `tests/test_wire_format.py` and `tests/test_identity.py`:
-  checked against a SANE log from a ProScan 10T and the ProScan 4000 captures,
-  plus golden masters of what `set_options()` sends
-- `wireshark/pieusb.lua`, a Wireshark dissector for this protocol.
-  `-Y pieusb.summary` reduces a capture to one line per command
-- `captures/tools/capdiff.py` diffs the command streams of several captures to
-  find the command a setting changes
+- Offline tests (`tests/test_*.py`) against a ProScan 10T SANE log, ProScan
+  4000 captures, recorded autofocus sweeps and scans, and golden masters of
+  what `set_options()` sends
+- `wireshark/pieusb.lua`, a Wireshark dissector; `-Y pieusb.summary` gives one
+  line per command
+- `captures/tools/capdiff.py` diffs the command streams of several captures
 - `exercise.py`:
-  - new flags: `--repeat`, `--pass-option`, `--assume`, `--autofocus`,
-    `--inquiry-hex`, and the transport and focus flags `--advance-only`,
-    `--rewind`, `--eject`, `--offset-mm`, `--frames`, `--transport-state`,
-    `--focus`, `--note` and `--ask`, which put what the person at the scanner
-    sees into the log
-  - `--steps` runs a sequence of scans and transport moves on one Scanner
-    (`scan`, `next`, `prev`, `prev0`, `offset`, `state`, `ask`), and
-    `--steps-repeat` repeats it until NEXT stops moving the frame counter
-  - `--log FILE` is the whole record of a run: everything printed, tracebacks,
-    warnings, the argv, Python and library versions, and the git commit and
-    modified files the run used. The terminal output is no longer needed
-  - each pass reports the exposure that reached the sensor and a per-channel
-    sharpness. `--repeat` ends with a level comparison between passes, next to
-    their exposures
-  - `--list` shows the model number and capabilities. The option table marks
-    options set explicitly with `*`, and device fields with `[advanced]`
-- `tests/hwsuite.py`, an unattended hardware suite. Each stage declares a risk
-  (read-only, scan, focus, transport) and runs only where the profile admits it
-  and the model has the motor: `--profile characterize` runs everything the
-  hardware has, `--profile regression` scans only, with the library as
-  configured. It measures which exposure modes work on a model (exp_rel on a
-  pass that runs the shading analysis, exp_time on one that skips it, as
-  black-level-independent slopes) against its capability entry, checks autofocus against a manual sweep, and on a filmstrip
-  measures offsets, stepping and positioning and walks the strip to its end. It
-  writes the log, the scans and a `summary.json` with a suggested capability
-  entry to one folder, and stops at the first failed motor command. An unknown
-  model gets motors only through `--allow`. `tests/test_hwsuite.py` runs it
-  against simulated scanners
-- hwsuite stages `stepsize` (what an offset step moves, measured in the image,
-  with direction and return error) and `framing` (roll scanning's positioning
-  loop over the whole strip: preview, `pieusb.framing` locates the frame, one
-  offset centres it, a check preview measures the result; the offset scale is
-  learnt from every correction and the frame width from frames showing both
-  gaps). `tests/test_hwsuite.py` runs them against a simulated filmstrip
-- `inquiry.MODEL_MOTORS`: the motors each model physically has, separate from
-  what `DEVICE_CAPABILITIES` lets the library drive
-- DEBUG logging for each phase of a SCSI transaction, with every payload and
-  reply in hex (image and shading reads cut to their first 32 bytes), the sense
-  data of a CHECK CONDITION, each SLIDE command and how long it kept the device
-  busy, and READ STATE decoded
+  - new flags `--repeat`, `--pass-option`, `--assume`, `--autofocus`,
+    `--inquiry-hex`; transport and focus flags `--advance-only`, `--rewind`,
+    `--eject`, `--offset-mm`, `--frames`, `--transport-state`, `--focus`; and
+    `--note` / `--ask` to log what the operator sees
+  - `--steps` scripts scans and moves on one Scanner (`scan`, `next`, `prev`,
+    `prev0`, `offset`, `state`, `ask`); `--steps-repeat` repeats to the end of
+    the strip
+  - `--log FILE` records the whole run: output, tracebacks, argv, versions, git
+    commit and modified files
+  - each pass reports the exposure reached and per-channel sharpness; `--repeat`
+    compares levels across passes
+  - `--list` shows model number and capabilities; the option table marks
+    explicit settings `*` and device fields `[advanced]`
+- **`tests/hwsuite.py`**, an unattended hardware suite. Stages run by risk
+  (read-only, scan, focus, transport) and only on hardware the model has:
+  `--profile characterize` runs all, `regression` scans only. It checks
+  `exp_rel` doubling on both kinds of pass; autofocus against manual sweeps and
+  full-resolution scans, plus a 16-bit autofocus pass; and on a filmstrip,
+  offsets, step size, stepping, positioning, a walk to the end of the strip
+  (each end checked by a scan) and roll scanning's framing loop. Writes the log,
+  scans and a `summary.json` with a suggested capability entry, and stops at
+  the first failed motor command. Unknown models get motors only via `--allow`.
+  `tests/test_hwsuite.py` runs it against simulated scanners
+- `inquiry.MODEL_MOTORS`: the motors each model physically has, apart from what
+  the library drives
+- DEBUG logging of every SCSI transaction phase with payloads in hex (bulk reads
+  cut to 32 bytes), sense data, SLIDE busy times, and decoded READ STATE
 
 # v0.3.7
 

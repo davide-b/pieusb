@@ -181,14 +181,14 @@ scan already does this for itself.
 ### Verified on hardware
 
 - ProScan 10T
-- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**.
-  Its exposure control (`exp_rel_*`) is not yet measured cleanly
+- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**,
+  exposure included
 - ProScan 4000: scanning, exposure, focus and `autofocus()` with a filmstrip
-  carrier, and `advance()` and `offset_frame()`
+  carrier, and `advance()`, `rewind()` and `offset_frame()`
 
 ### Not verified on hardware
 
-- ProScan 4000: `rewind()`, `eject()` and the slide carrier
+- ProScan 4000: `eject()` and the slide carrier
 - Slide transport on either DigitDia. The commands follow the SANE `pieusb`
   backend, but no DigitDia has been on the bench here.
 
