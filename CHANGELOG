@@ -78,6 +78,10 @@
   `InquiryResponse.firmware_version`
 
 ## Tools and tests
+- **`pieusb-udev`**, installed with the package: `sudo pieusb-udev install`
+  writes `/etc/udev/rules.d/60-pieusb.rules` for every known scanner and
+  applies it to plugged-in ones. Also `uninstall`, `print`, and `--group` for
+  machines without a seat user
 - Offline tests (`tests/test_*.py`) against a ProScan 10T SANE log, ProScan
   4000 captures, recorded autofocus sweeps and scans, and golden masters of
   what `set_options()` sends

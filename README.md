@@ -14,7 +14,17 @@ You need to swap whatever driver Windows auto-assigned to your scanner to WinUSB
 
 ### Linux
 
-You need to add a udev rule
+You need to add a udev rule. `pip install pieusb` installs a command that does it:
+
+```shell
+sudo pieusb-udev install
+```
+
+If sudo answers `command not found` (it searches its own PATH, without a
+virtualenv's or pipx's `bin`), run `pieusb-udev install` without sudo: it prints
+the full command to use. `pieusb-udev print` shows the rules, `--group NAME`
+grants a group instead of the logged-in user (for headless machines), and
+`pieusb-udev uninstall` removes them. To add the rule by hand instead:
 
 ```shell
 sudo tee /etc/udev/rules.d/60-pieusb.rules >/dev/null <<'EOF'

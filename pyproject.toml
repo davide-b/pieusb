@@ -27,6 +27,9 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pieusb"]
 
+[project.scripts]
+pieusb-udev = "pieusb.udev:main"
+
 [project.urls]
 Homepage = "https://github.com/davide-b/pieusb"
 Issues = "https://github.com/davide-b/pieusb/issues"
