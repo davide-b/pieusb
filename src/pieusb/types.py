@@ -124,15 +124,19 @@ class AutofocusResult:
     '''What Scanner.autofocus() measured.
 
     `scores[i]` is the sharpness of the line the device took at focus
-    `positions[i]`. `peaked` says whether the best score stood out from the rest;
-    if it did, `focus` is its position, which the Scanner has adopted as its
-    'focus' option, and if not, `focus` is the option left as it was. `lines` is
-    the sweep itself, (lines, width, 3), shading-corrected.
+    `positions[i]`, and `smoothed[i]` that averaged with its neighbours', which
+    is what the pick is made on. `depth` is the smoothed curve's best over its
+    worst. `peaked` says whether it was deep enough to trust; if it was, `focus`
+    is the best smoothed position, which the Scanner has adopted as its 'focus'
+    option, and if not, `focus` is the option left as it was. `lines` is the
+    sweep itself, (lines, width, 3), shading-corrected.
     '''
     focus: int
     peaked: bool
     positions: tuple[int, ...]
     scores: tuple[float, ...]
+    smoothed: tuple[float, ...]
+    depth: float
     lines: numpy.ndarray
 
 @dataclass(frozen=True)

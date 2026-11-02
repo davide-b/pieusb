@@ -100,10 +100,21 @@ PREVIEW_RESOLUTION_FALLBACK = 300
 # on the ProScan 4000, whose maximum is 3600.
 AUTOFOCUS_RESOLUTION = 5000
 
-# The sharpest line's score over the sweep's median below which the sweep has no
-# peak to trust. Sweeps of detailed film reach 1.11-1.21; a sweep of the default
-# frame's near-featureless lower half on an RPS 10M reached 1.04.
-AUTOFOCUS_MIN_PEAK = 1.07
+# The autofocus pass's bit depth. 8 is what the vendor software reads.
+AUTOFOCUS_COLOR_DEPTH = 8
+
+# Autofocus scores each position by the mean of the line scores within this
+# window around it, narrowed at the ends of the range so the first and last
+# positions are judged on their own side. A single line's score is noisy: on
+# the plateau of in-focus positions neighbouring lines differ by up to 5%, more
+# than the positions themselves do.
+AUTOFOCUS_SMOOTHING = 5
+
+# The smoothed curve's best over its worst below which the sweep has nothing to
+# trust. Sweeps of detailed film reach 1.13-1.35 (RPS 10M and ProScan 4000,
+# filmstrip); one of an RPS 10M's default frame reached 1.10, a slow rise to the
+# end of the range from something other than the film's picture.
+AUTOFOCUS_MIN_DEPTH = 1.115
 
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
 START_SCAN_ATTEMPTS = 30
@@ -143,6 +154,28 @@ UNVERIFIED_TRANSPORT = (
     "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
     "run these commands, and they move hardware"
 )
+
+def smooth_scores(scores: numpy.ndarray, width: int = AUTOFOCUS_SMOOTHING) -> numpy.ndarray:
+    """Each score averaged with its neighbours within `width`, the window
+    narrowed at the ends."""
+    scores = numpy.asarray(scores, dtype=numpy.float64)
+    kernel = numpy.ones(width)
+    return (numpy.convolve(scores, kernel, 'same')
+            / numpy.convolve(numpy.ones_like(scores), kernel, 'same'))
+
+
+def autofocus_pick(scores, positions) -> tuple[int, float, numpy.ndarray]:
+    """The position autofocus would pick, the sweep's depth, and the smoothed scores.
+
+    The pick is the best smoothed score's position. The depth is the smoothed
+    curve's best over its worst; under AUTOFOCUS_MIN_DEPTH the pick is not to be
+    trusted.
+    """
+    smoothed = smooth_scores(scores)
+    worst = smoothed.min()
+    depth = float(smoothed.max() / worst) if worst > 0 else 0.0
+    return positions[int(numpy.argmax(smoothed))], depth, smoothed
+
 
 def autofocus_positions(lines: int, focus_min: int, focus_max: int) -> list[int]:
     """The focus position each line of an autofocus pass was taken at.
@@ -495,9 +528,10 @@ class Scanner:
         This is the vendor's autofocus pass: MODE SELECT byte 10 set, the focus
         parked at its minimum, and a pass that returns as many lines as the focus
         range -- 30 with a filmstrip carrier on a ProScan 4000. The host scores
-        each line's sharpness in red, as the vendor software does, and picks the
-        best. A sweep whose best line does not stand out (AUTOFOCUS_MIN_PEAK)
-        leaves 'focus' alone, with a warning.
+        each line's sharpness in red, as the vendor software does, smooths the
+        scores over neighbouring positions (AUTOFOCUS_SMOOTHING) and picks the
+        best. A sweep too flat to trust (AUTOFOCUS_MIN_DEPTH) leaves 'focus'
+        alone, with a warning.
 
         The sweep covers the lower half of the current frame, full width, which on
         the default frame is the region CyberView sweeps. It runs with the
@@ -527,7 +561,7 @@ class Scanner:
             with self._overridden_options(
                 resolution=min(AUTOFOCUS_RESOLUTION, self.info.inquiry.max_resolution_x),
                 mode='rgb',
-                color_depth=8,
+                color_depth=AUTOFOCUS_COLOR_DEPTH,
                 sharpen=False,
                 fast_infrared=False,
                 reuse_calibration=False,
@@ -543,24 +577,23 @@ class Scanner:
 
         positions = autofocus_positions(sweep.rgb.shape[0], *limits)
         scores = line_sharpness(sweep.rgb)
-        best = positions[int(numpy.argmax(scores))]
-        median = float(numpy.median(scores))
-        peak = float(scores.max()) / median if median > 0 else 0.0
-        peaked = peak >= AUTOFOCUS_MIN_PEAK
+        best, depth, smoothed = autofocus_pick(scores, positions)
+        peaked = depth >= AUTOFOCUS_MIN_DEPTH
         if peaked:
             self.params['focus'].value = best
             self.params['focus'].assigned = True
             log.info(f"[autofocus] {len(positions)} lines over focus "
                      f"{limits[0]}..{limits[1]}; sharpest at {best}")
         else:
-            log.warning(f"[autofocus] no clear peak over focus {limits[0]}..{limits[1]} "
-                        f"(sharpest line {peak:.3f}x the median, below "
-                        f"{AUTOFOCUS_MIN_PEAK}); keeping focus "
+            log.warning(f"[autofocus] the sweep over focus {limits[0]}..{limits[1]} is "
+                        f"too flat to trust (best {depth:.3f}x the worst, below "
+                        f"{AUTOFOCUS_MIN_DEPTH}); keeping focus "
                         f"{self.params['focus'].value}. Sweep a region with more detail")
         return AutofocusResult(focus=self.params['focus'].value, peaked=peaked,
                                positions=tuple(positions),
                                scores=tuple(float(v) for v in scores),
-                               lines=sweep.rgb)
+                               smoothed=tuple(float(v) for v in smoothed),
+                               depth=depth, lines=sweep.rgb)
 
     def _start_scan(self) -> None:
         self.dev.command(SCSI_SCAN, cdb_length=1)

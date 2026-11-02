@@ -38,6 +38,12 @@ it, the one file to send back: suite.log has everything the terminal showed
 plus every command and reply, summary.json what each stage found and a
 suggested capability entry, and each stage's folder its scans as .npy.
 
+autofocus runs Scanner.autofocus(), then the same pass at 16 bits to compare
+line noise (a refusal is recorded, not fatal), then full scans of the patch over
+the focus range, then scans of a small square at the highest resolution around
+the pick: pick_ok in its record says whether the pick was within AF_PICK_MIN of
+the sharpest of them. Later stages scan at that sharpest position.
+
 Transport stages, in an order that needs no reloading:
 
     offsets      small offsets at 600 dpi, and the centring move CyberView uses,
@@ -181,6 +187,13 @@ GAIN_MAX = 63
 # A focus sweep whose sharpest scan beats its softest by this much shows the
 # focus motor does something.
 FOCUS_EFFECT = 1.2
+# The autofocus pick is checked with scans at the scanner's highest resolution,
+# where focus errors show most: a square of AF_CHECK_MM at the patch's centre,
+# at these offsets from the pick and at the coarse sweep's best. The pick passes
+# if it is at least AF_PICK_MIN as sharp as the sharpest of them.
+AF_CHECK_MM = 3.0
+AF_CHECK_STEPS = (-4, -2, 0, 2, 4)
+AF_PICK_MIN = 0.97
 
 
 class Halt(Exception):
@@ -272,6 +285,22 @@ def exposure_verdict(ratios: dict) -> tuple[bool, list[str]]:
     works = [name for name in ('exp_rel_x2_analysed', 'exp_rel_x2', 'exp_time_x2')
              if name in ratios and doubles(ratios[name])]
     return {'exp_rel_x2_analysed', 'exp_rel_x2'} <= set(works), works
+
+
+def sweep_summary(af) -> dict:
+    '''An autofocus sweep's pick and how far its curve stands above line noise.
+
+    Noise is the robust spread of the scores' second differences, which a
+    smooth focus curve barely moves, scaled to one score's standard deviation.
+    '''
+    scores = numpy.asarray(af.scores)
+    noise = float(numpy.median(numpy.abs(numpy.diff(scores, 2)))) * 1.4826 / 6 ** 0.5
+    span = max(af.smoothed) - min(af.smoothed)
+    return {'pick': af.focus if af.peaked else None, 'depth': round(af.depth, 4),
+            'noise_rel': round(noise / float(scores.mean()), 5),
+            'depth_over_noise': round(span / noise, 1) if noise > 0 else None,
+            'dtype': str(af.lines.dtype),
+            'red_level': round(float(af.lines[:, :, 0].mean()), 1)}
 
 
 def focus_sweep(lo: int, hi: int, points: int = FOCUS_SWEEP_POINTS) -> list[int]:
@@ -653,14 +682,10 @@ class Suite:
             af = self.scanner.autofocus()
         except PieusbError as e:
             raise Halt(f"autofocus failed: {type(e).__name__}: {e}") from e
-        path = self.out / self.record['stage'] / 'autofocus_lines.npy'
-        path.parent.mkdir(parents=True, exist_ok=True)
-        numpy.save(path, af.lines)
-        self.event(op='autofocus', focus=af.focus, peaked=af.peaked,
-                   scores=[round(s, 5) for s in af.scores],
-                   file=str(path.relative_to(self.out)))
-        print(f"\nautofocus: {'picked' if af.peaked else 'no clear peak, kept'} "
-              f"focus {af.focus}")
+        self.record_sweep(af, 'autofocus_lines.npy')
+        print(f"\nautofocus: {'picked' if af.peaked else 'too flat, kept'} "
+              f"focus {af.focus} (depth {af.depth:.3f})")
+        self.autofocus_16bit(af)
 
         self.set(reuse_calibration=True)
         sharpness = {}
@@ -674,12 +699,80 @@ class Suite:
         best = max(sharpness, key=sharpness.get)
         values = list(sharpness.values())
         self.findings['focus_changes_sharpness'] = max(values) > FOCUS_EFFECT * min(values)
-        # Later stages scan at the sweep's best: it is measured, the pick inferred.
-        self.set(focus=best)
-        self.record.update(sweep_best=best, autofocus_pick=af.focus if af.peaked else None,
-                           focus_used_from_here=best)
+        self.record.update(sweep_best=best, autofocus_pick=af.focus if af.peaked else None)
         print(f"sweep sharpest at {best}; autofocus picked "
               f"{af.focus if af.peaked else 'nothing'}")
+        checked = self.check_pick(limits, af, best)
+        # Later stages scan at the sharpest position measured, not the pick.
+        self.set(focus=checked)
+        self.record['focus_used_from_here'] = checked
+
+    def record_sweep(self, af, name: str) -> None:
+        path = self.out / self.record['stage'] / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        numpy.save(path, af.lines)
+        self.event(op='autofocus', focus=af.focus, peaked=af.peaked,
+                   scores=[round(s, 5) for s in af.scores],
+                   smoothed=[round(s, 5) for s in af.smoothed],
+                   file=str(path.relative_to(self.out)), **sweep_summary(af))
+
+    def autofocus_16bit(self, af8) -> None:
+        '''The autofocus pass again at 16 bits, on the same region: whether the
+        scanner takes it, and whether its line scores are less noisy than the
+        8-bit pass's. A refusal is recorded, not fatal; 'focus' is left as the
+        8-bit pass set it.'''
+        focus = self.scanner.params['focus']
+        kept = (focus.value, focus.assigned)
+        result = {'8': sweep_summary(af8)}
+        depth = pieusb.scanner.AUTOFOCUS_COLOR_DEPTH
+        pieusb.scanner.AUTOFOCUS_COLOR_DEPTH = 16
+        try:
+            af16 = self.scanner.autofocus()
+        except PieusbError as e:
+            result['16'] = {'error': f"{type(e).__name__}: {e}"}
+            log.exception("[suite] the 16-bit autofocus pass failed")
+        else:
+            self.record_sweep(af16, 'autofocus_lines_16bit.npy')
+            result['16'] = sweep_summary(af16)
+        finally:
+            pieusb.scanner.AUTOFOCUS_COLOR_DEPTH = depth
+            focus.value, focus.assigned = kept
+        self.record['autofocus_16bit'] = result
+        print(f"16-bit autofocus pass: {result['16']}")
+
+    def check_pick(self, limits: tuple[int, int], af, coarse_best: int) -> int:
+        '''Scans at the highest resolution around the pick (or the coarse best,
+        without one) and at the coarse best. Records how the pick compares with
+        the sharpest, and returns the sharpest.'''
+        inq = self.scanner.params.inq
+        cx = (self.patch_mm[0] + self.patch_mm[2]) / 2
+        cy = (self.patch_mm[1] + self.patch_mm[3]) / 2
+        half = AF_CHECK_MM / 2
+        ex.set_frame(self.scanner, *(ex.mm_to_native(v, inq) for v in
+                                     (cx - half, cy - half, cx + half, cy + half)))
+        self.set(resolution=inq.max_resolution_x)
+        centre = af.focus if af.peaked else coarse_best
+        positions = sorted({min(max(centre + d, limits[0]), limits[1])
+                            for d in AF_CHECK_STEPS} | {coarse_best})
+        sharpness = {}
+        self.set(reuse_calibration=True)
+        try:
+            for focus in positions:
+                self.set(focus=focus)
+                sharpness[focus] = round(image_sharpness(self.scan(f"check{focus:02d}").rgb), 5)
+        finally:
+            self.unset('reuse_calibration')
+            self.record.update(check_dpi=inq.max_resolution_x, check_sharpness=sharpness)
+        best = max(sharpness, key=sharpness.get)
+        self.record['check_best'] = best
+        if af.peaked:
+            relative = sharpness[af.focus] / sharpness[best]
+            ok = relative >= AF_PICK_MIN
+            self.record.update(pick_relative_sharpness=round(relative, 4), pick_ok=ok)
+            self.findings['autofocus_pick_ok'] = ok
+            print(f"at {inq.max_resolution_x} dpi: sharpest at {best}; the pick {af.focus} "
+                  f"is {relative:.3f} of it ({'ok' if ok else 'TOO SOFT'})")
+        return best
 
     # --- transport --------------------------------------------------------
 
