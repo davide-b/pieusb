@@ -1,5 +1,23 @@
 # unreleased
 
+## Exposure
+- **`auto_exp` meters on the film base** where its preview shows a gap
+  between frames of a colour negative, rather than on the picture's 99th
+  percentile. The base is the thinnest film on the strip, so nothing clips,
+  and on an RPS 10M strip it reads the same on every frame to within 1-3%,
+  where the percentile moved 3-7% and fell to 0.62 of the base on thin
+  frames. It falls back to the percentile without a gap, or where the picture
+  is brighter than the supposed base (`framing.BASE_TOLERANCE`).
+  `Scanner.film_base` records which it used
+- **`Scanner.meter_base()`** sets and keeps `exposure_r/g/b` from the film
+  base, for an exposure that holds across a roll. It meters the gate, or 70
+  steps forward if the gate shows no gap, and returns the film there
+- `framing.film_base()` reads the base off `find_bands()`' gaps (pure numpy)
+
+## Tools and tests
+- `tests/hwsuite.py`'s roll stage locks the exposure with `meter_base()` where
+  the model has a transport, and records each frame's peak and clipped pixels
+
 # 0.4.0
 
 ## Models

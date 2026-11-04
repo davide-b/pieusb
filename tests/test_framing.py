@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from support import REFERENCE_DIR
 
-from pieusb.framing import FRAME_MM, BandKind, Polarity, find_bands, locate_frame
+from pieusb.framing import (BASE_TOLERANCE, FRAME_MM, BandKind, Polarity, film_base,
+                            find_bands, locate_frame)
 
 PX_PER_MM = 300 / 25.4
 TOLERANCE_PX = 2
@@ -27,6 +28,11 @@ TOLERANCE_PX = 2
 
 def scan(name):
     with numpy.load(REFERENCE_DIR / 'framing_scans.npz') as scans:
+        return scans[name]
+
+
+def base_scan(name):
+    with numpy.load(REFERENCE_DIR / 'base_scans.npz') as scans:
         return scans[name]
 
 
@@ -207,6 +213,60 @@ class Placement(unittest.TestCase):
     def test_the_frame_width_places_the_unseen_edge(self):
         frame = self.place(scan('ps4000_gap_right'), frame_mm=35.6)
         self.assertAlmostEqual(frame.start, 400 - 35.6 * PX_PER_MM, delta=TOLERANCE_PX)
+
+
+class FilmBase(unittest.TestCase):
+    """`reference/base_scans.npz`: RPS 10M walk scans reduced as above. On that
+    strip the base read off whole gaps at full resolution is 0.3255 / 0.1583 /
+    0.0724 of full scale."""
+
+    STRIP_BASE = (0.3255, 0.1583, 0.0724)
+
+    def base(self, rgb):
+        return film_base(rgb, find_bands(rgb, PX_PER_MM))
+
+    def test_a_whole_gap_reads_the_strips_base(self):
+        for name in ('rps10m_full_gap', 'rps10m_thin_full_gap'):
+            with self.subTest(name=name):
+                base = self.base(base_scan(name))
+                self.assertTrue(base.consistent)
+                for got, want in zip(base.level, self.STRIP_BASE):
+                    self.assertAlmostEqual(got / want, 1.0, delta=0.03)
+
+    def test_a_thin_frame_does_not_move_the_base(self):
+        """Frame 4's own 99th percentile is 0.62 of the base in red; its gap
+        reads the same base as frame 3's."""
+        thin = self.base(base_scan('rps10m_thin_full_gap'))
+        dense = self.base(base_scan('rps10m_full_gap'))
+        self.assertLess(thin.picture_top[0], 0.7 * thin.level[0])
+        for a, b in zip(thin.level, dense.level):
+            self.assertAlmostEqual(a / b, 1.0, delta=0.02)
+
+    def test_a_sliver_at_the_edge_is_enough(self):
+        base = self.base(scan('rps10m_sliver'))
+        self.assertIsNotNone(base)
+        self.assertGreaterEqual(base.columns, 2)
+        self.assertTrue(base.consistent)
+
+    def test_no_gap_means_no_base(self):
+        for rgb in (base_scan('rps10m_thin_no_gap'), scan('ps4000_centred_no_gap')):
+            self.assertIsNone(self.base(rgb))
+
+    def test_blank_film_and_clear_film_are_not_read_as_base(self):
+        for name in ('ps4000_leader', 'ps4000_blank_frame'):
+            with self.subTest(name=name):
+                self.assertIsNone(self.base(scan(name)))
+        end = self.base(scan('ps4000_strip_end'))
+        self.assertLess(max(end.level), 0.5, 'the clear film past the end is left out')
+
+    def test_a_gap_darker_than_the_picture_is_not_consistent(self):
+        rgb = base_scan('rps10m_full_gap').copy()
+        bands = find_bands(rgb, PX_PER_MM)
+        gap = next(b for b in bands if b.kind is BandKind.GAP)
+        rgb[:, gap.start:gap.stop] = (rgb[:, gap.start:gap.stop] * 0.7).astype(rgb.dtype)
+        base = film_base(rgb, bands)
+        self.assertFalse(base.consistent)
+        self.assertGreater(base.picture_top[0], BASE_TOLERANCE * base.level[0])
 
 
 if __name__ == '__main__':

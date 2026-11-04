@@ -330,3 +330,75 @@ def locate_frame(bands: list[Band], width_px: int, px_per_mm: float,
                      max(0.0, stop - width_px) / px_per_mm),
         width_mm=(stop - start) / px_per_mm,
     )
+
+
+# Columns left out on each side of a gap when reading the base off it: its
+# edges blur into the picture, and the image's outermost column into nothing.
+BASE_TRIM_PX = 1
+# A gap must keep this many columns once trimmed to give a base reading.
+BASE_MIN_COLUMNS = 2
+# Columns around a band, and at the image edges, left out of the picture when
+# checking it against the base: what a band's edge or stray clear film lights.
+PICTURE_MARGIN_PX = 3
+# The picture is judged by this percentile of its BLOCK_PX x BLOCK_PX block
+# means, which averages pixel noise away. On an RPS 10M strip with the gaps cut
+# away it stays within 1.04 of the base.
+PICTURE_PERCENTILE = 99
+BLOCK_PX = 4
+# A base the picture outshines by more than this is not the base: nothing on a
+# negative is thinner than unexposed film.
+BASE_TOLERANCE = 1.10
+
+
+@dataclass(frozen=True)
+class FilmBase:
+    '''A negative's unexposed base, read off the gaps between frames in a scan.
+
+    `level` is its median per channel, as a fraction of full scale; `columns`
+    how many image columns it was read from. `picture_top` is the brightest the
+    rest of the scan gets, per channel, on the same scale. `consistent` says the
+    picture stays within BASE_TOLERANCE of the base, as it must if the bands
+    really are base.
+    '''
+    level: tuple[float, float, float]
+    columns: int
+    picture_top: tuple[float, float, float]
+
+    @property
+    def consistent(self) -> bool:
+        return all(top <= BASE_TOLERANCE * base
+                   for top, base in zip(self.picture_top, self.level))
+
+
+def film_base(rgb: numpy.ndarray, bands: list[Band]) -> FilmBase | None:
+    '''The film base of a negative from find_bands' result on `rgb`, or None
+    when no bright gap leaves BASE_MIN_COLUMNS columns once trimmed.
+
+    Only GAP bands that stand out bright count: a slide's gaps are opaque and
+    say nothing about its exposure, and clear film is no film at all.
+    '''
+    full = float(numpy.iinfo(rgb.dtype).max) if rgb.dtype.kind in 'ui' else 1.0
+    h, w = rgb.shape[:2]
+    margin = int(h * ROW_MARGIN)
+    body = rgb[margin:h - margin, :, :3] if h - 2 * margin >= 4 else rgb[:, :, :3]
+    base_cols = numpy.zeros(w, bool)
+    picture = numpy.ones(w, bool)
+    picture[:PICTURE_MARGIN_PX] = picture[w - PICTURE_MARGIN_PX:] = False
+    for band in bands:
+        picture[max(0, band.start - PICTURE_MARGIN_PX):band.stop + PICTURE_MARGIN_PX] = False
+        if band.kind is BandKind.GAP and band.polarity is Polarity.BRIGHT:
+            base_cols[max(band.start + BASE_TRIM_PX, BASE_TRIM_PX):
+                      min(band.stop - BASE_TRIM_PX, w - BASE_TRIM_PX)] = True
+    columns = int(base_cols.sum())
+    if columns < BASE_MIN_COLUMNS:
+        return None
+    level = numpy.median(body[:, base_cols].reshape(-1, 3), axis=0) / full
+    top = numpy.zeros(3)
+    pic = body[:, picture].astype(numpy.float64)
+    bh, bw = pic.shape[0] // BLOCK_PX * BLOCK_PX, pic.shape[1] // BLOCK_PX * BLOCK_PX
+    if bh and bw:
+        blocks = pic[:bh, :bw].reshape(bh // BLOCK_PX, BLOCK_PX, bw // BLOCK_PX, BLOCK_PX, 3)
+        top = numpy.percentile(blocks.mean(axis=(1, 3)).reshape(-1, 3),
+                               PICTURE_PERCENTILE, axis=0) / full
+    return FilmBase(level=tuple(float(v) for v in level), columns=columns,
+                    picture_top=tuple(float(v) for v in top))

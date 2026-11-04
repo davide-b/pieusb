@@ -395,9 +395,9 @@ def generate_options(inq: InquiryResponse,
     )))
 
     # Meter a preview pass and set exposure_r/g/b from it, instead of scanning with
-    # whatever they hold. 'exposure' still applies on top, as compensation. Costs
-    # one extra pass at the device's preview resolution; see
-    # Scanner._meter_exposure.
+    # whatever they hold: on a negative's film base where a gap shows, else on the
+    # picture. 'exposure' still applies on top, as compensation. Costs one extra
+    # pass at the device's preview resolution; see Scanner._meter_exposure.
     out.append(Parameter(Option(
         name='auto_exp',
         type=bool,

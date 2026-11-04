@@ -594,7 +594,14 @@ def run_one_pass(scanner: Scanner, args, prefix: Path) -> tuple[int, ScanResult 
 
     # wait() returned True, so the worker is done and on_complete has run.
     result = box[0]
-    return report_result(result, args, prefix), result
+    status = report_result(result, args, prefix)
+    if scanner.params['auto_exp'].value and result.error is None:
+        base = getattr(scanner, 'film_base', None)
+        print("  auto_exp metered: " + (
+            "the picture's percentile (no film base in view)" if base is None else
+            f"the film base at {', '.join(f'{v:.4f}' for v in base.level)} of full "
+            f"scale, from {base.columns} columns"))
+    return status, result
 
 
 def planes_of(r: ScanResult) -> list:

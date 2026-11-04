@@ -61,6 +61,8 @@ import struct
 
 import numpy
 
+from pieusb.framing import FilmBase, film_base, find_bands
+
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -91,6 +93,11 @@ METERING_TARGET = 0.85
 # Percentile of each colour plane taken as "the top of the image", so that a
 # handful of dust specks or scratches cannot veto the whole exposure.
 METERING_PERCENTILE = 99
+
+# Steps forward meter_base() moves to bring a gap into view when the frame in
+# the gate shows none: 7.41 mm nominal, CyberView's own centring move. On an
+# RPS 10M every such scan showed a whole gap.
+BASE_OFFSET_STEPS = 70
 
 # Used for the metering pass if the device's own reported preview resolution is
 # unusable. Matches the 'resolution' option default.
@@ -238,6 +245,9 @@ class Scanner:
         self._transport_initialized: bool = False
         # The R/G/B exposure multipliers in force, inside Scanner._exposure().
         self._applied_factors: tuple[float, float, float] | None = None
+        # The film base the last metering exposed for; None when it metered the
+        # picture's percentile instead.
+        self.film_base: FilmBase | None = None
         self.info = info
         self.params = generate_options(info.inquiry, info.capabilities)
         self.dev.open()
@@ -961,20 +971,27 @@ class Scanner:
     def _meter_exposure(self, started: float) -> ScanResult | None:
         """Run a metering pass and set exposure_r/g/b from what it measured.
 
-        The pass runs at the scanner's own exposure, the METERING_PERCENTILE of
-        each colour plane is compared against METERING_TARGET of full scale, and
-        each channel's factor is the shortfall, clamped to 1.0 below and the Timer
-        1 ceiling above with the shortfall reported.
-
-        Measured on a PIE ProScan 10T against a colour negative: this puts all
-        three channels within 1% of each other at ~88% of full scale, where
-        untouched they sit at 4.39 : 1.93 : 1.00 with red at 34%. The per-pixel
-        level does not depend on resolution there, so metering at preview
-        resolution carries over to the real scan.
+        Each channel's factor puts a reference level at METERING_TARGET of full
+        scale, clamped to 1.0 below and the Timer 1 ceiling above with the
+        shortfall reported. The reference is the film base where the preview
+        shows a negative's gap (pieusb.framing.film_base): the thinnest film on
+        the strip, so nothing on any frame can clip, and the same from frame to
+        frame to within 1-3% on an RPS 10M. Otherwise it is the
+        METERING_PERCENTILE of each colour plane: on a slide, or where a holder
+        masks the gaps. self.film_base records which.
 
         Returns None once exposure_r/g/b have been set, or the metering pass's
         own ScanResult if it was cancelled. Failures propagate.
         """
+        preview = self._metering_preview(started, self._emit_metering)
+        if preview.cancelled:
+            return preview
+        self._set_metered_exposure(preview, self._base_in(preview))
+        return None
+
+    def _metering_preview(self, started: float, emit) -> ScanResult:
+        """The metering pass: the frame at preview resolution, at the scanner's
+        own exposure."""
         preview_resolution = self.info.inquiry.preview_scan_resolution
         if not self.params['resolution'].opt.validate(preview_resolution):
             fallback = min(self.params['resolution'].value, PREVIEW_RESOLUTION_FALLBACK)
@@ -988,24 +1005,45 @@ class Scanner:
             sharpen=False,
             fast_infrared=False,
         ), self._exposure((DEFAULT_EXPOSURE_FACTOR,) * 3):
-            preview = self._scan_pass(started, self._emit_metering)
-
-        if preview.cancelled:
-            return preview
-        if preview.rgb is None:
+            preview = self._scan_pass(started, emit)
+        if not preview.cancelled and preview.rgb is None:
             raise PieusbError("metering pass returned no image data")
+        return preview
 
+    def _base_in(self, preview: ScanResult) -> FilmBase | None:
+        """The film base in a metering preview, or None where it shows none or
+        the picture outshines what was taken for it."""
+        px_per_mm = preview.resolution / MM_PER_INCH
+        base = film_base(preview.rgb, find_bands(preview.rgb, px_per_mm))
+        if base is None:
+            return None
+        if not base.consistent:
+            log.warning(f"[autoexp] a gap at {base.level} of full scale is darker than "
+                        f"the picture ({base.picture_top}), so it is not the film base; "
+                        f"metering the picture instead")
+            return None
+        return base
+
+    def _set_metered_exposure(self, preview: ScanResult, base: FilmBase | None) -> None:
+        """exposure_r/g/b from a metering preview, on `base` if given, else on
+        each plane's METERING_PERCENTILE."""
         ceilings = self._relative_ceilings(self._get_gain_offset()["exposure_time"])
         # What the preview ran at, normally 1.0; a device field set directly moves it.
         metered_at = preview.exposure_factor or (DEFAULT_EXPOSURE_FACTOR,) * 3
         full_scale = numpy.iinfo(preview.rgb.dtype).max
         target = METERING_TARGET * full_scale
+        self.film_base = base
+        if base is not None:
+            log.info(f"[autoexp] metering the film base, read off {base.columns} "
+                     f"columns of gap")
         for c, name in enumerate(METERED_OPTIONS):
-            measured = float(numpy.percentile(preview.rgb[:, :, c], METERING_PERCENTILE))
+            if base is not None:
+                measured = base.level[c] * full_scale
+            else:
+                measured = float(numpy.percentile(preview.rgb[:, :, c], METERING_PERCENTILE))
             if measured <= 0:
-                log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} metered 0 at the "
-                            f"{METERING_PERCENTILE}th percentile; leaving {name} at "
-                            f"{self.params[name].value}")
+                log.warning(f"[autoexp] channel {CHANNEL_NAMES[c]} metered 0; leaving "
+                            f"{name} at {self.params[name].value}")
                 continue
             wanted = metered_at[c] * target / measured
             low, high = 1.0, ceilings[c] / DEFAULT_RELATIVE_EXPOSURE
@@ -1021,7 +1059,43 @@ class Scanner:
                             f"than the target and this scanner cannot shorten its "
                             f"exposure; it will be over-exposed by {low / wanted:.2f}x")
             self.params[name].value = value
-        return None
+
+    def meter_base(self) -> FilmBase:
+        """Meter exposure_r/g/b on a negative's film base and keep them: an
+        exposure to hold for the whole strip, which no frame on it can clip.
+
+        Meters the frame in the gate if a gap shows there. Otherwise moves the
+        film BASE_OFFSET_STEPS forward, meters there and moves it back; the
+        return is a reversal and lands within about 0.35 mm on an RPS 10M. Sets
+        and assigns exposure_r/g/b, so leave auto_exp off for the scans that
+        follow, and returns the base it metered (also self.film_base).
+
+        Raises PieusbError on a scanner without a film transport or when no gap
+        shows either way (a slide, a blank stretch), ScanInProgress while a scan
+        is running, or if a cancel() stopped a metering pass.
+        """
+        self._require_slide_transport()
+        started = time.monotonic()
+        preview = self._metering_preview(started, lambda update: None)
+        base = None if preview.cancelled else self._base_in(preview)
+        if base is None and not preview.cancelled:
+            log.info(f"[autoexp] no film base in the gate; looking "
+                     f"{BASE_OFFSET_STEPS} steps forward")
+            self._slide(SLIDE_OFFSET_FORWARD, BASE_OFFSET_STEPS)
+            try:
+                preview = self._metering_preview(started, lambda update: None)
+            finally:
+                self._slide(SLIDE_OFFSET_BACK, BASE_OFFSET_STEPS)
+            base = None if preview.cancelled else self._base_in(preview)
+        if preview.cancelled:
+            raise PieusbError("meter_base() was cancelled")
+        if base is None:
+            raise PieusbError("no film base in view, in the gate or "
+                              f"{BASE_OFFSET_STEPS} steps forward")
+        self._set_metered_exposure(preview, base)
+        for name in METERED_OPTIONS:
+            self.params[name].assigned = True
+        return base
 
     def _skips_analysis(self, reuse: bool | None) -> bool:
         """Whether a pass asks to skip the shading analysis: `reuse`, or the

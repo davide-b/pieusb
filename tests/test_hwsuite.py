@@ -27,7 +27,8 @@ import hwsuite
 from hwsuite import Risk
 from pieusb import transport
 import pieusb.scanner
-from pieusb.exceptions import CheckCondition, TransportError
+from pieusb.exceptions import CheckCondition, PieusbError, TransportError
+from pieusb.framing import FilmBase
 from pieusb.scanner import autofocus_pick
 from pieusb.option import DEFAULT_EXPOSURE_TIME, DEFAULT_RELATIVE_EXPOSURE
 from pieusb.scanner import TransportState
@@ -193,6 +194,24 @@ def fake_autofocus(s, peak=SHARPEST_FOCUS, refuse_16bit=False):
     return autofocus
 
 
+def no_film_base(s):
+    '''Scanner.meter_base() on a strip whose gaps never show.'''
+    def meter_base():
+        raise PieusbError('no film base in view')
+    return meter_base
+
+
+def film_base_at(level):
+    '''Scanner.meter_base() finding the base at `level` of full scale.'''
+    def wired(s):
+        def meter_base():
+            for name in hwsuite.EXPOSURE_FACTOR_OPTIONS:
+                setattr(s, name, round(0.85 / level, 3))
+            return FilmBase(level=(level,) * 3, columns=20, picture_top=(level,) * 3)
+        return meter_base
+    return wired
+
+
 class SuiteRun(unittest.TestCase):
 
     def setUp(self):
@@ -205,7 +224,7 @@ class SuiteRun(unittest.TestCase):
     def run_suite(self, strip=None, inquiry=PROSCAN_4000, model=0x002C,
                   profile='characterize', motors=MOTORS_ALL, honours='both',
                   only=None, autofocus=None, enabled=frozenset(), on_reopen=None,
-                  **settings):
+                  meter_base=None, **settings):
         strip = strip or Strip(8)
 
         def wired():
@@ -215,6 +234,7 @@ class SuiteRun(unittest.TestCase):
             s._slide = strip.slide
             s.offset_frame = strip.offset
             s.autofocus = (autofocus or fake_autofocus)(s)
+            s.meter_base = (meter_base or no_film_base)(s)
             return s
 
         def reopen(old):
@@ -675,6 +695,19 @@ class Roll(SuiteRun):
         self.assertEqual(result['shading_analyses'], 0, 'every pass may reuse a reference')
         meters = [e for e in stages['roll']['events'] if e['op'] == 'scan' and e['name'] == 'meter']
         self.assertEqual(len(meters), 1)
+
+    def test_the_exposure_is_locked_on_the_film_base_where_it_shows(self):
+        _, stages, _, summary = self.run_suite(Film(4), only={'identity', 'roll'},
+                                               roll_dpi=600,
+                                               meter_base=film_base_at(0.25))
+        roll = stages['roll']
+        self.assertEqual(roll['base_metering']['level'], [0.25] * 3)
+        self.assertIn('frame_moved_mm', roll['base_metering'])
+        self.assertEqual(summary['findings']['roll']['exposure_lock'], [3.4] * 3)
+        names = [e['name'] for e in roll['events'] if e['op'] == 'scan']
+        self.assertNotIn('meter', names, 'no auto_exp pass once the base is metered')
+        self.assertEqual(summary['findings']['roll']['clipped_frames'], [])
+        self.assertTrue(all('saturated_pct' in f for f in roll['frames']))
 
     def test_back_at_the_first_frame_it_is_where_it_was(self):
         _, _, _, summary = self.run_suite(Film(4), only={'identity', 'roll'}, roll_dpi=600)

@@ -47,6 +47,7 @@ from support import (
 
 from pieusb import option, transport
 from pieusb.exceptions import EndOfStrip
+from pieusb.framing import film_base, find_bands
 from pieusb.inquiry import capabilities_for
 from pieusb.option import generate_options, set_options
 from pieusb.postprocess import line_sharpness
@@ -992,6 +993,97 @@ class Passes(unittest.TestCase):
         with self.assertLogs('pieusb.scanner', level='WARNING'):
             result, _ = self.run_scan(s, level=0.95)
         self.assertEqual(result.exposure_factor, (1.0, 1.0, 1.0))
+
+
+class BaseMetering(unittest.TestCase):
+    """Metering on the film base: auto_exp where the preview shows a gap, and
+    meter_base(), which looks forward for one. Images are recorded RPS 10M scans
+    (tests/reference/base_scans.npz)."""
+
+    def setUp(self):
+        with numpy.load(REFERENCE_DIR / 'base_scans.npz') as scans:
+            self.gap = scans['rps10m_thin_full_gap']
+            self.no_gap = scans['rps10m_thin_no_gap']
+        self.base = film_base(self.gap, find_bands(self.gap, 300 / 25.4)).level
+
+    def rps10m(self, overrides=None):
+        dev = FakeStrip(8, STATE_FILMSTRIP, frame=1, replies={
+            transport.SCSI_READ_GAIN_OFFSET: gain_offset_reply(exposure=(4100,) * 3)})
+        s = scanner(PROSCAN_4000, 0x0048, overrides=overrides, device=dev)
+        s._transport_initialized = True
+        return s
+
+    def passes(self, s, *images):
+        """Stub _scan_pass to return `images` in turn; returns the list of the
+        exposure factors each pass ran at."""
+        queue, ran = list(images), []
+
+        def fake_pass(started, emit, autofocus=False, reuse=None):
+            ran.append(s._applied_factors)
+            return s._result(queue.pop(0), started=started)
+
+        s._scan_pass = fake_pass
+        return ran
+
+    def slides(self, s):
+        return [c['out'] for c in s.dev.of(transport.SCSI_SLIDE)]
+
+    def factors(self, s):
+        return [s.params[n].value for n in METERED_OPTIONS]
+
+    def assertMeteredOn(self, factors, levels):
+        for got, level in zip(factors, levels):
+            self.assertAlmostEqual(got, 0.85 / level, delta=0.01 * got)
+
+    def test_auto_exp_meters_the_base_where_a_gap_shows(self):
+        """Frame 4 is thin: its picture alone tops out at 0.62 of the base in
+        red, so only the gap gives the strip's exposure."""
+        s = self.rps10m({'auto_exp': True})
+        ran = self.passes(s, self.gap, self.gap)
+        s._run_scan(0.0)
+        self.assertMeteredOn(ran[1], self.base)
+        self.assertEqual(s.film_base.level, self.base)
+
+    def test_auto_exp_meters_the_percentile_without_a_gap(self):
+        s = self.rps10m({'auto_exp': True})
+        ran = self.passes(s, self.no_gap, self.no_gap)
+        s._run_scan(0.0)
+        p99 = [numpy.percentile(self.no_gap[:, :, c], 99) / 65535 for c in range(3)]
+        self.assertMeteredOn(ran[1], p99)
+        self.assertIsNone(s.film_base)
+        self.assertEqual(self.slides(s), [], 'auto_exp never moves the film')
+
+    def test_meter_base_uses_a_gap_in_the_gate_without_moving(self):
+        s = self.rps10m()
+        self.passes(s, self.gap)
+        self.assertEqual(s.meter_base().level, self.base)
+        self.assertEqual(self.slides(s), [])
+        self.assertMeteredOn(self.factors(s), self.base)
+        self.assertTrue(all(s.params[n].assigned for n in METERED_OPTIONS),
+                        'the lock holds for the scans that follow')
+
+    def test_meter_base_looks_70_steps_forward_and_comes_back(self):
+        s = self.rps10m()
+        self.passes(s, self.no_gap, self.gap)
+        s.meter_base()
+        self.assertEqual(self.slides(s), [bytes.fromhex('00460000'),
+                                          bytes.fromhex('01460000')])
+        self.assertMeteredOn(self.factors(s), self.base)
+
+    def test_meter_base_without_a_gap_raises_with_the_film_returned(self):
+        s = self.rps10m()
+        self.passes(s, self.no_gap, self.no_gap)
+        with self.assertRaises(PieusbError):
+            s.meter_base()
+        self.assertEqual(self.slides(s), [bytes.fromhex('00460000'),
+                                          bytes.fromhex('01460000')])
+        self.assertEqual(self.factors(s), [1.0] * 3, 'nothing set')
+
+    def test_meter_base_needs_a_film_transport(self):
+        s = scanner(PROSCAN_10T, 0x0047)
+        with self.assertRaises(PieusbError):
+            s.meter_base()
+        self.assertEqual(s.dev.sent, [])
 
 
 # ---------------------------------------------------------------------------

@@ -80,7 +80,8 @@ Transport stages, in an order that needs no reloading:
                  to centre it and a check preview of where it landed. Preview
                  timings at a few resolutions on the first frame
     roll         a roll as an application scans it: back to frame 0, autofocus
-                 and the exposure metered there and held, then every frame
+                 and the exposure metered there (on the film base, by
+                 Scanner.meter_base(), where it shows) and held, then every frame
                  placed as framing does and scanned at --roll-dpi (kept as
                  thumbnails). Then frame 0 again: placement and level after
                  the roll
@@ -191,6 +192,9 @@ FRAMING_MIN_SHIFT_MM = 0.25
 # A correction at least this long is measured well enough to refine the offset
 # scale: 0.5 mm is 6 px at 300 dpi.
 FRAMING_SCALE_MIN_MM = 0.5
+# A roll frame with more than this percentage of a channel's pixels at full
+# scale counts as clipped: an exposure locked on the film base should leave none.
+CLIPPED_PCT = 0.1
 # Preview resolutions timed on the first frame, and whether each finds the same
 # frame; the loop itself previews at PREVIEW_DPI.
 PREVIEW_TIMING_DPI = (100, 150, 300)
@@ -391,6 +395,17 @@ def aligned(a: numpy.ndarray, b: numpy.ndarray, shift_px: int):
     if shift_px >= 0:
         return a[:h, :w - shift_px], b[:h, shift_px:w]
     return a[:h, -shift_px:w], b[:h, :w + shift_px]
+
+
+def clipping_fields(rgb: numpy.ndarray | None) -> dict:
+    '''Per channel, the brightest pixel as a fraction of full scale and the
+    percentage of pixels at full scale.'''
+    if rgb is None:
+        return {}
+    full = numpy.iinfo(rgb.dtype).max
+    planes = [rgb[:, :, c] for c in range(3)]
+    return {'peak': [round(float(p.max()) / full, 3) for p in planes],
+            'saturated_pct': [round(100 * float((p >= full).mean()), 3) for p in planes]}
 
 
 def mean_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
@@ -1297,13 +1312,15 @@ class Suite:
                         break
                 entry = {'index': index}
                 frames.append(entry)
-                frame_mm, _ = self.centre(entry, frame_mm, base_levels, widths, residuals)
+                frame_mm, placed = self.centre(entry, frame_mm, base_levels, widths,
+                                               residuals)
                 if index == 0:
-                    self.hold_focus_and_exposure()
+                    self.hold_focus_and_exposure(placed)
                     reference = self.scan('reference')
                 self.full_frame(self.roll_dpi)
                 r = self.scan('frame', keep=False)
-                entry.update(scan_s=round(r.duration_s, 1), shading_acquired=r.shading_acquired)
+                entry.update(scan_s=round(r.duration_s, 1), shading_acquired=r.shading_acquired,
+                             **clipping_fields(r.rgb))
                 self.full_frame(self.preview_dpi)
             minutes = round((time.monotonic() - started) / 60, 1)
             self.to_first_frame()
@@ -1325,6 +1342,8 @@ class Suite:
                   'shading_analyses': analyses,
                   'return_shift_mm': round(shift_px / (self.preview_dpi / MM_PER_INCH), 2),
                   'return_level': mean_ratio(a, b),
+                  'clipped_frames': [f['index'] for f in frames
+                                     if max(f.get('saturated_pct', [0])) > CLIPPED_PCT],
                   'focus': self.record.get('autofocus'),
                   'exposure_lock': self.record.get('exposure_lock')}
         self.findings['roll'] = result
@@ -1332,8 +1351,12 @@ class Suite:
               f"{result['shading_analyses']} shading analyses; back at frame 0 "
               f"{result['return_shift_mm']:+.2f} mm off, level x {result['return_level']}")
 
-    def hold_focus_and_exposure(self) -> None:
-        '''Autofocus and meter the frame in the gate, and keep both as options.'''
+    def hold_focus_and_exposure(self, before=None) -> None:
+        '''Autofocus and meter the frame in the gate, and keep both as options.
+        With a film transport the exposure is metered on the film base
+        (Scanner.meter_base()); where none shows, or without one, by auto_exp.
+        `before`, a preview of the frame as placed, measures how far
+        meter_base()'s look forward and back left it.'''
         if self.scanner.info.capabilities.focus:
             try:
                 af = self.scanner.autofocus()
@@ -1341,6 +1364,27 @@ class Suite:
                 raise Halt(f"autofocus failed: {type(e).__name__}: {e}") from e
             self.record['autofocus'] = {'focus': af.focus, 'peaked': af.peaked,
                                         'depth': round(af.depth, 4)}
+        if self.scanner.info.capabilities.film_transport:
+            try:
+                base = self.scanner.meter_base()
+            except PieusbError as e:
+                self.record['base_metering'] = {'error': f"{type(e).__name__}: {e}"}
+                print(f"\nno film base metered ({e}); metering the frame instead")
+            else:
+                factor = [self.scanner.params[n].value for n in EXPOSURE_FACTOR_OPTIONS]
+                entry = {'level': [round(v, 4) for v in base.level],
+                         'columns': base.columns,
+                         'picture_top': [round(v, 4) for v in base.picture_top]}
+                self.record['base_metering'] = entry
+                self.record['exposure_lock'] = [round(v, 4) for v in factor]
+                print(f"\nfilm base at {entry['level']} of full scale; exposure "
+                      f"locked at {self.record['exposure_lock']}")
+                if before is not None:
+                    check = self.scan('after_meter')
+                    shift_px = image_shift_px(before.rgb, check.rgb)
+                    entry['frame_moved_mm'] = round(
+                        shift_px / (self.preview_dpi / MM_PER_INCH), 2)
+                return
         self.set(auto_exp=True)
         try:
             factor = self.scan('meter').exposure_factor

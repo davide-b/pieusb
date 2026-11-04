@@ -140,6 +140,23 @@ The scanner can only lengthen its exposure, so values below 1.0 are clamped to
 1.0 with a warning, and the longest it reaches depends on the exposure it chose
 for itself.
 
+`auto_exp` meters each channel to 85% of full scale. Where its preview shows
+a gap between frames of a colour negative, it meters on the film base there:
+nothing on the strip is thinner than the base, so nothing clips. Otherwise
+(a slide, or a holder that masks the gaps) it meters the picture's 99th
+percentile. `scanner.film_base` says which it used, and the base's level.
+
+For a roll, meter once and hold the result, so every frame gets the same
+exposure. On a scanner with a film transport, `meter_base()` does that: it
+meters the base in the gate, or 70 steps forward if the gate shows no gap, and
+then moves the film back. It sets `exposure_r/g/b` and raises if it finds no
+base:
+
+```python
+scanner.meter_base()          # exposure_r/g/b now hold for the strip
+scanner.auto_exp = False      # leave them alone
+```
+
 The device settings behind it (`exp_rel_*`, `exp_time_*`, `gain_*`, `offset_*`,
 `light`) are marked `advanced` in the option table. They can be set for
 debugging, and a value set there overrides what `exposure` would derive.
