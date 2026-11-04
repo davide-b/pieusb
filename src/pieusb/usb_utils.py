@@ -2,7 +2,6 @@ import usb.core
 import usb.util
 from usb.backend import IBackend
 
-import ctypes
 import logging
 
 log = logging.getLogger(__name__)
@@ -22,7 +21,7 @@ def get_backend() -> IBackend:
     return libusb1_backend.get_backend()
 
 def find_device(vid: int, pid: int) -> usb.core.Device | None:
-    log.debug(f"[find_device] resolving libusb backend...")
+    log.debug("[find_device] resolving libusb backend...")
     backend = get_backend()
     log.debug(f"[find_device] backend = {backend}")
 

@@ -1,0 +1,511 @@
+# SANE pieusb backend, SANE_DEBUG_PIEUSB=11, against a PIE ProScan 10T (rev 1.70).
+#
+# Extracted from ~/sw/pieusb_ref/scan.log (sha256:b7d58d5ac5c5932b..., recorded 2026-04-25)
+# by captures/tools/sanelog.py. The command was:
+#
+#   scanimage --resolution=5000 --format=tiff --clean-image=yes \
+#            --calibration='from preview'
+#
+# This is the only reference we have for a model the library is VERIFIED on, so
+# it is checked in rather than left outside the repo. It is a second, independent
+# implementation of the same protocol talking to the same hardware family.
+#
+# SANE's debug dumps clip at 128 bytes. 'in' is therefore a PREFIX whenever
+# 'in_len' is present and larger; 'in_len' is the true reply length. Bulk image
+# payloads are dropped entirely (their 'in_len' is kept) -- their content is not
+# reproducible and would add megabytes.
+#
+# Format: one transaction per record, blank line between records.
+#   call <name>
+#   cdb <hex>            the 6-byte CDB
+#   out <hex>            parameter list, if any
+#   in <hex>             reply, possibly a prefix
+#   in_len <n>           true reply length, when it exceeds what was dumped
+
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 05 00
+in 06 00 02 01 b4
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 b8 00
+in 06 00 02 01 b4 00 00 00 50 49 45 20 20 20 20 20 53 46 20 53 63 61 6e 6e 65 72 00 00 00 00 00 00 31 2e 37 30 10 27 10 27 22 38 62 25 9e 35 07 00 09 4b 65 02 0c 00 2c 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 31 2e 31 36 0e 64 64 01 c4 09 64 00 34 3a b2 25 31 2e 30 36 47 00 00 00 50 49 45 00 32 30 31 36
+in_len 184
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 05 00
+in 06 00 02 01 b4
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 b8 00
+in 06 00 02 01 b4 00 00 00 50 49 45 20 20 20 20 20 53 46 20 53 63 61 6e 6e 65 72 00 00 00 00 00 00 31 2e 37 30 10 27 10 27 22 38 62 25 9e 35 07 00 09 4b 65 02 0c 00 2c 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 31 2e 31 36 0e 64 64 01 c4 09 64 00 34 3a b2 25 31 2e 30 36 47 00 00 00 50 49 45 00 32 30 31 36
+in_len 184
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 05 00
+in 06 00 02 01 b4
+
+call sanei_pieusb_cmd_inquiry
+cdb 12 00 00 00 b8 00
+in 06 00 02 01 b4 00 00 00 50 49 45 20 20 20 20 20 53 46 20 53 63 61 6e 6e 65 72 00 00 00 00 00 00 31 2e 37 30 10 27 10 27 22 38 62 25 9e 35 07 00 09 4b 65 02 0c 00 2c 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 31 2e 31 36 0e 64 64 01 c4 09 64 00 34 3a b2 25 31 2e 30 36 47 00 00 00 50 49 45 00 32 30 31 36
+in_len 184
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_read_state
+cdb dd 00 00 00 0c 00
+in 00 00 7c dd f7 00 01 60 00 49 45 20
+
+call sanei_pieusb_cmd_set_exposure_time
+cdb 0a 00 00 00 08 00
+out 13 00 04 00 02 00 64 00
+
+call sanei_pieusb_cmd_set_exposure_time
+cdb 0a 00 00 00 08 00
+out 13 00 04 00 04 00 64 00
+
+call sanei_pieusb_cmd_set_exposure_time
+cdb 0a 00 00 00 08 00
+out 13 00 04 00 08 00 64 00
+
+call sanei_pieusb_cmd_set_highlight_shadow
+cdb 0a 00 00 00 08 00
+out 14 00 04 00 02 00 64 00
+
+call sanei_pieusb_cmd_set_highlight_shadow
+cdb 0a 00 00 00 08 00
+out 14 00 04 00 04 00 64 00
+
+call sanei_pieusb_cmd_set_highlight_shadow
+cdb 0a 00 00 00 08 00
+out 14 00 04 00 08 00 64 00
+
+call sanei_pieusb_cmd_get_shading_parms
+cdb 0a 00 00 00 06 00
+out 95 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_shading_parms
+cdb 08 00 00 00 20 00
+in 95 00 1c 00 04 06 04 00 00 10 10 23 11 1c 08 10 10 23 1a 1d 10 10 10 23 11 1c 20 10 10 23 11 1c
+
+call sanei_pieusb_cmd_set_scan_frame
+cdb 0a 00 00 00 0e 00
+out 12 00 0a 00 80 00 00 00 00 00 21 38 61 25
+
+call sanei_pieusb_cmd_get_gain_offset
+cdb d7 00 00 00 67 00
+in 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 04 10 b7 b8 30 ef ad 85 5f ce 31 cf 20 e7 c3 a3 ad b3 c3 9b d8 7f 04 10 00 03 0f
+
+call sanei_pieusb_cmd_set_gain_offset
+cdb dc 00 00 00 1d 00
+out 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 04 10 00 00 0f 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_set_mode
+cdb 15 00 00 00 10 00
+out 00 0f 88 13 90 04 04 00 01 08 00 00 00 7f 10 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_start_scan
+cdb 1b 00 00 00 01 00
+
+call sanei_pieusb_cmd_get_sense
+cdb 03 00 00 00 0e 00
+in 70 00 06 00 00 00 00 06 00 00 00 00 82 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_gain_offset
+cdb d7 00 00 00 67 00
+in 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ad 00 b8 00 b7 00 00 00 00 00 00 00 04 10 04 10 04 10 0c 10 10 00 00 00 2c 1c 25 04 04 10 b7 b8 30 ef ad 85 5f ce 31 cf 20 e7 c3 a3 ad b3 c3 9b d8 7f 04 10 10 00 39
+
+call sanei_pieusb_cmd_set_gain_offset
+cdb dc 00 00 00 1d 00
+out 7a 0e 65 0e 7b 0e 0c 10 10 00 00 00 28 16 20 04 00 00 04 10 10 00 39 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 04 00
+in_len 57488
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 88 00
+in_len 1954592
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_ccd_mask
+cdb 18 00 00 1c 11 00
+in 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+in_len 7185
+
+call sanei_pieusb_cmd_get_parameters
+cdb 0f 00 00 00 12 00
+in 10 1c b1 12 10 1c 08 08 10 40 00 00 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 ff 00
+in_len 1832430
+
+call sanei_pieusb_cmd_get_scanned_lines
+cdb 08 00 00 00 0f 00
+in_len 107790
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00
+
+call sanei_pieusb_cmd_test_unit_ready
+cdb 00 00 00 00 00 00

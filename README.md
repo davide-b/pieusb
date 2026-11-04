@@ -146,8 +146,9 @@ debugging, and a value set there overrides what `exposure` would derive.
 
 ### Slide transport
 
-The DigitDia 4000 and DigitDia 6000 feed slides from a magazine, and the
-ProScan 4000 feeds a filmstrip or slide carrier. Moving the
+The DigitDia 4000 and DigitDia 6000 feed slides from a magazine, the
+ProScan 4000 feeds a filmstrip or slide carrier, and the RPS 10M feeds a
+filmstrip. Moving the
 transport is a call of its own rather than something `scan()` does for you, so
 the loop above becomes:
 
@@ -179,8 +180,32 @@ on when you are done with it.
 
 `advance()` returns how many frames the medium moved, read off the scanner's
 frame counter, and raises `EndOfStrip` when it moved none: the medium is at its
-last frame. A ProScan 4000 with a filmstrip signals its end this way. On the
-RPS 10M and with a slide magazine it is not yet measured.
+last frame. A ProScan 4000 or RPS 10M with a filmstrip signals its end this
+way; with a slide magazine it is not yet measured.
+
+### Centring a frame
+
+`advance()` moves the film by a fixed distance; it does not look for the gap
+between frames, so a frame can land a millimetre or so off centre. A preview
+shows by how much, and `shift_image()` corrects it:
+
+```python
+from pieusb.framing import find_bands, locate_frame
+
+scanner.resolution = 300                    # lower resolutions are no faster
+scanner.scan(on_update, on_complete)        # on_complete keeps result.rgb as `preview`
+scanner.wait()
+px_per_mm = 300 / 25.4
+frame = locate_frame(find_bands(preview, px_per_mm), preview.shape[1], px_per_mm)
+if frame is not None and frame.measured and abs(frame.shift_mm) > 0.3:
+    scanner.shift_image(frame.shift_mm)
+```
+
+`shift_image()` converts with the model's measured step (ProScan 4000 and
+RPS 10M). The correction stays in force across `advance()`, so a roll needs
+only small touch-ups after the first frame. Avoid moving back and forth: each
+out-and-back move ends 0.2-0.6 mm off. `offset_frame(mm)` moves by nominal
+travel instead, on any model with a transport.
 
 `init_transport()` prepares the transport and is there for priming it before the
 first scan, or for recovering after the magazine has been handled by hand. Every
@@ -191,14 +216,16 @@ scan already does this for itself.
 ### Verified on hardware
 
 - ProScan 10T
-- RPS 10M (aka Pacific Image PrimeFilm XAs) - **Single frame scan only**,
-  exposure included
+- RPS 10M (aka Pacific Image PrimeFilm XAs): scanning, exposure, focus and
+  `autofocus()` with a filmstrip, and `advance()`, `rewind()`,
+  `offset_frame()` and `shift_image()`, end of strip included
 - ProScan 4000: scanning, exposure, focus and `autofocus()` with a filmstrip
   carrier, and `advance()`, `rewind()` and `offset_frame()`
 
 ### Not verified on hardware
 
 - ProScan 4000: `eject()` and the slide carrier
+- RPS 10M: `eject()`
 - Slide transport on either DigitDia. The commands follow the SANE `pieusb`
   backend, but no DigitDia has been on the bench here.
 

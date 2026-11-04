@@ -3,11 +3,9 @@ from pieusb.types import (
     InquiryResponse,
     Filter,
     ColorFormat,
-    ColorFormat,
     ImageFormat,
     ScanCapabilities,
-    OptionalDevices,
-    DeviceInfo
+    OptionalDevices
 )
 
 import struct
@@ -31,7 +29,10 @@ MODEL_NAMES = {
 # Per-model knowledge, in the spirit of SANE's pieusb.conf flags. A model absent
 # here gets the conservative Capabilities() defaults.
 DEVICE_CAPABILITIES = {
-    0x002c: Capabilities(film_transport=True, focus=True),   # ProScan 4000
+    0x002c: Capabilities(film_transport=True, focus=True,    # ProScan 4000
+                         offset_mm_per_step=0.1164),
+    0x0048: Capabilities(film_transport=True, focus=True,    # RPS 10M
+                         offset_mm_per_step=-0.0985),
     0x002f: Capabilities(film_transport=True),   # DigitDia 4000
     0x003a: Capabilities(film_transport=True),   # DigitDia 6000
 }

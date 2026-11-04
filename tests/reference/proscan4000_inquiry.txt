@@ -1,0 +1,19 @@
+# INQUIRY reply from a Reflecta ProScan 4000, all 184 bytes.
+#
+# Recorded with `python tests/exercise.py --inquiry-hex`. The capture corpus in
+# captures/ contains no INQUIRY reply, so this is the only copy.
+#
+# Reads as: PIE / MF Scanner / rev 1.70, model 0x002c, 3600 dpi, bed 5172 x 3444,
+# firmware 1.98, built 2003/11/25.
+06 00 02 01 b4 00 00 00 50 49 45 20 20 20 20 20
+4d 46 20 53 63 61 6e 6e 65 72 00 00 00 00 00 00
+31 2e 37 30 10 0e 10 0e 34 14 74 0d 9e 35 07 00
+09 4b 69 02 0c 00 2c 01 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+31 2e 39 38 08 64 64 01 c4 09 64 00 d0 02 86 04
+bc 10 c0 15 2c 00 00 00 50 49 45 00 32 30 30 33
+2f 31 31 2f 32 35 09 30 35 3a 30 30 50 4d 00 00
+46 6c 61 73 68 20 52 4f 4d 20 32 39 45 45 35 31
+32 20 0d 0a 42 59 3a 43 68 65 6e 20 54 73 75 6e
+67 2d 59 75 20 20 00 00

@@ -6,24 +6,31 @@
 - **ProScan 4000** detected and named (product `0x0143`, model `0x002c`). Unknown
   models report their number: `Unknown (model 0x00ff)`
 - **Per-model capabilities**: `DeviceInfo.capabilities` (`film_transport`,
-  `focus`) from `inquiry.DEVICE_CAPABILITIES`. Unlisted models get conservative
-  defaults, so the ProScan 10T is unchanged
+  `focus`, `offset_mm_per_step`) from `inquiry.DEVICE_CAPABILITIES`. Unlisted
+  models get conservative defaults, so the ProScan 10T is unchanged
+- **RPS 10M film transport and focus** enabled, from a full hardware-suite run
+  on a six-frame strip
 - `get_devices()` skips a scanner it cannot identify, and raises only if it can
   identify none
 
 ## Film transport and focus
-- **Transport control** on models with a film transport (ProScan 4000, DigitDia
-  4000/6000): `Scanner.advance()`, `rewind()`, `eject()`, `offset_frame(mm)`,
-  `init_transport()`. Each blocks until idle and raises `ScanInProgress` during
-  a scan; the film moves only on these calls (the ignored `advance` option is
-  gone). `advance()`, `rewind()` and `offset_frame()` are verified on a
-  ProScan 4000 filmstrip; `eject()` is not, and every transport call logs a
-  warning
+- **Transport control** on models with a film transport (ProScan 4000, RPS 10M,
+  DigitDia 4000/6000): `Scanner.advance()`, `rewind()`, `eject()`,
+  `offset_frame(mm)`, `init_transport()`. Each blocks until idle and raises
+  `ScanInProgress` during a scan; the film moves only on these calls (the
+  ignored `advance` option is gone). `advance()`, `rewind()` and
+  `offset_frame()` are verified on ProScan 4000 and RPS 10M filmstrips;
+  `eject()` is not
+- **`Scanner.shift_image(mm)`** moves the film so the image shifts `mm` towards
+  +x, which is what `framing.FramePosition.shift_mm` asks for. It converts with
+  the model's measured step: 0.1164 mm towards +x on a ProScan 4000,
+  0.0985 mm towards -x on an RPS 10M. NEXT moves a fixed distance (38.07 mm on
+  the 10M), so a correction carries over to the following frames
 - **End of strip**: `advance()` returns the frames moved, from the READ STATE
   frame counter, and raises `EndOfStrip` (with the last `frame`) when it moved
-  none; `rewind()` returns the frames moved back. Built on the ProScan 4000,
-  whose counter stays put at a filmstrip's end; RPS 10M and slide magazines
-  unmeasured
+  none; `rewind()` returns the frames moved back. At a filmstrip's end the
+  ProScan 4000 and RPS 10M refuse NEXT within 0.2 s and leave the counter and
+  the film where they were; slide magazines unmeasured
 - `Scanner.transport_state()` decodes READ STATE: frame, focus, focus range,
   `medium_present`, `filmstrip_carrier`, raw `flags`
 - **Focus**: a `focus` option sent before every scan, `set_focus()`, and

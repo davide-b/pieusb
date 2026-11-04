@@ -1,0 +1,9 @@
+WRITE:HIGHLIGHT_SHADOW cdb_len=8     out=14 00 04 00 02 00 64 00
+WRITE:HIGHLIGHT_SHADOW cdb_len=8     out=14 00 04 00 04 00 64 00
+WRITE:HIGHLIGHT_SHADOW cdb_len=8     out=14 00 04 00 08 00 64 00
+WRITE:EXPOSURE         cdb_len=8     out=13 00 04 00 02 00 64 00
+WRITE:EXPOSURE         cdb_len=8     out=13 00 04 00 04 00 64 00
+WRITE:EXPOSURE         cdb_len=8     out=13 00 04 00 08 00 64 00
+WRITE:SCAN_FRAME       cdb_len=14    out=12 00 0a 00 80 00 e8 03 f4 01 28 23 70 17
+WRITE_GAIN_OFFSET      cdb_len=29    out=7a 0e 65 0e 7b 0e 0c 10 10 00 00 00 28 16 20 04 00 00 04 10 10 00 39 00 00 00 00 00 00
+MODE_SELECT            cdb_len=16    out=00 0f b0 04 80 04 04 00 01 00 00 00 00 80 10 00

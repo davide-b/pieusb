@@ -148,12 +148,6 @@ SLIDE_ACTION_NAMES = {
     SLIDE_INIT: 'INIT',
 }
 
-# REMOVE BEFORE RELEASE, together with the two log.warning calls that use it,
-# once a scanner with a slide transport has run these commands.
-UNVERIFIED_TRANSPORT = (
-    "[transport] the slide transport is UNVERIFIED: no scanner with a magazine has "
-    "run these commands, and they move hardware"
-)
 
 def smooth_scores(scores: numpy.ndarray, width: int = AUTOFOCUS_SMOOTHING) -> numpy.ndarray:
     """Each score averaged with its neighbours within `width`, the window
@@ -440,7 +434,6 @@ class Scanner:
         magazine has been handled by hand.
         """
         self._require_slide_transport()
-        log.warning(UNVERIFIED_TRANSPORT)
         self._slide(SLIDE_INIT, self._focus_for_scan())
 
     def advance(self, frames: int = 1) -> int:
@@ -453,9 +446,11 @@ class Scanner:
         Returns how many frames the medium moved, read off the READ STATE frame
         counter either side of the move: fewer than `frames` when the strip ended
         on the way. Raises EndOfStrip when it moved none. At the end of a strip a
-        ProScan 4000 accepts NEXT, refuses it within 0.2 s, and leaves the counter
-        where it was; the RPS 10M's counter moves with NEXT the same way, but its
-        end of strip is unmeasured, as is a slide magazine on any model.
+        ProScan 4000 or RPS 10M accepts NEXT, refuses it within 0.2 s, and leaves
+        the counter and the film where they were. A slide magazine is unmeasured.
+
+        NEXT moves a fixed distance rather than looking for the next gap, so an
+        offset still in force when it is sent carries over to the next frame.
 
         Raises ScanInProgress while a scan is running -- the worker thread owns the
         device -- and PieusbError on a scanner without a slide transport.
@@ -483,7 +478,6 @@ class Scanner:
         """NEXT or PREV, returning the frame counter before and after."""
         if not 1 <= frames <= 0xFF:
             raise ValueError(f"frames must be 1..255, got {frames}")
-        log.warning(UNVERIFIED_TRANSPORT)
         if not self._transport_initialized:
             self._slide(SLIDE_INIT, self._focus_for_scan())
         before = self.transport_state().frame
@@ -491,18 +485,13 @@ class Scanner:
         return before, self.transport_state().frame
 
     def offset_frame(self, mm: float) -> None:
-        """Shift the medium off its detected frame position by `mm`.
+        """Shift the medium off its frame position by `mm` of nominal travel.
 
-        For a filmstrip whose frame boundaries the scanner reads differently from
-        where the images actually are. The step is 1/240 inch and the move is
-        relative, so undo it with the opposite sign once the frame is scanned --
-        both vendor applications bracket a scan that way rather than tracking an
-        absolute position.
-
-        On a ProScan 4000 a positive `mm` moves the image content towards +x,
-        the way NEXT moves the film, and a step moves it about 0.115 mm rather
-        than the nominal 0.106 (tests/hwsuite.py's stepsize stage measures it).
-        Other models are unmeasured.
+        The step is 1/240 inch and the move is relative; a positive `mm` moves
+        the film the way NEXT does. What that does to the image depends on the
+        model: shift_image() takes a shift in image terms instead. Out-and-back
+        moves do not quite return: each round trip ends 0.2-0.6 mm off, always
+        the same way, so avoid undoing and redoing a correction.
         """
         self._require_slide_transport()
         steps = int(abs(mm) * OFFSET_STEPS_PER_MM)
@@ -511,13 +500,32 @@ class Scanner:
                 f"{mm} mm is {steps} steps of 1/{OFFSET_STEPS_PER_INCH} inch; "
                 f"the field carries 1..255"
             )
-        log.warning(UNVERIFIED_TRANSPORT)
         self._slide(SLIDE_OFFSET_FORWARD if mm > 0 else SLIDE_OFFSET_BACK, steps)
+
+    def shift_image(self, mm: float) -> float:
+        """Move the film so that the image content shifts `mm` towards +x, as
+        `pieusb.framing.FramePosition.shift_mm` asks, and return the shift the
+        whole steps sent amount to.
+
+        Converts with the model's measured `Capabilities.offset_mm_per_step`.
+        Raises PieusbError on a model where it is unmeasured, and ValueError for
+        a shift under half a step or over 255 steps.
+        """
+        self._require_slide_transport()
+        per_step = self.info.capabilities.offset_mm_per_step
+        if per_step is None:
+            raise PieusbError(f"{self.info.model}: the offset step is unmeasured; "
+                              f"use offset_frame()")
+        steps = round(mm / per_step)
+        if not 1 <= abs(steps) <= 0xFF:
+            raise ValueError(f"a {mm} mm shift is {abs(steps)} steps of {abs(per_step)} mm; "
+                             f"the field carries 1..255")
+        self._slide(SLIDE_OFFSET_FORWARD if steps > 0 else SLIDE_OFFSET_BACK, abs(steps))
+        return steps * per_step
 
     def eject(self, direction: EjectDirection = EjectDirection.UP) -> None:
         """Eject the medium, blocking until the transport is idle."""
         self._require_slide_transport()
-        log.warning(UNVERIFIED_TRANSPORT)
         action = (SLIDE_EJECT_UP if direction is EjectDirection.UP
                   else SLIDE_EJECT_DOWN)
         self._slide(action, 0x00)

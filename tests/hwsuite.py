@@ -11,10 +11,15 @@ Every stage declares a risk, and runs only if the profile admits that risk and
 the scanner has the hardware it drives:
 
     read-only   identity                       nothing changes
-    scan        default_scan, exposure         ordinary scans
+    scan        first_frame, default_scan,     ordinary scans
+                exposure, calibration, drift
     focus       autofocus                      moves the focus motor
-    transport   offsets, stepping, redetect,   moves film; also needs film loaded
-                rewind, walk, recovery
+    transport   offsets, stepsize, stepping,   moves film; also needs film loaded
+                reopen, redetect, rewind,
+                walk, recovery, prev_many,
+                framing, roll
+
+drift runs only with --soak-minutes, because it takes as long as it says.
 
 --profile characterize (the default) admits every risk; regression admits
 read-only and scan stages and runs the library exactly as configured for the
@@ -30,13 +35,21 @@ scanner reports (scan window, focus range) and library constants (offset step);
 expected results from what the library assumes (the exposure stage checks that
 exp_rel works on every pass). What is left are tolerances.
 
-Load film (for transport stages: a strip of colour negative at its first frame),
-start it, and leave it. It stops on its own: at the end of the strip, or at the
+Load film (for transport stages: a strip of colour negative, fed in fresh,
+before anything has moved it), start it, and leave it. It stops on its own: at the end of the strip, or at the
 first transport or focus command that fails, since carrying on after one risks
 the film. Every run ends by packing the output folder as <folder>.zip beside
 it, the one file to send back: suite.log has everything the terminal showed
 plus every command and reply, summary.json what each stage found and a
 suggested capability entry, and each stage's folder its scans as .npy.
+
+identity and first_frame record where a freshly loaded strip sits: READ
+STATE as the run found it (and whether that was the first read since
+power-up), and whether the gate shows a picture, blank film or clear film.
+
+calibration checks that a shading reference taken at the preview resolution
+serves a pass at the highest one. drift scans one frame on one reference for
+--soak-minutes, then once on a new one: lamp drift over a long roll.
 
 autofocus runs Scanner.autofocus(), then the same pass at 16 bits to compare
 line noise (a refusal is recorded, not fatal), then full scans of the patch over
@@ -49,6 +62,8 @@ Transport stages, in an order that needs no reloading:
     offsets      small offsets at 600 dpi, and the centring move CyberView uses,
                  each scanned and returned
     stepping     NEXT 1, NEXT 2, PREV with byte 3 = 1, PREV with byte 3 = 0
+    reopen       the Scanner closed and a new one opened: does READ STATE keep
+                 the frame counter, and does the film stay where it was
     redetect     NEXT after deliberately shifting the film each way: does NEXT
                  find the frame, or move a fixed distance? Then PREV and the
                  shift undone, so later stages start where this one did
@@ -57,10 +72,18 @@ Transport stages, in an order that needs no reloading:
     rewind       PREV back to frame 0, then a scan to compare with the start
     walk         every frame to the end: home and both centring offsets
     recovery     PREV from the end, and a scan
+    prev_many    one rewind() of one frame more than lies before the film: does
+                 the counter stop at 0, the film at the first frame, and the
+                 strip stay in. The suite stops if the strip leaves
     framing      back to frame 0, then every frame to the end as roll scanning
                  would: a preview, the frame located (pieusb.framing), one offset
                  to centre it and a check preview of where it landed. Preview
                  timings at a few resolutions on the first frame
+    roll         a roll as an application scans it: back to frame 0, autofocus
+                 and the exposure metered there and held, then every frame
+                 placed as framing does and scanned at --roll-dpi (kept as
+                 thumbnails). Then frame 0 again: placement and level after
+                 the roll
 
 A stage that runs out of film is recorded as partial and the suite goes on.
 The end of the strip is what Scanner.advance() reports (EndOfStrip). Each time
@@ -94,7 +117,7 @@ from pieusb.framing import (BAND_MIN_CLIPPED_PX, FRAME_MM, BandKind, FramePositi
                             find_bands, locate_frame)
 from pieusb.exceptions import DeviceNotReady, EndOfStrip, PieusbError, WarmingUp
 from pieusb.inquiry import MODEL_MOTORS
-from pieusb.option import EXPOSURE_TIME_MAX
+from pieusb.option import EXPOSURE_FACTOR_OPTIONS, EXPOSURE_TIME_MAX
 from pieusb.scanner import MM_PER_INCH, OFFSET_STEPS_PER_MM, Scanner
 from pieusb.transport import SLIDE_PREV
 
@@ -117,21 +140,29 @@ class Stage:
     risk: Risk
     # Transport stages also need film loaded, which only READ STATE can tell.
     needs_medium: bool = False
+    # The flag that turns on a stage no profile runs by itself, because it takes long.
+    opt_in: str | None = None
 
 
 STAGES = (
     Stage('identity', Risk.READ_ONLY),
+    Stage('first_frame', Risk.SCAN, needs_medium=True),
     Stage('default_scan', Risk.SCAN),
     Stage('exposure', Risk.SCAN),
+    Stage('calibration', Risk.SCAN),
+    Stage('drift', Risk.SCAN, opt_in='--soak-minutes'),
     Stage('autofocus', Risk.FOCUS),
     Stage('offsets', Risk.TRANSPORT, needs_medium=True),
     Stage('stepsize', Risk.TRANSPORT, needs_medium=True),
     Stage('stepping', Risk.TRANSPORT, needs_medium=True),
+    Stage('reopen', Risk.TRANSPORT, needs_medium=True),
     Stage('redetect', Risk.TRANSPORT, needs_medium=True),
     Stage('rewind', Risk.TRANSPORT, needs_medium=True),
     Stage('walk', Risk.TRANSPORT, needs_medium=True),
     Stage('recovery', Risk.TRANSPORT, needs_medium=True),
+    Stage('prev_many', Risk.TRANSPORT, needs_medium=True),
     Stage('framing', Risk.TRANSPORT, needs_medium=True),
+    Stage('roll', Risk.TRANSPORT, needs_medium=True),
 )
 STAGE_NAMES = tuple(s.name for s in STAGES)
 
@@ -195,6 +226,21 @@ AF_CHECK_MM = 3.0
 AF_CHECK_STEPS = (-4, -2, 0, 2, 4)
 AF_PICK_MIN = 0.97
 
+# READ STATE byte 7 bit set only on the first read after power-up.
+STATE_POWER_UP = 0x20
+# Two passes share a shading reference if a reusing pass's levels are within
+# this of a pass that took its own: the noise between repeat scans is ~1%.
+SHADING_MATCH = 0.03
+# The drift stage scans every SOAK_INTERVAL_S for --soak-minutes.
+SOAK_INTERVAL_S = 60
+# Two scans of one frame show the same placement if they differ by less than
+# this; NEXT and PREV land within 0.2-0.8 mm of each other on a ProScan 4000.
+SAME_PLACE_MM = 1.0
+# The roll stage's full scans, unless --roll-dpi says otherwise. Each is kept
+# only as a thumbnail, ROLL_THUMB_STEP pixels apart, to keep the zip small.
+ROLL_DPI = 2500
+ROLL_THUMB_STEP = 8
+
 
 class Halt(Exception):
     '''A motor command failed: stop the suite rather than move anything further.'''
@@ -215,14 +261,19 @@ def motors_for(model: int, allow: frozenset) -> frozenset:
     return allow
 
 
-def select_stages(profile: str, motors: frozenset, only=None) -> list[tuple[Stage, str | None]]:
-    '''Every stage, with the reason it will not run, or None if it will.'''
+def select_stages(profile: str, motors: frozenset, only=None,
+                  enabled: frozenset = frozenset()) -> list[tuple[Stage, str | None]]:
+    '''Every stage, with the reason it will not run, or None if it will.
+
+    `enabled` names the opt-in stages whose flag was given.'''
     plan = []
     for stage in STAGES:
         reason = None
         motor = RISK_MOTOR.get(stage.risk)
         if only is not None and stage.name not in only:
             reason = 'not selected by --only'
+        elif stage.opt_in and stage.name not in enabled:
+            reason = f"runs only with {stage.opt_in}"
         elif stage.risk > PROFILES[profile]:
             reason = f"the {profile} profile does not run {stage.risk.name.lower()} stages"
         elif motor is not None and motor not in motors:
@@ -333,6 +384,47 @@ def image_shift_px(a: numpy.ndarray, b: numpy.ndarray) -> int:
     return dx - w if dx > w // 2 else dx
 
 
+def aligned(a: numpy.ndarray, b: numpy.ndarray, shift_px: int):
+    '''The overlap of two scans whose content lies `shift_px` columns apart, b's
+    towards +x, as image_shift_px measures it.'''
+    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+    if shift_px >= 0:
+        return a[:h, :w - shift_px], b[:h, shift_px:w]
+    return a[:h, -shift_px:w], b[:h, :w + shift_px]
+
+
+def mean_ratio(base: numpy.ndarray, other: numpy.ndarray) -> list[float]:
+    '''Per channel, the mean of `other` over the mean of `base`. Unlike
+    level_ratio it does not need the two aligned to the pixel.'''
+    return [round(float(other[:, :, c].astype(numpy.float64).mean()
+                        / max(base[:, :, c].astype(numpy.float64).mean(), 1e-9)), 4)
+            for c in range(3)]
+
+
+def window_content(bands, frame: FramePosition | None, width_px: int) -> str:
+    '''What a scan of the gate shows: a picture, clear film (no film, or past
+    its end) over most of the window, or film with nothing on it.'''
+    if frame is not None:
+        return 'picture'
+    clear = sum(b.width for b in bands if b.kind is BandKind.CLEAR)
+    return 'clear' if clear > width_px / 2 else 'blank'
+
+
+def reopen_scanner(old: Scanner) -> Scanner:
+    '''Close a Scanner and open a new one on the same device.'''
+    info = old.info
+    old.close()
+    return Scanner(info)
+
+
+def copy_assigned_options(old: Scanner, new: Scanner) -> None:
+    '''Carry every option set on `old` over to `new`, so a reopen changes nothing else.'''
+    for par in old.params.table:
+        if par.assigned:
+            new.params[par.opt.name].value = par.value
+            new.params[par.opt.name].assigned = True
+
+
 def placement_fields(bands, frame: FramePosition | None) -> dict:
     fields = {'bands': [{'kind': b.kind.value, 'start': b.start, 'stop': b.stop,
                          'clipped': [b.clipped_start, b.clipped_stop],
@@ -349,9 +441,17 @@ def placement_fields(bands, frame: FramePosition | None) -> dict:
 
 
 class Suite:
-    def __init__(self, scanner: Scanner, out: Path) -> None:
+    def __init__(self, scanner: Scanner, out: Path, *, soak_minutes: float = 0,
+                 roll_dpi: int = ROLL_DPI, reopen=reopen_scanner, sleep=time.sleep) -> None:
         self.scanner = scanner
         self.out = out
+        self.soak_minutes = soak_minutes
+        self.roll_dpi = roll_dpi
+        self.reopen_scanner = reopen
+        self.sleep = sleep
+        # A scan of frame 0 at the preview resolution, for the stages that come
+        # back to it.
+        self.frame0: object | None = None
         self.stages: list[dict] = []
         self.record: dict | None = None
         self.started = time.monotonic()
@@ -365,7 +465,7 @@ class Suite:
         self.findings: dict = {}
         # Image millimetres per commanded millimetre of offset, signed: what the
         # stepsize stage and each framing correction measured. offset_scale is
-        # their median, None before any.
+        # their median, the model's measured step before any.
         self.scale_samples: list[float] = []
         self.scan_args = SimpleNamespace(png=False, tiff=False)
 
@@ -412,7 +512,9 @@ class Suite:
                            'status': 'running', 'events': []}
             self.stages.append(self.record)
             if reason is None and stage.needs_medium and not self.medium_present:
-                reason = 'no film loaded according to READ STATE'
+                reason = ('no film transport on this model'
+                          if not self.scanner.info.capabilities.film_transport
+                          else 'no film loaded according to READ STATE')
             if reason is not None:
                 self.record['status'] = 'skipped'
                 self.record['note'] = reason
@@ -447,6 +549,7 @@ class Suite:
                   f"in {self.record['duration_s']:.0f}s")
             if status:
                 break
+        self.write_summary()
         return status
 
     # --- primitives -------------------------------------------------------
@@ -467,11 +570,13 @@ class Suite:
             return None
         fields = dict(frame=s.frame, focus=s.focus, focus_max=s.focus_max,
                       flags=f"0x{s.flags:02x}", medium_present=s.medium_present,
-                      raw=s.raw.hex(' '))
+                      filmstrip_carrier=s.filmstrip_carrier, raw=s.raw.hex(' '))
         self.event(op=label, **fields)
         return fields
 
-    def scan(self, name: str):
+    def scan(self, name: str, keep: bool = True):
+        '''One pass, saved in the stage's folder. With `keep` False only a
+        thumbnail is saved, ROLL_THUMB_STEP pixels apart.'''
         stage_dir = self.out / self.record['stage']
         n = sum(1 for e in self.record['events'] if e['op'] == 'scan') + 1
         prefix = stage_dir / f"{n:02d}_{name}"
@@ -484,7 +589,13 @@ class Suite:
         if r is None or r.error is not None:
             raise RuntimeError(f"scan {name} did not complete")
         self.scans_here.append((self.unreturned_mm, r))
-        self.event(op='scan', name=name, file=f"{prefix.relative_to(self.out)}_rgb.npy",
+        file = f"{prefix.relative_to(self.out)}_rgb.npy"
+        if not keep:
+            for suffix in ('_rgb.npy', '_ir.npy'):
+                prefix.with_name(prefix.name + suffix).unlink(missing_ok=True)
+            file = f"{prefix.relative_to(self.out)}_thumb.npy"
+            numpy.save(self.out / file, r.rgb[::ROLL_THUMB_STEP, ::ROLL_THUMB_STEP])
+        self.event(op='scan', name=name, file=file,
                    width=r.width, height=r.height, resolution=r.resolution,
                    focus=self.focus(), shading_acquired=r.shading_acquired,
                    exposure_factor=r.exposure_factor, exposure=r.exposure, gain=r.gain,
@@ -502,6 +613,8 @@ class Suite:
         try:
             if op == 'next':
                 moved = self.scanner.advance(value)
+            elif op == 'rewind':
+                moved = self.scanner.rewind(value)
             elif op == 'prev':
                 self.scanner._slide(SLIDE_PREV, value, byte3=self.prev_byte3)
             elif op == 'prev0':
@@ -525,7 +638,8 @@ class Suite:
             # so record what was outstanding rather than guess.
             self.event(op='unreturned_offset', mm=self.unreturned_mm, before=op)
         after = self.state('after')
-        extra = {} if op != 'next' else {'moved': moved, 'end_of_strip': end is not None}
+        extra = ({'moved': moved, 'end_of_strip': end is not None} if op == 'next'
+                 else {'moved': moved} if op == 'rewind' else {})
         self.event(op=op, value=value, busy_s=busy,
                    frame_before=before and before['frame'],
                    frame_after=after and after['frame'], **extra)
@@ -610,9 +724,33 @@ class Suite:
         if self.scanner.info.capabilities.film_transport:
             state = self.state()
             self.medium_present = bool(state and state['medium_present'])
+            if state:
+                raw = bytes.fromhex(state['raw'])
+                self.findings['load'] = {
+                    'first_read': state['raw'], 'counter': state['frame'],
+                    'power_up_read': bool(raw[7] & STATE_POWER_UP) if len(raw) > 7 else None,
+                    'medium_present': state['medium_present'],
+                    'filmstrip_carrier': state['filmstrip_carrier']}
             if state and state['frame'] != 0:
                 print(f"\nNote: the frame counter reads {state['frame']}, not 0. "
                       f"Running from here.")
+
+    def first_frame(self) -> None:
+        '''What the gate shows before anything has moved the film: a picture,
+        film with nothing on it, or clear film. With the counter identity read,
+        this is where a loaded strip starts; prev_many says whether a frame lies
+        before it.'''
+        self.full_frame(self.preview_dpi)
+        state = self.state('start')
+        r = self.scan('start')
+        frame, bands = self.locate(r)
+        content = window_content(bands, frame, r.rgb.shape[1])
+        load = self.findings.setdefault('load', {})
+        load.update(counter_at_start=state and state['frame'], content=content,
+                    shift_mm=frame and round(frame.shift_mm, 2))
+        if state and state['frame'] == 0:
+            self.frame0 = r
+        print(f"\nthe gate shows {content} at counter {state and state['frame']}")
 
     def default_scan(self) -> None:
         '''One scan exactly as the library configures this model.'''
@@ -668,6 +806,68 @@ class Suite:
         print(f"\nexposure: exp_rel {'doubles' if supported else 'does NOT double'} the "
               f"image on both kinds of pass" + ("" if supported else "   <- MISMATCH: the "
               "library's exposure does not work as it assumes on this model"))
+
+    def centre_square(self, size_mm: float, dpi: int) -> None:
+        '''Window a square of `size_mm` at the patch's centre.'''
+        inq = self.scanner.params.inq
+        cx = (self.patch_mm[0] + self.patch_mm[2]) / 2
+        cy = (self.patch_mm[1] + self.patch_mm[3]) / 2
+        half = size_mm / 2
+        ex.set_frame(self.scanner, *(ex.mm_to_native(v, inq) for v in
+                                     (cx - half, cy - half, cx + half, cy + half)))
+        self.set(resolution=dpi)
+
+    def calibration(self) -> None:
+        '''Whether a shading reference taken at the preview resolution serves a
+        pass at the highest one, as a roll of previews and full scans needs: a
+        pass that may reuse it, against one that takes its own.'''
+        dpi = self.scanner.params.inq.max_resolution_x
+        self.full_frame(self.preview_dpi)
+        self.set(reuse_calibration=False)
+        try:
+            self.scan('preview_calibrating')
+            self.centre_square(AF_CHECK_MM, dpi)
+            self.set(reuse_calibration=True)
+            reusing = self.scan('full_res_reusing')
+            self.set(reuse_calibration=False)
+            own = self.scan('full_res_calibrating')
+        finally:
+            self.unset('reuse_calibration')
+        ratios = level_ratio(own.rgb, reusing.rgb)
+        reused = not reusing.shading_acquired
+        matches = all(abs(v - 1) <= SHADING_MATCH for v in ratios)
+        self.record.update(dpi=dpi, reused=reused, level_vs_own=ratios, matches=matches)
+        self.findings['shading_shared_across_resolution'] = reused and matches
+        print(f"\na {dpi} dpi pass {'reused' if reused else 'did NOT reuse'} the "
+              f"{self.preview_dpi} dpi reference; level against its own: {ratios}")
+
+    def drift(self) -> None:
+        '''The lamp over --soak-minutes, on whatever is in the gate: passes that
+        reuse one shading reference, every SOAK_INTERVAL_S, against the pass that
+        took it, then one pass that takes its own. Reused passes that drift while
+        the last does not mean a long roll needs a new reference now and then.'''
+        self.full_frame(self.preview_dpi)
+        self.set(reuse_calibration=False)
+        reference = self.scan('reference')
+        started = time.monotonic()
+        samples = []
+        try:
+            self.set(reuse_calibration=True)
+            for i in range(1, max(1, round(self.soak_minutes * 60 / SOAK_INTERVAL_S)) + 1):
+                self.sleep(max(0.0, started + i * SOAK_INTERVAL_S - time.monotonic()))
+                r = self.scan('soak')
+                samples.append({'minutes': round((time.monotonic() - started) / 60, 1),
+                                'level': level_ratio(reference.rgb, r.rgb)})
+                print(f"after {samples[-1]['minutes']} min: level x {samples[-1]['level']}")
+            self.set(reuse_calibration=False)
+            fresh = level_ratio(reference.rgb, self.scan('fresh').rgb)
+        finally:
+            self.unset('reuse_calibration')
+        worst = max(abs(v - 1) for sample in samples for v in sample['level'])
+        self.record.update(samples=samples, fresh_level=fresh, worst_reused=round(worst, 4))
+        self.findings['drift'] = {'minutes': self.soak_minutes,
+                                  'worst_reused': round(worst, 4), 'fresh_level': fresh}
+        print(f"\nreused passes drifted up to {worst:.1%}; a fresh one reads x {fresh}")
 
     # --- focus ------------------------------------------------------------
 
@@ -843,6 +1043,38 @@ class Suite:
             self.prev_byte3 = 0x00
         self.record['prev_byte3_used_from_here'] = self.prev_byte3
 
+    def reopen(self) -> None:
+        '''Whether the frame counter and the film's place survive closing the
+        Scanner and opening a new one: READ STATE before any command, then a
+        scan, which runs the transport's INIT first.'''
+        self.full_frame(self.preview_dpi)
+        before_state = self.state('before_close')
+        if before_state is None:
+            raise Skip("the scanner reports no READ STATE")
+        if before_state['frame'] == 0:
+            # A counter at 0 could not show a reset.
+            self.next(1)
+            before_state = self.state('before_close')
+        before = self.scan('before_close')
+        old = self.scanner
+        try:
+            self.scanner = self.reopen_scanner(old)
+        except PieusbError as e:
+            raise Halt(f"could not open the scanner again: {type(e).__name__}: {e}") from e
+        copy_assigned_options(old, self.scanner)
+        after_state = self.state('after_reopen')
+        after = self.scan('after_reopen')
+        shift = image_shift_px(before.rgb, after.rgb) / (self.preview_dpi / MM_PER_INCH)
+        kept = after_state is not None and after_state['frame'] == before_state['frame']
+        result = {'counter_before': before_state['frame'],
+                  'counter_after': after_state and after_state['frame'],
+                  'counter_kept': kept, 'film_shift_mm': round(shift, 2),
+                  'film_stayed': abs(shift) < SAME_PLACE_MM}
+        self.record.update(result)
+        self.findings['reopen'] = result
+        print(f"\nafter reopening: counter {result['counter_before']} -> "
+              f"{result['counter_after']}, film moved {shift:+.2f} mm")
+
     def redetect(self) -> None:
         self.full_frame(self.preview_dpi)
         self.scan('home')
@@ -875,7 +1107,7 @@ class Suite:
     def rewind(self) -> None:
         self.full_frame(self.preview_dpi)
         self.to_first_frame()
-        self.scan('start_again')
+        self.frame0 = self.scan('start_again')
 
     def walk(self) -> None:
         self.full_frame(self.preview_dpi)
@@ -894,9 +1126,48 @@ class Suite:
         self.move('prev', 1)
         self.scan('back_from_end')
 
+    def prev_many(self) -> None:
+        '''One rewind for one frame more than lies before the film, as a roll
+        scan goes back to its start in one command: whether the counter stops at
+        0, the film at the first frame, and the strip stays in. One more, not
+        255, so a transport that keeps feeding backwards moves one frame's worth.'''
+        self.full_frame(self.preview_dpi)
+        state = self.state('start')
+        if state is None or state['frame'] == 0:
+            raise Skip("the film is at frame 0: nothing lies before it")
+        frames = state['frame'] + 1
+        # The library's rewind() sends byte 3 = 1; fall back where only 0 worked.
+        op = 'rewind' if self.prev_byte3 == 0x01 else 'prev'
+        _, after = self.move(op, frames)
+        result = {'from': state['frame'], 'asked': frames, 'op': op,
+                  'counter_after': after and after['frame'],
+                  'medium_present': after and after['medium_present']}
+        self.findings['prev_past_first'] = result
+        self.record.update(result)
+        if after is not None and not after['medium_present']:
+            raise Halt(f"a rewind of {frames} from frame {state['frame']} took the strip out")
+        r = self.scan('after_prev_many')
+        if self.frame0 is None or self.frame0.rgb.shape != r.rgb.shape:
+            result['at_first_frame'] = None
+            return
+        shift_px = image_shift_px(self.frame0.rgb, r.rgb)
+        a, b = aligned(self.frame0.rgb, r.rgb, shift_px)
+        diff = image_difference(a, b)
+        result.update(shift_mm=round(shift_px / (self.preview_dpi / MM_PER_INCH), 2),
+                      difference=round(diff, 4),
+                      at_first_frame=result['counter_after'] == 0 and diff < END_OF_STRIP_MOVED)
+        print(f"\nrewind {frames} from frame {state['frame']}: counter "
+              f"{result['counter_after']}, {'at' if result['at_first_frame'] else 'NOT at'} "
+              f"the first frame ({result['shift_mm']:+.2f} mm, difference {diff:.3f})")
+
     @property
     def offset_scale(self) -> float | None:
-        return float(numpy.median(self.scale_samples)) if self.scale_samples else None
+        '''Image mm per nominal mm of offset: measured on this run, else the
+        model's Capabilities.offset_mm_per_step, else unknown.'''
+        if self.scale_samples:
+            return float(numpy.median(self.scale_samples))
+        per_step = self.scanner.info.capabilities.offset_mm_per_step
+        return per_step * OFFSET_STEPS_PER_MM if per_step is not None else None
 
     def locate(self, r, frame_mm: float = FRAME_MM, label: str = 'located',
                base_levels: list[float] | None = None):
@@ -912,17 +1183,78 @@ class Suite:
         self.event(op=label, **placement_fields(bands, frame))
         return frame, bands
 
-    def framing(self) -> None:
-        '''Roll scanning's positioning loop, every frame from the first.
+    def centre(self, entry: dict, frame_mm: float, base_levels: list, widths: list,
+               residuals: list):
+        '''Roll scanning's placement of the frame in the gate: a preview, the frame
+        located, one offset by its shift from centre (converted with the measured
+        offset scale, learnt from the first correction if stepsize did not run),
+        and a check preview whose remaining shift is the loop's error. Every
+        correction is also a sample of the offset scale, so one bad measurement
+        cannot steer the rest. Fills `entry`, and returns the frame width learnt
+        from frames whose edges both showed and the last preview.'''
+        r = self.scan('preview')
+        frame, bands = self.locate(r, frame_mm, base_levels=base_levels)
+        if frame is None:
+            entry['result'] = 'no frame'
+            return frame_mm, r
+        entry.update(shift_mm=round(frame.shift_mm, 3), measured=frame.measured,
+                     confidence=round(frame.confidence, 2))
+        if frame.measured_start and frame.measured_stop:
+            widths.append(frame.width_mm)
+            frame_mm = float(numpy.median(widths))
+        if not frame.measured:
+            # No band at all: the picture runs to both edges, so the gaps
+            # lie outside the window and the frame is about centred.
+            entry['result'] = 'fills the window' if not bands else 'no edge seen'
+            return frame_mm, r
+        if abs(frame.shift_mm) < FRAMING_MIN_SHIFT_MM:
+            entry['result'] = 'centred'
+            return frame_mm, r
+        steps = round(abs(frame.shift_mm / (self.offset_scale or 1.0))
+                      * OFFSET_STEPS_PER_MM)
+        if not 1 <= steps <= 0xFF:
+            entry['result'] = 'centred' if not steps else 'shift beyond one offset'
+            return frame_mm, r
+        direction = 1 if frame.shift_mm * (self.offset_scale or 1.0) > 0 else -1
+        # What the steps sent amount to; a hair over so offset_frame's
+        # truncation lands on them exactly.
+        commanded = direction * steps / OFFSET_STEPS_PER_MM
+        self.move('offset', round(direction * (steps + 0.01) / OFFSET_STEPS_PER_MM, 3))
+        check = self.scan('check')
+        after, after_bands = self.locate(check, frame_mm, 'checked', base_levels)
+        entry.update(commanded_steps=direction * steps, commanded_mm=round(commanded, 3))
+        if after is not None and not after_bands:
+            # The gap left the window and the picture fills it: centred to
+            # within what the window shows.
+            entry['result'] = 'moved out of view'
+            return frame_mm, check
+        if after is None or not after.measured:
+            entry['result'] = 'lost after the move'
+            return frame_mm, check
+        moved = frame.shift_mm - after.shift_mm
+        entry.update(result='corrected', residual_mm=round(after.shift_mm, 3),
+                     moved_mm=round(moved, 3))
+        residuals.append(after.shift_mm)
+        if abs(commanded) >= FRAMING_SCALE_MIN_MM:
+            self.scale_samples.append(moved / commanded)
+            entry['offset_scale_sample'] = round(moved / commanded, 4)
+        print(f"frame {entry['index']}: shift {frame.shift_mm:+.2f} mm, "
+              f"left {after.shift_mm:+.2f} mm")
+        return frame_mm, check
 
-        Each frame: NEXT, a preview, the frame located, one offset by its shift
-        from centre (converted with the measured offset scale, learnt from the
-        first correction if stepsize did not run), and a check preview whose
-        remaining shift is the loop's error. Every correction is also a sample
-        of the offset scale, so one bad measurement cannot steer the rest.
-        Corrections are not undone: NEXT carries them to the next frame. The frame width is learnt from frames
-        whose edges both showed.
-        '''
+    def record_placement(self, frame_mm: float, widths: list, residuals: list) -> None:
+        self.record.update(frame_mm=round(frame_mm, 2),
+                           frame_widths_mm=[round(w, 2) for w in widths],
+                           offset_scale=self.offset_scale and round(self.offset_scale, 4))
+        if residuals:
+            r = numpy.abs(residuals)
+            self.record['residual_mm'] = {'median': round(float(numpy.median(r)), 3),
+                                          'max': round(float(r.max()), 3)}
+
+    def framing(self) -> None:
+        '''Roll scanning's positioning loop, every frame from the first: each
+        frame placed by centre(). Corrections are not undone: NEXT carries them
+        to the next frame.'''
         self.full_frame(self.preview_dpi)
         self.to_first_frame()
         frame_mm = FRAME_MM
@@ -937,58 +1269,86 @@ class Suite:
                     self.next(1)
                 entry = {'index': index}
                 frames.append(entry)
-                frame, bands = self.locate(self.scan('preview'), frame_mm,
-                                           base_levels=base_levels)
-                if frame is None:
-                    entry['result'] = 'no frame'
-                    continue
-                entry.update(shift_mm=round(frame.shift_mm, 3), measured=frame.measured,
-                             confidence=round(frame.confidence, 2))
-                if frame.measured_start and frame.measured_stop:
-                    widths.append(frame.width_mm)
-                    frame_mm = float(numpy.median(widths))
-                if not frame.measured:
-                    # No band at all: the picture runs to both edges, so the gaps
-                    # lie outside the window and the frame is about centred.
-                    entry['result'] = 'fills the window' if not bands else 'no edge seen'
-                    continue
-                if abs(frame.shift_mm) < FRAMING_MIN_SHIFT_MM:
-                    entry['result'] = 'centred'
-                    continue
-                steps = round(abs(frame.shift_mm / (self.offset_scale or 1.0))
-                              * OFFSET_STEPS_PER_MM)
-                if not 1 <= steps <= 0xFF:
-                    entry['result'] = 'centred' if not steps else 'shift beyond one offset'
-                    continue
-                direction = 1 if frame.shift_mm * (self.offset_scale or 1.0) > 0 else -1
-                # What the steps sent amount to; a hair over so offset_frame's
-                # truncation lands on them exactly.
-                commanded = direction * steps / OFFSET_STEPS_PER_MM
-                self.move('offset', round(direction * (steps + 0.01) / OFFSET_STEPS_PER_MM, 3))
-                after, _ = self.locate(self.scan('check'), frame_mm, 'checked', base_levels)
-                entry.update(commanded_steps=direction * steps,
-                             commanded_mm=round(commanded, 3))
-                if after is None or not after.measured:
-                    entry['result'] = 'lost after the move'
-                    continue
-                moved = frame.shift_mm - after.shift_mm
-                entry.update(result='corrected', residual_mm=round(after.shift_mm, 3),
-                             moved_mm=round(moved, 3))
-                residuals.append(after.shift_mm)
-                if abs(commanded) >= FRAMING_SCALE_MIN_MM:
-                    self.scale_samples.append(moved / commanded)
-                    entry['offset_scale_sample'] = round(moved / commanded, 4)
-                print(f"frame {index}: shift {frame.shift_mm:+.2f} mm, "
-                      f"left {after.shift_mm:+.2f} mm")
+                frame_mm, _ = self.centre(entry, frame_mm, base_levels, widths, residuals)
         finally:
             self.unset('reuse_calibration')
-            self.record.update(frame_mm=round(frame_mm, 2),
-                               frame_widths_mm=[round(w, 2) for w in widths],
-                               offset_scale=self.offset_scale and round(self.offset_scale, 4))
-            if residuals:
-                r = numpy.abs(residuals)
-                self.record['residual_mm'] = {'median': round(float(numpy.median(r)), 3),
-                                              'max': round(float(r.max()), 3)}
+            self.record_placement(frame_mm, widths, residuals)
+
+    def roll(self) -> None:
+        '''A roll scanned as an application would, start to end. Back to frame
+        0; there the frame is placed, autofocus runs and the exposure is metered,
+        and both are held for the rest of the roll. Each frame is placed by
+        centre() and scanned at --roll-dpi, all from one shading reference where
+        the scanner allows. Then back to frame 0, to see how far its placement
+        and level moved over the roll.'''
+        self.full_frame(self.preview_dpi)
+        self.to_first_frame()
+        frame_mm = FRAME_MM
+        widths, residuals, base_levels = [], [], []
+        self.record['frames'] = frames = []
+        started = time.monotonic()
+        try:
+            self.set(reuse_calibration=True)
+            for index in range(MAX_WALK_FRAMES):
+                if index:
+                    try:
+                        self.next(1)
+                    except EndOfStrip:
+                        break
+                entry = {'index': index}
+                frames.append(entry)
+                frame_mm, _ = self.centre(entry, frame_mm, base_levels, widths, residuals)
+                if index == 0:
+                    self.hold_focus_and_exposure()
+                    reference = self.scan('reference')
+                self.full_frame(self.roll_dpi)
+                r = self.scan('frame', keep=False)
+                entry.update(scan_s=round(r.duration_s, 1), shading_acquired=r.shading_acquired)
+                self.full_frame(self.preview_dpi)
+            minutes = round((time.monotonic() - started) / 60, 1)
+            self.to_first_frame()
+            again = self.scan('first_again')
+        finally:
+            self.unset('reuse_calibration', 'auto_exp', *EXPOSURE_FACTOR_OPTIONS)
+            self.record_placement(frame_mm, widths, residuals)
+        shift_px = image_shift_px(reference.rgb, again.rgb)
+        a, b = aligned(reference.rgb, again.rgb, shift_px)
+        analyses = sum(1 for e in self.record['events']
+                       if e['op'] == 'scan' and e.get('shading_acquired'))
+        result = {'frames': len(frames), 'minutes': minutes,
+                  'corrected': sum(1 for f in frames
+                                   if f.get('result') in ('corrected', 'moved out of view')),
+                  'unplaced': [f['index'] for f in frames if f.get('result') in
+                               ('no frame', 'no edge seen', 'lost after the move',
+                                'shift beyond one offset')],
+                  'residual_mm_max': self.record.get('residual_mm', {}).get('max'),
+                  'shading_analyses': analyses,
+                  'return_shift_mm': round(shift_px / (self.preview_dpi / MM_PER_INCH), 2),
+                  'return_level': mean_ratio(a, b),
+                  'focus': self.record.get('autofocus'),
+                  'exposure_lock': self.record.get('exposure_lock')}
+        self.findings['roll'] = result
+        print(f"\nroll: {result['frames']} frames in {minutes} min, "
+              f"{result['shading_analyses']} shading analyses; back at frame 0 "
+              f"{result['return_shift_mm']:+.2f} mm off, level x {result['return_level']}")
+
+    def hold_focus_and_exposure(self) -> None:
+        '''Autofocus and meter the frame in the gate, and keep both as options.'''
+        if self.scanner.info.capabilities.focus:
+            try:
+                af = self.scanner.autofocus()
+            except PieusbError as e:
+                raise Halt(f"autofocus failed: {type(e).__name__}: {e}") from e
+            self.record['autofocus'] = {'focus': af.focus, 'peaked': af.peaked,
+                                        'depth': round(af.depth, 4)}
+        self.set(auto_exp=True)
+        try:
+            factor = self.scan('meter').exposure_factor
+        finally:
+            self.unset('auto_exp')
+        self.record['exposure_lock'] = factor and [round(v, 4) for v in factor]
+        if factor:
+            self.set(**dict(zip(EXPOSURE_FACTOR_OPTIONS, factor)))
 
     def preview_timings(self) -> None:
         '''One preview at each PREVIEW_TIMING_DPI on the current frame: how long it
@@ -1033,6 +1393,11 @@ def parse_args(argv=None):
                    help='do not ask the closing question')
     p.add_argument('--warmup-timeout', type=float, default=300, metavar='S',
                    help='how long to wait for the lamp (default: 300)')
+    p.add_argument('--soak-minutes', type=float, default=0, metavar='MIN',
+                   help='run the drift stage: scan the frame in the gate every '
+                        f'{SOAK_INTERVAL_S} s for MIN minutes on one shading reference')
+    p.add_argument('--roll-dpi', type=int, default=ROLL_DPI, metavar='DPI',
+                   help=f"resolution of the roll stage's full scans (default: {ROLL_DPI})")
     return p.parse_args(argv)
 
 
@@ -1093,7 +1458,8 @@ def run_suite(args, out: Path, allow: frozenset, only) -> int:
     if args.profile == 'regression':
         # Regression runs the library exactly as configured for the model.
         motors = frozenset()
-    plan = select_stages(args.profile, motors, only)
+    enabled = frozenset({'drift'} if args.soak_minutes > 0 else ())
+    plan = select_stages(args.profile, motors, only, enabled)
     log.info(f"[suite] {info.model} (model 0x{model:04x}), profile {args.profile}, "
              f"motors {', '.join(sorted(motors)) or 'none'}")
     for stage, reason in plan:
@@ -1111,7 +1477,8 @@ def run_suite(args, out: Path, allow: frozenset, only) -> int:
         except (WarmingUp, DeviceNotReady) as e:
             print(f"Not ready: {e}")
             return 1
-        suite = Suite(scanner, out)
+        suite = Suite(scanner, out, soak_minutes=args.soak_minutes,
+                      roll_dpi=min(args.roll_dpi, info.inquiry.max_resolution_x))
         extra = dict(output=str(out), notes=args.note, profile=args.profile,
                      model=f"0x{model:04x}", model_name=info.model,
                      motors=sorted(motors))
@@ -1124,6 +1491,9 @@ def run_suite(args, out: Path, allow: frozenset, only) -> int:
             status = 130
         finally:
             suite.write_summary(**extra)
+            # The reopen stage replaces the Scanner this block opened.
+            if suite.scanner is not scanner:
+                suite.scanner.close()
 
     print(f"\nSuggested capabilities: {suite.suggested_capabilities()}")
     if not args.no_ask:

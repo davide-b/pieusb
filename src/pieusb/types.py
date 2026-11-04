@@ -42,11 +42,16 @@ class EjectDirection(StrEnum):
 class Capabilities:
     '''Per-model facts INQUIRY does not report, keyed on model number in
     inquiry.DEVICE_CAPABILITIES.'''
-    # Whether the hardware has a film transport. Scanner does not drive the
-    # ProScan 4000's; InquiryResponse.slide_transport is that gate.
+    # Whether the Scanner drives a film transport: advance(), rewind(),
+    # offset_frame(), eject() and transport_state(). Copied to
+    # InquiryResponse.slide_transport.
     film_transport: bool = False
     # Whether SCSI_SLIDE action 0x10 moves a focus motor.
     focus: bool = False
+    # How far one offset step moves the image content towards +x, in mm, as
+    # measured on a filmstrip; None where unmeasured. Scanner.shift_image()
+    # converts with it.
+    offset_mm_per_step: float | None = None
 
 @dataclass(frozen=True)
 class InquiryResponse:
@@ -96,7 +101,7 @@ class DeviceInfo:
     capabilities: Capabilities = field(default_factory=Capabilities)
 
 class ScanPhase(StrEnum):
-    # Never emitted. Kept so consumers matching on it still compile.
+    # The metering pass that auto_exp runs before the scan.
     METERING = 'Metering'
     CONFIGURING = 'Configuring'
     WARMING_UP = 'Warming up'

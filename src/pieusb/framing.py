@@ -262,7 +262,7 @@ class FramePosition:
     otherwise the step strength of the measured edges, from Band.
 
     `shift_mm` is how far the image content must move towards +x to centre the
-    frame in the window. `overhang_mm` is how much of the frame lies past each
+    frame in the window; Scanner.shift_image() takes it as is. `overhang_mm` is how much of the frame lies past each
     edge of the image now, (left, right), 0 where it is inside.
     '''
     start: float
