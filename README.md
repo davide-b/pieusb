@@ -28,6 +28,7 @@ grants a group instead of the logged-in user (for headless machines), and
 
 ```shell
 sudo tee /etc/udev/rules.d/60-pieusb.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0126", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0142", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0143", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0144", TAG+="uaccess"

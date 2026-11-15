@@ -96,6 +96,7 @@ local SLIDE_ACTIONS = {
 }
 
 local MODELS = {
+    [0x0027] = "ProScan 3600",
     [0x002c] = "ProScan 4000",
     [0x002e] = "CrystalScan 3600",
     [0x002f] = "DigitDia 4000",

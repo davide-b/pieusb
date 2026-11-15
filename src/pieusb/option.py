@@ -153,7 +153,7 @@ DOUBLE_TIMES = 0
 # that with ILLEGAL REQUEST / parameter list length error while its own driver
 # sends 23 (captures/ProScan4000.pcapng, transaction 72). Tried in this order so a
 # scanner that takes the padded form keeps getting it.
-GAIN_OFFSET_LENGTHS = (29, 23)
+GAIN_OFFSET_LENGTHS = (29, 23, 18)
 
 class Unit(Enum):
     MM = 0

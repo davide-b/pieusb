@@ -12,10 +12,11 @@ import struct
 
 PIE_VENDOR_ID = 0x05E3
 
-KNOWN_PIDS = [0x0142, 0x0143, 0x0144, 0x0145]
+KNOWN_PIDS = [0x0126, 0x0142, 0x0143, 0x0144, 0x0145]
 
 # Model number, INQUIRY offset 116.
 MODEL_NAMES = {
+    0x0027: 'ProScan 3600',
     0x002c: 'ProScan 4000',
     0x003a: 'DigitDia 6000 Multiple Slide Scanner',
     0x0030: 'CrystalScan 7200',
@@ -29,6 +30,8 @@ MODEL_NAMES = {
 # Per-model knowledge, in the spirit of SANE's pieusb.conf flags. A model absent
 # here gets the conservative Capabilities() defaults.
 DEVICE_CAPABILITIES = {
+    0x0027: Capabilities(film_transport=True, focus=True,    # ProScan 3600
+                         offset_mm_per_step=0.1164),
     0x002c: Capabilities(film_transport=True, focus=True,    # ProScan 4000
                          offset_mm_per_step=0.1164),
     0x0048: Capabilities(film_transport=True, focus=True,    # RPS 10M
@@ -44,6 +47,7 @@ DEVICE_CAPABILITIES = {
 MODEL_MOTORS = {
     0x0047: frozenset(),                              # ProScan 10T
     0x0048: frozenset({'film_transport', 'focus'}),   # RPS 10M
+    0x0027: frozenset({'film_transport', 'focus'}),   # ProScan 3600
     0x002c: frozenset({'film_transport', 'focus'}),   # ProScan 4000
 }
 

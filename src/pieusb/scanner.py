@@ -1152,6 +1152,8 @@ class Scanner:
         if acquire:
             emit(UpdateData(phase=ScanPhase.CALIBRATING))
 
+            #FIXME: ProScan 3600 fails here
+
             # Shading data is always 16-bit, with the same two-byte channel tag
             # per line as the image data. The C reads 4 * entry[0].nLines
             # (pieusb_specific.c:2078); summing over the entries agrees with that
