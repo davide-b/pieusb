@@ -4,7 +4,7 @@ Python package to enable interfacing with USB-connected Reflecta (a.k.a. Pacific
 
 # Testers wanted!
 
-![Discord Banner 2](https://discord.com/api/guilds/1545399511654998109/widget.png?style=banner2)
+[![Discord Banner 2](https://discord.com/api/guilds/1545399511654998109/widget.png?style=banner2)](https://discord.gg/nsPsg48cPp)
 
 ## Prerequisites
 
