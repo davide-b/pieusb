@@ -21,6 +21,7 @@ from pieusb.types import (
     AutofocusResult,
     DeviceInfo,
     EjectDirection,
+    Filter,
     UpdateData,
     ScanResult,
     ScanPhase
@@ -71,6 +72,19 @@ log = logging.getLogger(__name__)
 # requesting more than 255 lines in one call returns banded images.
 MAX_LINES_PER_READ = 255
 
+# WRITE sub-commands a ProScan 3600 wants before GET PARAMETERS: a shading table
+# (three tagged lines) and one curve table per channel (a filter mask, then 4096
+# x u16). The tags and filters are the masks of R, G and B.
+SHADING_TABLE_CMD = 0x0016
+CURVE_TABLE_CMD = 0x0010
+CURVE_TABLE_ENTRIES = 4096
+CHANNEL_MASKS = (0x0002, 0x0004, 0x0008)
+# CyberView's shading table fits T = SLOPE * (LEVEL - raw), raw being the average
+# of that channel's shading reads: slope 1.36-1.44 and level 3983-4006 over ten
+# scans, whatever the dpi, bit depth or film.
+SHADING_SLOPE = 1.4
+SHADING_LEVEL = 4000
+
 # Every line the scanner returns in INDEX colour format is prefixed by a two-byte
 # channel tag.
 TAG_TO_CHANNEL = {b'RR': 0, b'GG': 1, b'BB': 2, b'II': 3}
@@ -117,8 +131,8 @@ AUTOFOCUS_SMOOTHING = 5
 AUTOFOCUS_MIN_DEPTH = 1.115
 
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
-START_SCAN_ATTEMPTS = 30
-START_SCAN_RETRY_S = 5
+START_SCAN_ATTEMPTS = 150
+START_SCAN_RETRY_S = 1
 
 # How long close() waits for a cancelled worker to notice. Cancellation lands at
 # the next chunk boundary, so the bound is one outstanding command.
@@ -222,6 +236,7 @@ class _ShadingReference:
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
+        self.dev.bulk_announce_max = info.capabilities.bulk_announce_max
         self.scan_thread: threading.Thread | None = None
         self.on_update: Callable[[UpdateData], None] | None = None
         self.on_complete: Callable[[ScanResult], None] | None = None
@@ -652,6 +667,12 @@ class Scanner:
                 "n_lines": raw[off + 3],
                 "pixels_per_line": struct.unpack_from("<H", raw, off + 4)[0],
             })
+        # ProScan 3600: the report lists 4 entries (40 lines), but a 40-line READ
+        # (413840 bytes) times out even when announced in pieces. CyberView and
+        # VueScan read only the first three, the colour ones, 30 lines. A device
+        # without an infrared filter gets only the three colour entries.
+        if Filter.INFRARED not in self.info.inquiry.filters:
+            entries = entries[:3]
         return entries
 
     def _get_scan_parameters(self):
@@ -665,7 +686,42 @@ class Scanner:
             "available_lines": struct.unpack_from("<H", raw, 14)[0],
         }
 
-    def _get_ccd_mask(self, mask_size):
+    def _upload_shading_tables(self, shading_raw: bytes | None, shading_ppl: int) -> None:
+        """Send the ProScan 3600 the tables it wants before GET PARAMETERS.
+
+        The scanner answers GET PARAMETERS with sense 05/20/00 until it has them,
+        and applies them to every pixel. The shading table follows CyberView's
+        (see SHADING_SLOPE); the curve tables are linear, as CyberView sends
+        them. Zero curves map every pixel to 0 and the scan comes back black.
+        A pass that skipped the shading analysis has no shading reads and sends
+        the curve tables alone, as CyberView does after skipShadingAnalysis; the
+        scanner keeps the shading table of the pass that acquired it.
+        """
+        payloads = []
+        if shading_raw is not None:
+            ref, _ = calculate_shading(shading_raw, shading_ppl)
+            if ref is None:
+                raise PieusbError("no shading lines to build the shading table from")
+            lines = b""
+            for channel, mask in enumerate(CHANNEL_MASKS):
+                table = numpy.clip(SHADING_SLOPE * (SHADING_LEVEL - ref[channel]), 0, 0xFFFF)
+                lines += struct.pack("<H", mask) + table.astype("<u2").tobytes()
+            payloads.append(struct.pack("<HH", SHADING_TABLE_CMD, len(lines)) + lines)
+        curve = struct.pack(f"<{CURVE_TABLE_ENTRIES}H", *range(CURVE_TABLE_ENTRIES))
+        for mask in CHANNEL_MASKS:
+            body = struct.pack("<H", mask) + curve
+            payloads.append(struct.pack("<HH", CURVE_TABLE_CMD, len(body)) + body)
+        for payload in payloads:
+            log.debug(f"[scan] uploading a {len(payload)}-byte table...")
+            self.wait_ready()
+            self.dev.command(SCSI_WRITE, out_data=payload, cdb_length=len(payload))
+        self.wait_ready()
+
+    def _get_ccd_mask(self, mask_size) -> bytes | None:
+        """The CCD mask, or None on a device that does not support COPY."""
+        if not self.info.capabilities.ccd_mask:
+            log.debug("[scan] this model has no COPY command; no CCD mask")
+            return None
         return self.dev.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
 
     def _get_gain_offset(self):
@@ -1178,6 +1234,9 @@ class Scanner:
         log.debug("[scan] reading CCD mask...")
         ccd_mask = self._get_ccd_mask(shading_ppl)
 
+        if self.info.capabilities.shading_upload:
+            self._upload_shading_tables(shading_raw, shading_ppl)
+
         # The device's own geometry, rather than one computed from the frame.
         scan_params = self._get_scan_parameters()
         width = scan_params["width"]
@@ -1276,6 +1335,8 @@ class Scanner:
         shading_corrected = False
         if self._shading is None:
             log.warning("[scan] no shading reference available; returning raw pixel data")
+        elif ccd_mask is None:
+            log.debug("[scan] no CCD mask: the shading correction is not applied on the host")
         else:
             log.debug(f"[scan] shading mean per channel = "
                       f"{[round(self._shading.mean[c], 1) for c in range(n_planes)]}")

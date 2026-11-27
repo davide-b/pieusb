@@ -152,8 +152,9 @@ DOUBLE_TIMES = 0
 # its whole padded struct (pieusb_scancmd.c:1082), and the ProScan 4000 rejects
 # that with ILLEGAL REQUEST / parameter list length error while its own driver
 # sends 23 (captures/ProScan4000.pcapng, transaction 72). Tried in this order so a
-# scanner that takes the padded form keeps getting it.
-GAIN_OFFSET_LENGTHS = (29, 23)
+# scanner that takes the padded form keeps getting it. The ProScan 3600 refuses
+# the 29- and 23-byte forms with the same parameter list length error and takes 18.
+GAIN_OFFSET_LENGTHS = (29, 23, 18)
 
 class Unit(Enum):
     MM = 0

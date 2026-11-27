@@ -113,6 +113,9 @@ class UASDevice:
         # SET GAIN OFFSET parameter-list length this device accepts, once known.
         # See option.write_gain_offset().
         self.gain_offset_length: int | None = None
+        # The most bytes announced to the bridge at once; None announces a whole
+        # READ in one piece. See Capabilities.bulk_announce_max.
+        self.bulk_announce_max: int | None = None
 
     def __enter__(self) -> "UASDevice":
         self.open()
@@ -278,9 +281,15 @@ class UASDevice:
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)
             log.debug(f"      [txn 0x{opcode:02x}] status 0x{status:02x}")
         elif status == STATUS_READ:
-            log.debug(f"      [txn 0x{opcode:02x}] announcing {in_size} bytes")
-            self._bulk_size(in_size)
-            result = self._bulk_in(in_size)
+            log.debug(f"      [txn 0x{opcode:02x}] reading {in_size} bytes")
+            while True:
+                part = min(self.bulk_announce_max or in_size, in_size - len(result))
+                self._bulk_size(part)
+                data = self._bulk_in(part)
+                result += data
+                # A short piece ends the READ, as a short single read always did.
+                if len(result) >= in_size or len(data) < part:
+                    break
             if log.isEnabledFor(logging.DEBUG):
                 log.debug(f"      [txn 0x{opcode:02x}] read {len(result)} bytes: {_hex(result)}")
             status = self._ctrl_in_byte(PORT_SCSI_STATUS)

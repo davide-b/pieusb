@@ -52,6 +52,18 @@ class Capabilities:
     # measured on a filmstrip; None where unmeasured. Scanner.shift_image()
     # converts with it.
     offset_mm_per_step: float | None = None
+    # Whether the device answers COPY, which returns the CCD mask. The ProScan
+    # 3600 rejects it, and its vendor software never sends it.
+    ccd_mask: bool = True
+    # Whether the device wants the host to upload its shading tables (WRITE
+    # 0x16 and 0x10) before GET PARAMETERS. The ProScan 3600 answers GET
+    # PARAMETERS with sense 05/20/00 until it has them; the 4000 never gets them.
+    shading_upload: bool = False
+    # The most bytes of a READ announced to the bridge at once, None for the
+    # whole READ. The ProScan 3600 returned only the size modulo 65536 when
+    # announced more (a 413840-byte READ delivered 20624); CyberView announces
+    # each READ in pieces of 65520.
+    bulk_announce_max: int | None = None
 
 @dataclass(frozen=True)
 class InquiryResponse:
