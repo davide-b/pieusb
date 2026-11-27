@@ -55,6 +55,11 @@ class Capabilities:
     # Whether the device answers COPY, which returns the CCD mask. The ProScan
     # 3600 rejects it, and its vendor software never sends it.
     ccd_mask: bool = True
+    # The most bytes of a READ announced to the bridge at once, None for the
+    # whole READ. The ProScan 3600 returned only the size modulo 65536 when
+    # announced more (a 413840-byte READ delivered 20624); CyberView announces
+    # each READ in pieces of 65520.
+    bulk_announce_max: int | None = None
 
 @dataclass(frozen=True)
 class InquiryResponse:

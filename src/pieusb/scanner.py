@@ -222,6 +222,7 @@ class _ShadingReference:
 class Scanner:
     def __init__(self, info: DeviceInfo) -> None:
         self.dev = UASDevice(info.dev)
+        self.dev.bulk_announce_max = info.capabilities.bulk_announce_max
         self.scan_thread: threading.Thread | None = None
         self.on_update: Callable[[UpdateData], None] | None = None
         self.on_complete: Callable[[ScanResult], None] | None = None
