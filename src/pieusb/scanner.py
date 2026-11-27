@@ -665,7 +665,11 @@ class Scanner:
             "available_lines": struct.unpack_from("<H", raw, 14)[0],
         }
 
-    def _get_ccd_mask(self, mask_size):
+    def _get_ccd_mask(self, mask_size) -> bytes | None:
+        """The CCD mask, or None on a device that does not support COPY."""
+        if not self.info.capabilities.ccd_mask:
+            log.debug("[scan] this model has no COPY command; no CCD mask")
+            return None
         return self.dev.command(SCSI_COPY, in_size=mask_size, cdb_length=mask_size)
 
     def _get_gain_offset(self):
@@ -1276,6 +1280,8 @@ class Scanner:
         shading_corrected = False
         if self._shading is None:
             log.warning("[scan] no shading reference available; returning raw pixel data")
+        elif ccd_mask is None:
+            log.debug("[scan] no CCD mask: the shading correction is not applied on the host")
         else:
             log.debug(f"[scan] shading mean per channel = "
                       f"{[round(self._shading.mean[c], 1) for c in range(n_planes)]}")

@@ -52,6 +52,9 @@ class Capabilities:
     # measured on a filmstrip; None where unmeasured. Scanner.shift_image()
     # converts with it.
     offset_mm_per_step: float | None = None
+    # Whether the device answers COPY, which returns the CCD mask. The ProScan
+    # 3600 rejects it, and its vendor software never sends it.
+    ccd_mask: bool = True
 
 @dataclass(frozen=True)
 class InquiryResponse:

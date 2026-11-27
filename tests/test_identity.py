@@ -140,6 +140,10 @@ class DeviceCapabilities(unittest.TestCase):
         self.assertTrue(cap.film_transport)
         self.assertTrue(cap.focus)
 
+    def test_only_the_proscan_3600_lacks_a_ccd_mask(self):
+        self.assertFalse(capabilities_for(0x0027).ccd_mask)
+        self.assertTrue(capabilities_for(0x002C).ccd_mask)
+
     def test_only_the_expected_model_declares_focus(self):
         '''No other model may reach the focus code path by accident.'''
         focus = {m for m, c in DEVICE_CAPABILITIES.items() if c.focus}
