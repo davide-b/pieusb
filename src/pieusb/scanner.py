@@ -72,6 +72,19 @@ log = logging.getLogger(__name__)
 # requesting more than 255 lines in one call returns banded images.
 MAX_LINES_PER_READ = 255
 
+# WRITE sub-commands a ProScan 3600 wants before GET PARAMETERS: a shading table
+# (three tagged lines) and one curve table per channel (a filter mask, then 4096
+# x u16). The tags and filters are the masks of R, G and B.
+SHADING_TABLE_CMD = 0x0016
+CURVE_TABLE_CMD = 0x0010
+CURVE_TABLE_ENTRIES = 4096
+CHANNEL_MASKS = (0x0002, 0x0004, 0x0008)
+# CyberView's shading table fits T = SLOPE * (LEVEL - raw), raw being the average
+# of that channel's shading reads: slope 1.36-1.44 and level 3983-4006 over ten
+# scans, whatever the dpi, bit depth or film.
+SHADING_SLOPE = 1.4
+SHADING_LEVEL = 4000
+
 # Every line the scanner returns in INDEX colour format is prefixed by a two-byte
 # channel tag.
 TAG_TO_CHANNEL = {b'RR': 0, b'GG': 1, b'BB': 2, b'II': 3}
@@ -673,6 +686,37 @@ class Scanner:
             "available_lines": struct.unpack_from("<H", raw, 14)[0],
         }
 
+    def _upload_shading_tables(self, shading_raw: bytes | None, shading_ppl: int) -> None:
+        """Send the ProScan 3600 the tables it wants before GET PARAMETERS.
+
+        The scanner answers GET PARAMETERS with sense 05/20/00 until it has them,
+        and applies them to every pixel. The shading table follows CyberView's
+        (see SHADING_SLOPE); the curve tables are linear, as CyberView sends
+        them. Zero curves map every pixel to 0 and the scan comes back black.
+        A pass that skipped the shading analysis has no shading reads and sends
+        the curve tables alone, as CyberView does after skipShadingAnalysis; the
+        scanner keeps the shading table of the pass that acquired it.
+        """
+        payloads = []
+        if shading_raw is not None:
+            ref, _ = calculate_shading(shading_raw, shading_ppl)
+            if ref is None:
+                raise PieusbError("no shading lines to build the shading table from")
+            lines = b""
+            for channel, mask in enumerate(CHANNEL_MASKS):
+                table = numpy.clip(SHADING_SLOPE * (SHADING_LEVEL - ref[channel]), 0, 0xFFFF)
+                lines += struct.pack("<H", mask) + table.astype("<u2").tobytes()
+            payloads.append(struct.pack("<HH", SHADING_TABLE_CMD, len(lines)) + lines)
+        curve = struct.pack(f"<{CURVE_TABLE_ENTRIES}H", *range(CURVE_TABLE_ENTRIES))
+        for mask in CHANNEL_MASKS:
+            body = struct.pack("<H", mask) + curve
+            payloads.append(struct.pack("<HH", CURVE_TABLE_CMD, len(body)) + body)
+        for payload in payloads:
+            log.debug(f"[scan] uploading a {len(payload)}-byte table...")
+            self.wait_ready()
+            self.dev.command(SCSI_WRITE, out_data=payload, cdb_length=len(payload))
+        self.wait_ready()
+
     def _get_ccd_mask(self, mask_size) -> bytes | None:
         """The CCD mask, or None on a device that does not support COPY."""
         if not self.info.capabilities.ccd_mask:
@@ -1189,6 +1233,9 @@ class Scanner:
         # correction consumes it, so it may go unused.
         log.debug("[scan] reading CCD mask...")
         ccd_mask = self._get_ccd_mask(shading_ppl)
+
+        if self.info.capabilities.shading_upload:
+            self._upload_shading_tables(shading_raw, shading_ppl)
 
         # The device's own geometry, rather than one computed from the frame.
         scan_params = self._get_scan_parameters()

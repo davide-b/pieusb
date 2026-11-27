@@ -32,7 +32,7 @@ MODEL_NAMES = {
 DEVICE_CAPABILITIES = {
     0x0027: Capabilities(film_transport=True, focus=True,    # ProScan 3600
                          offset_mm_per_step=0.1164, ccd_mask=False,
-                         bulk_announce_max=65520),
+                         shading_upload=True, bulk_announce_max=65520),
     0x002c: Capabilities(film_transport=True, focus=True,    # ProScan 4000
                          offset_mm_per_step=0.1164),
     0x0048: Capabilities(film_transport=True, focus=True,    # RPS 10M
