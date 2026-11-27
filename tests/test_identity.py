@@ -135,10 +135,15 @@ class DeviceCapabilities(unittest.TestCase):
         self.assertTrue(cap.focus)
         self.assertGreater(cap.offset_mm_per_step, 0)
 
+    def test_proscan_3600_capabilities(self):
+        cap = capabilities_for(0x0027)
+        self.assertTrue(cap.film_transport)
+        self.assertTrue(cap.focus)
+
     def test_only_the_expected_model_declares_focus(self):
         '''No other model may reach the focus code path by accident.'''
         focus = {m for m, c in DEVICE_CAPABILITIES.items() if c.focus}
-        self.assertEqual(focus, {0x002C, 0x0048})
+        self.assertEqual(focus, {0x0027, 0x002C, 0x0048})
 
     def test_no_model_is_enabled_for_a_motor_it_does_not_have(self):
         '''DEVICE_CAPABILITIES may lag MODEL_MOTORS, never lead it.'''
@@ -160,7 +165,7 @@ class DeviceCapabilities(unittest.TestCase):
             if reported:
                 driven.add(model)
 
-        self.assertEqual(driven, {0x002C, 0x002F, 0x003A, 0x0048})
+        self.assertEqual(driven, {0x0027, 0x002C, 0x002F, 0x003A, 0x0048})
         self.assertNotIn(0x0047, driven, 'the ProScan 10T must never be driven')
 
 
