@@ -21,6 +21,7 @@ from pieusb.types import (
     AutofocusResult,
     DeviceInfo,
     EjectDirection,
+    Filter,
     UpdateData,
     ScanResult,
     ScanPhase
@@ -653,6 +654,12 @@ class Scanner:
                 "n_lines": raw[off + 3],
                 "pixels_per_line": struct.unpack_from("<H", raw, off + 4)[0],
             })
+        # ProScan 3600: the report lists 4 entries (40 lines), but a 40-line READ
+        # (413840 bytes) times out even when announced in pieces. CyberView and
+        # VueScan read only the first three, the colour ones, 30 lines. A device
+        # without an infrared filter gets only the three colour entries.
+        if Filter.INFRARED not in self.info.inquiry.filters:
+            entries = entries[:3]
         return entries
 
     def _get_scan_parameters(self):
