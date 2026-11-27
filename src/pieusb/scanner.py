@@ -131,8 +131,8 @@ AUTOFOCUS_SMOOTHING = 5
 AUTOFOCUS_MIN_DEPTH = 1.115
 
 # START SCAN is retried while the device reports warming up (pieusb.c:1088-1093).
-START_SCAN_ATTEMPTS = 30
-START_SCAN_RETRY_S = 5
+START_SCAN_ATTEMPTS = 150
+START_SCAN_RETRY_S = 1
 
 # How long close() waits for a cancelled worker to notice. Cancellation lands at
 # the next chunk boundary, so the bound is one outstanding command.
